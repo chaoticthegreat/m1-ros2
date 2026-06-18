@@ -272,7 +272,8 @@ steady residual with the lift parked at its limit.
 
 ## Tuning
 
-- IK behaviour (damping, step size, settle tolerance, null-space): top of
+- IK behaviour (adaptive damping, convergence tolerance, per-tick command step,
+  null-space posture, restart search): top of
   `m1_control/m1_control/kinematics.py`.
 - Swerve geometry / wheel + steer direction sign fixups:
   `m1_control/m1_control/swerve.py`.

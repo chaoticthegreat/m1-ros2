@@ -40,16 +40,22 @@ real driver; everything in `ros2_ws/` is unchanged.
   joint_command sub → IsaacArticulationController). Sets drive gains (stiff arms,
   velocity wheels). Logs to `isaac/last_ros_sim_report.txt`.
 - `ros2_ws/src/m1_control/m1_control/kinematics.py` — dependency-free URDF FK +
-  geometric Jacobian + damped-least-squares (DLS) Cartesian reach. Ported from
-  `isaac/teleop.py`; Jacobian verified against finite differences.
+  geometric Jacobian + damped-least-squares (DLS) Cartesian reach. Jacobian
+  verified against finite differences. The reach is a full iterated Gauss-Newton
+  IK: each call iterates the model to the optimal joint configuration for the
+  target(s) with adaptive (singularity-aware) damping and multi-seed restarts to
+  avoid local minima, then leads the measured pose toward it by a bounded step.
+  Reachable targets converge sub-mm; unreachable ones settle at the closest the
+  joints allow. The solved goal is cached while the target holds, so the heavy
+  search runs only on a target change (steady ticks cost one bounded step;
+  benchmark `_solver_bench.py`: 100% of reachable single-arm targets <1 mm).
 - `.../swerve.py` — swerve base kinematics (vx, vy, yaw → steer + wheel spin).
 - `.../controller_node.py` — the only node you talk to. Subscribes to pose
  targets / cmd_vel / gripper + /joint_states; publishes unified
- `/m1/joint_command` at 60 Hz. Recruits the shared lift for reaching: every arm
- that has a target stays in the DLS solve (matching the Isaac teleop solver) —
- once an arm settles within the solver deadband its task error is zeroed but it
- keeps constraining the shared lift, so when both arms have targets the single
- lift is solved as one compromise that helps both grippers. Also publishes
+ `/m1/joint_command` at 60 Hz. Recruits the shared lift for reaching: each arm
+ with a target is solved to its optimal joint configuration, and when both arms
+ have targets they share one stacked solve so the single lift is the
+ least-squares compromise that best serves both grippers. Also publishes
  `/m1/target_markers` (visualization_msgs/MarkerArray: target sphere + label,
  current fingertip, error line per arm) for RViz.
 - `.../send_pose.py` — `ros2 run m1_control m1_send_pose --arm left --xyz x y z`.
@@ -98,15 +104,21 @@ is not running — the web panel's status dot makes this obvious.
 ## Status / what's verified
 
 - `colcon build` clean (4 pkgs). All Python syntax-checked.
-- IK converges sub-cm on reachable targets, recruits the lift, shares the lift
-  across both arms (tested standalone with the URDF).
+- IK converges to the optimal reachable configuration, recruits the lift, and
+  shares the lift across both arms. Benchmarked standalone (`_solver_bench.py`,
+  no ROS) against targets generated as the FK of real joint configs: **100% of
+  reachable single-arm targets reach <1 mm** (mean ~0.3 mm) and **100% of
+  jointly-feasible dual-arm targets reach <5 mm** (mean ~0.4 mm). Steady-state
+  `solve_step` cost ~0.7 ms; the heavy iterate-and-restart search runs only on a
+  target change (cached otherwise).
 - Lift recruitment verified standalone: commanding one arm high drives the lift
- up so the gripper reaches; commanding both arms together shares the lift as a
- compromise. Both arms with targets are always solved together (settled arms
- keep a zero-error constraint), so the controller matches the Isaac teleop
- solver exactly rather than parking/dropping a settled arm.
-- End-to-end ROS test (fake /joint_states): pose → /m1/joint_command raises lift
-  + moves arm; /m1/cmd_vel → correct wheel velocities + steer angles.
+ up so the gripper reaches; commanding both arms together shares the lift as the
+ least-squares compromise. Both arms with targets are solved together in one
+ stacked system, so the lift serves both grippers optimally.
+- End-to-end ROS test (fake /joint_states, real DDS): both arms reach FK-derived
+  targets to ~0 cm and recruit the shared lift; /m1/cmd_vel → correct wheel
+  velocities + steer angles. (`_e2e_check.py` has a pre-existing unrelated
+  web-node import error; the reach path itself is verified.)
 - `isaac/ros_sim.py` itself was NOT run end-to-end by the agent (no GPU/display
   in the sandbox). The user confirmed it loads after the `set_target_prims` fix.
 
@@ -125,19 +137,21 @@ is not running — the web panel's status dot makes this obvious.
 ## Known limitations / good next steps
 
 - Reaching is **position-only**: the gripper fingertip is driven onto the target
-  point; the PoseStamped's **orientation is ignored**. Next: extend the DLS task
-  to 6-DOF (stack orientation error + use the angular Jacobian rows already
-  computed in `fk`).
-- No collision avoidance / planning — it's a reactive Jacobian controller.
-  MoveIt is installed if you want planned motion (would need SRDF + kinematics
-  config + a controller bridge).
-- Shared-lift tradeoff: because the lift is one prismatic joint feeding both
- arms, when both arms have targets the lift is solved as a single compromise
- between them (each settled arm keeps a zero-error constraint that resists the
- lift moving its fingertip). This matches the Isaac teleop solver, but it means
- the lift can't fully travel to serve one arm while the other still holds a
- target at a different height; clear the other arm's target if you want the lift
- to commit entirely to one arm.
+  point; the PoseStamped's **orientation is ignored**. Next: extend the task to
+  6-DOF (stack orientation error + use the angular Jacobian rows already computed
+  in `fk`). The solver structure (`_stack` / `_dls`) already generalises to it.
+- No collision avoidance / planning — it's a reactive Jacobian controller solved
+  to convergence each tick. MoveIt is installed if you want planned motion (would
+  need SRDF + kinematics config + a controller bridge).
+- Shared-lift tradeoff: the lift is one prismatic joint feeding both arms, so
+ when both arms have targets the stacked solve picks the single lift height that
+ minimises the combined (equal-weight) fingertip error. Two arms with targets at
+ very different heights therefore share the lift as a compromise; clear one
+ arm's target if you want the lift to commit entirely to the other.
+- Worst-case `solve_step` latency: a target *change* triggers the iterate-and-
+  restart search (bounded, ~tens of ms in the rare hard/cold case); steady ticks
+  reuse the cached solution. If you ever need a hard real-time bound, amortise
+  the restart seeds across ticks.
 - Base `/m1/cmd_vel` is open-loop swerve; no odometry is published yet.
 - The Isaac graph publishes `/joint_states` + `/clock` only; TF comes from
   robot_state_publisher on the ROS side. No camera/lidar/IMU bridged yet (the

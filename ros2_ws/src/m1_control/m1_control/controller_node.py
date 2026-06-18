@@ -25,13 +25,14 @@ Given a target pose, the arms + shared lift run a damped-least-squares reach
 toward the requested point (position-only, orientation is currently ignored).
 Targets are interpreted in the robot ``base_link`` frame.
 
-The shared prismatic lift is recruited to help the arms reach. Whenever an arm
-has a target it stays in the solve (exactly like the Isaac teleop solver): once
-its fingertip settles within the solver's deadband its task error is zeroed but
-it remains in the system, so its zero-error rows keep constraining the shared
-lift. When both arms have targets they are solved together and the single lift
-is resolved as a compromise that helps both grippers. The target poses are also
-published as RViz markers for inspection.
+Each tick the solver iterates a full Gauss-Newton IK to the optimal joint
+configuration for the active target(s) and leads the measured pose toward it by
+a bounded step, so reachable targets converge to sub-millimetre error and an
+unreachable one settles at the closest the joints allow. The shared prismatic
+lift is recruited automatically to help the arms reach; when both arms have
+targets they are solved together and the single lift is resolved as the
+least-squares compromise that best serves both grippers. The target poses are
+also published as RViz markers for inspection.
 """
 
 from __future__ import annotations
@@ -173,11 +174,11 @@ class M1Controller(Node):
         if not self._initialized:
             return
 
-        # 1) Cartesian reach. Every arm that has a target is passed to the solver
-        #    and stays in the system (matching the Isaac teleop solver): a
-        #    settled arm's task error is zeroed but its rows keep constraining
-        #    the shared lift, so when both arms reach the single lift is solved
-        #    as a compromise that helps both grippers.
+        # 1) Cartesian reach. Each arm with a target is solved to its optimal
+        #    joint configuration; the command then leads the measured pose toward
+        #    that goal by a bounded step. When both arms reach, they share one
+        #    stacked solve so the single lift is the least-squares compromise
+        #    that best serves both grippers.
         if any(t is not None for t in self.targets.values()):
             result = self.reach.solve_step(self.q_meas, self.targets)
             for jname, q in result.items():

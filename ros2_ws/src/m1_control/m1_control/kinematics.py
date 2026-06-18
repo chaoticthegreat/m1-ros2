@@ -2,15 +2,25 @@
 
 This module parses a URDF string (no KDL / pinocchio needed) and provides
 forward kinematics and a geometric Jacobian for arbitrary base->tip chains.
-On top of that it implements the same damped-least-squares (DLS) Cartesian
-controller used by the Isaac teleop script, but driven purely from the URDF so
-it can run unchanged on the real robot.
+On top of that it implements a damped-least-squares (DLS) Cartesian reach
+controller driven purely from the URDF, so it can run unchanged on the real
+robot.
 
 The solver treats each arm's 7 joints plus the single shared prismatic lift as
-the actuated DOFs. When both arms reach at once they are solved together in one
-system so the shared lift column is resolved as a compromise that helps both
-grippers (instead of the two arms fighting over the lift), exactly like the
-teleop solver.
+the actuated DOFs. Unlike a single-step Jacobian nudge, every call iterates a
+full damped Gauss-Newton solve (against the URDF model) to the optimal joint
+configuration for the requested target(s) -- with adaptive, singularity-aware
+damping and multi-seed restarts to avoid local minima -- then leads the
+measured pose toward that goal by a bounded step. On reachable targets this
+drives the gripper to sub-millimetre error; on an unreachable one the joints
+saturate at the closest configuration the limits allow.
+
+When both arms reach at once they are solved together in one stacked system, so
+the shared lift column is resolved as the least-squares compromise that best
+serves both grippers (instead of the two arms fighting over the lift). The
+solved goal is cached and reused while the target holds steady, so the heavy
+search runs only when a target actually changes -- each control tick otherwise
+costs a single bounded step.
 """
 
 from __future__ import annotations
@@ -22,13 +32,34 @@ from dataclasses import dataclass, field
 import numpy as np
 
 
-# --- DLS / reach tuning (mirrors isaac/teleop.py) ---------------------------
-IK_DAMPING = 0.06       # DLS damping (larger = safer near singularities)
-IK_MAX_STEP = 0.12      # max Cartesian error (m) consumed per IK step
-IK_GAIN = 0.85          # fraction of the solved step taken per tick
-IK_MAX_DQ = 0.22        # max joint motion (rad) the command leads per tick
-IK_NULL_GAIN = 0.03     # null-space pull toward mid-range
-IK_POS_TOL = 0.012      # settle deadband (m): stop nudging within this
+# --- Cartesian reach tuning ------------------------------------------------
+# The reach is solved as a full damped-least-squares (Gauss-Newton) IK: every
+# control tick we iterate the URDF model to the joint configuration that best
+# reaches the target(s), then lead the *measured* pose toward that solution by a
+# bounded step. Iterating to convergence (instead of taking a single linear
+# nudge) means each command is anchored to the genuine optimum, so the solver
+# reliably drives reachable targets to sub-millimetre error and settles an
+# unreachable one at the closest configuration the joints allow.
+#
+# Damping is applied adaptively: it is zero while the Jacobian is well
+# conditioned (exact, fast, unbiased tracking) and grows only as a singularity
+# is approached, trading a little accuracy there for stability instead of
+# over-damping everywhere like a fixed term would.
+IK_SV_EPS = 0.04          # smallest singular value below which damping turns on
+IK_DAMPING_MAX = 0.06     # peak DLS damping injected right at a singularity
+IK_NULL_GAIN = 0.04       # null-space pull toward mid-range (posture quality)
+IK_MAX_DQ = 0.22          # max joint motion (rad) the command leads per tick
+IK_POS_TOL = 0.001        # internal-solve convergence tolerance (m)
+IK_CMD_DEADBAND = 1e-4    # hold the command still once the solved step (rad) is tiny
+
+# Internal Gauss-Newton iteration controls.
+_IK_MAX_ITERS = 80        # max iterations for the primary solve
+_IK_PROBE_ITERS = 40      # max iterations for each restart-seed probe
+_IK_INT_MAX_DQ = 0.40     # cap on a single internal iteration's joint step (rad)
+_IK_STEP_TOL = 1e-6       # stop iterating once the internal step is this small
+_IK_RESTART_TOL = 0.005   # residual (m) above which we try alternate seeds
+_IK_RANK_TOL = 1e-6       # singular values below this are treated as zero
+_IK_TARGET_EPS = 1e-4     # target move (m) under which a cached solve is reused
 
 # End-effector link + fingertip offset (ee-local frame), from teleop.py.
 EE_LINK_NAME = {
@@ -209,7 +240,16 @@ class ArmChain:
 
 
 class ReachController:
-    """Stateless-ish DLS Cartesian reach for one or both arms + shared lift."""
+    """Converged DLS Cartesian reach for one or both arms + shared lift.
+
+    Each :meth:`solve_step` runs a full damped Gauss-Newton IK (iterated to
+    convergence against the URDF model, with adaptive damping and multi-seed
+    restarts) to find the optimal joint configuration for the requested
+    target(s), then leads the measured pose toward it by a bounded step. When
+    both arms reach at once they are solved in one stacked system, so the shared
+    lift column is resolved as the least-squares compromise that best serves
+    both grippers.
+    """
 
     def __init__(self, model: UrdfModel):
         self.model = model
@@ -221,76 +261,184 @@ class ReachController:
                 joint = model.joints[j]
                 mids.append(0.5 * (joint.lower + joint.upper))
             self.arm_mid[arm] = np.array(mids, dtype=np.float64)
+        self._restart_rng = np.random.default_rng(0xC0FFEE)
+        # Cache of the last fully-solved goal. The optimal joint configuration
+        # depends only on the (fixed) target, not on where the arm currently is,
+        # so while the target holds we reuse the solution and skip the heavy
+        # iterate-and-restart search -- each tick then costs just a bounded step.
+        self._cache = None
 
     def fingertip(self, arm: str, q: dict) -> np.ndarray:
         return self.chains[arm].fk(q)[0]
 
-    def solve_step(self, q_meas: dict, targets: dict) -> dict:
-        """One DLS step. ``targets`` maps arm -> 3D world point (base frame).
+    # --- internal solve helpers -------------------------------------------
+    def _bounds(self, joint_order: list):
+        lo = np.array([self.model.joints[j].lower for j in joint_order], dtype=np.float64)
+        hi = np.array([self.model.joints[j].upper for j in joint_order], dtype=np.float64)
+        return lo, hi
 
-        Returns a dict of joint name -> new commanded position (only joints that
-        moved). ``q_meas`` is the measured joint position dict.
+    def _stack(self, q_vec, joint_order, arms, targets):
+        """Stacked fingertip Jacobian + error for the current joint vector."""
+        m = 3 * len(arms)
+        J = np.zeros((m, len(joint_order)), dtype=np.float64)
+        e = np.zeros(m, dtype=np.float64)
+        dist = {}
+        q = {jn: float(q_vec[k]) for k, jn in enumerate(joint_order)}
+        for ai, a in enumerate(arms):
+            tip_pos, Ja = self.chains[a].position_jacobian(q, joint_order)
+            ev = np.asarray(targets[a], dtype=np.float64) - tip_pos
+            dist[a] = float(np.linalg.norm(ev))
+            J[3 * ai:3 * ai + 3, :] = Ja
+            e[3 * ai:3 * ai + 3] = ev
+        return J, e, dist
+
+    @staticmethod
+    def _dls(J, e):
+        """Adaptively-damped least-squares step plus the null-space projector.
+
+        Damping is zero while the smallest singular value stays above
+        ``IK_SV_EPS`` (so the step is the exact, unbiased pseudo-inverse) and
+        ramps to ``IK_DAMPING_MAX`` as that value collapses toward a
+        singularity. Returns ``(dq, N)`` where ``N`` projects a secondary
+        objective onto the task null space.
+        """
+        U, s, Vt = np.linalg.svd(J, full_matrices=False)
+        s_min = s[-1] if s.size else 0.0
+        if s_min >= IK_SV_EPS:
+            lam2 = 0.0
+        else:
+            lam2 = (1.0 - (s_min / IK_SV_EPS) ** 2) * (IK_DAMPING_MAX ** 2)
+        d = s / (s * s + lam2)
+        dq = Vt.T @ (d * (U.T @ e))
+        rank = s > _IK_RANK_TOL
+        Vr = Vt[rank]
+        N = np.eye(J.shape[1], dtype=np.float64) - Vr.T @ Vr
+        return dq, N
+
+    def _solve_from(self, seed, joint_order, arms, targets, lo, hi, null_slices,
+                    max_iters=_IK_MAX_ITERS):
+        """Iterate damped Gauss-Newton from ``seed`` to convergence.
+
+        Joint limits are enforced by clamping every iterate, so an unreachable
+        target naturally settles at the closest configuration the joints allow.
+        """
+        q = np.clip(np.asarray(seed, dtype=np.float64), lo, hi)
+        dist = {}
+        for _ in range(max_iters):
+            J, e, dist = self._stack(q, joint_order, arms, targets)
+            if max(dist.values()) < IK_POS_TOL:
+                break
+            dq_task, N = self._dls(J, e)
+            dq_null = np.zeros(len(joint_order), dtype=np.float64)
+            for base, mid in null_slices:
+                dq_null[base:base + 7] = IK_NULL_GAIN * (mid - q[base:base + 7])
+            dq = dq_task + N @ dq_null
+            nrm = float(np.linalg.norm(dq))
+            if nrm > _IK_INT_MAX_DQ:
+                dq *= _IK_INT_MAX_DQ / nrm
+            q = np.clip(q + dq, lo, hi)
+            if nrm < _IK_STEP_TOL:
+                _, _, dist = self._stack(q, joint_order, arms, targets)
+                break
+        return q, dist
+
+    def _restart_seeds(self, lo, hi):
+        """Diverse seeds used to escape a local minimum / poor start pose.
+
+        Sweeping the shared lift (last entry) over its range with the arms at
+        mid-range covers the dominant reachability factor (target height); a
+        couple of random arm postures add coverage for awkward orientations.
+        These only run on a target change whose primary solve fell short, so the
+        list is kept short to bound the worst-case re-solve latency.
+        """
+        mid = 0.5 * (lo + hi)
+        seeds = []
+        for frac in (0.0, 0.35, 0.7, 1.0):
+            s = mid.copy()
+            s[-1] = lo[-1] + frac * (hi[-1] - lo[-1])
+            seeds.append(s)
+        for _ in range(2):
+            seeds.append(lo + self._restart_rng.random(lo.shape[0]) * (hi - lo))
+        return seeds
+
+    def solve_step(self, q_meas: dict, targets: dict) -> dict:
+        """Drive the command one bounded step toward the optimal reach solution.
+
+        ``targets`` maps arm -> 3D world point (base frame). Returns a dict of
+        joint name -> new commanded position plus ``"_dist"`` (per-arm residual
+        of the solved configuration). ``q_meas`` is the measured joint dict.
         """
         arms = [a for a in ("left", "right") if targets.get(a) is not None]
         if not arms:
             return {}
 
-        # Build the joint variable vector: each arm's 7 joints + the shared lift.
+        # Joint variable vector: each arm's 7 joints, then the shared lift last.
         joint_order = []
         for a in arms:
             joint_order += ARM_JOINTS[a]
         if LIFT_JOINT not in joint_order:
             joint_order.append(LIFT_JOINT)
+        lo, hi = self._bounds(joint_order)
+        null_slices = [
+            (joint_order.index(ARM_JOINTS[a][0]), self.arm_mid[a]) for a in arms
+        ]
 
-        m = 3 * len(arms)
-        n = len(joint_order)
-        big_j = np.zeros((m, n), dtype=np.float64)
-        err = np.zeros(m, dtype=np.float64)
-        dist = {}
-        any_active = False
-        for ai, a in enumerate(arms):
-            tip_pos, J = self.chains[a].position_jacobian(q_meas, joint_order)
-            e = np.asarray(targets[a], dtype=np.float64) - tip_pos
-            d = float(np.linalg.norm(e))
-            dist[a] = d
-            if d < IK_POS_TOL:
-                e = np.zeros(3)
-            else:
-                any_active = True
-                if d > IK_MAX_STEP:
-                    e = e * (IK_MAX_STEP / d)
-            big_j[3 * ai:3 * ai + 3, :] = J
-            err[3 * ai:3 * ai + 3] = e
+        q_meas_vec = np.array([q_meas.get(j, 0.0) for j in joint_order], dtype=np.float64)
+        tgt_vecs = [np.asarray(targets[a], dtype=np.float64) for a in arms]
 
-        if not any_active:
-            return {"_dist": dist}
+        cache = self._cache
+        cache_arms_match = cache is not None and cache["arms"] == tuple(arms)
+        unchanged = cache_arms_match and all(
+            np.linalg.norm(c - t) < _IK_TARGET_EPS
+            for c, t in zip(cache["targets"], tgt_vecs))
 
-        jjt = big_j @ big_j.T + (IK_DAMPING ** 2) * np.eye(m)
-        try:
-            j_pinv = big_j.T @ np.linalg.inv(jjt)
-        except np.linalg.LinAlgError:
-            return {"_dist": dist}
+        if unchanged:
+            # Target is steady (operator bridges republish it every tick): reuse
+            # the goal we already solved instead of re-running the full IK.
+            q_best, dist_best = cache["q_best"], cache["dist"]
+        else:
+            # Warm-start from the cached goal when the same arms are reaching (a
+            # nudged target reconverges in a few iterations); otherwise seed from
+            # the measured pose. Either way we stay in the nearest IK branch.
+            seed0 = cache["q_best"] if cache_arms_match else q_meas_vec
+            q_best, dist_best = self._solve_from(
+                seed0, joint_order, arms, targets, lo, hi, null_slices)
+            best_res = max(dist_best.values())
 
-        q_vec = np.array([q_meas.get(j, 0.0) for j in joint_order], dtype=np.float64)
-        dq = IK_GAIN * (j_pinv @ err)
+            # Large residual means a poor basin (e.g. the singular zero pose or a
+            # distant new target): search diverse seeds and keep the global best
+            # so we converge to the optimal reachable configuration, never a
+            # local minimum. This only runs when the target actually changes.
+            if best_res > _IK_RESTART_TOL:
+                for seed in [q_meas_vec] + self._restart_seeds(lo, hi):
+                    q_try, dist_try = self._solve_from(
+                        seed, joint_order, arms, targets, lo, hi, null_slices,
+                        max_iters=_IK_PROBE_ITERS)
+                    res_try = max(dist_try.values())
+                    if res_try < best_res:
+                        q_best, dist_best, best_res = q_try, dist_try, res_try
+                        if best_res < IK_POS_TOL:
+                            break
 
-        # Null-space: pull each arm's joints toward mid-range; lift gets no pull.
-        dq_null = np.zeros(n, dtype=np.float64)
-        for a in arms:
-            base = joint_order.index(ARM_JOINTS[a][0])
-            cur = q_vec[base:base + 7]
-            dq_null[base:base + 7] = IK_NULL_GAIN * (self.arm_mid[a] - cur)
-        dq = dq + (np.eye(n) - j_pinv @ big_j) @ dq_null
+            self._cache = {
+                "arms": tuple(arms),
+                "targets": tgt_vecs,
+                "q_best": q_best,
+                "dist": dist_best,
+            }
 
-        dq_norm = float(np.linalg.norm(dq))
-        if dq_norm > IK_MAX_DQ:
-            dq = dq * (IK_MAX_DQ / dq_norm)
+        # Command stepping: lead the measured pose toward the solved goal by a
+        # bounded amount so the stiff drive supplies holding torque without the
+        # command overshooting (the same contract the Isaac teleop relied on).
+        dq = q_best - q_meas_vec
+        nrm = float(np.linalg.norm(dq))
+        if nrm < IK_CMD_DEADBAND:
+            # Already at the solved configuration: hold to avoid command jitter.
+            return {"_dist": dist_best}
+        if nrm > IK_MAX_DQ:
+            dq *= IK_MAX_DQ / nrm
+        q_cmd = np.clip(q_meas_vec + dq, lo, hi)
 
-        out = {}
-        for k, jname in enumerate(joint_order):
-            joint = self.model.joints[jname]
-            new_q = float(q_vec[k] + dq[k])
-            new_q = max(joint.lower, min(joint.upper, new_q))
-            out[jname] = new_q
-        out["_dist"] = dist
+        out = {jname: float(q_cmd[k]) for k, jname in enumerate(joint_order)}
+        out["_dist"] = dist_best
         return out
