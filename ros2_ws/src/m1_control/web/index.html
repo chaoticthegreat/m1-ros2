@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>M1 Control Panel</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #171c24; --panel2: #1f2630; --line: #2b333f;
+    --txt: #e6edf3; --muted: #8b97a7; --accent: #4f9dff; --accent2: #2bd4a4;
+    --warn: #ff5d5d; --ok: #2bd47a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--txt);
+    font: 14px/1.45 -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; padding: 12px 20px;
+    background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5;
+  }
+  header h1 { font-size: 17px; margin: 0; font-weight: 600; letter-spacing: .3px; }
+  .status { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--warn); box-shadow: 0 0 8px var(--warn); }
+  .dot.ok { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  .spacer { flex: 1; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 20px; display: grid;
+          grid-template-columns: 1fr 1fr; gap: 18px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
+  .card h2 { margin: 0 0 14px; font-size: 14px; text-transform: uppercase; letter-spacing: .8px; color: var(--muted); font-weight: 600; }
+  .full { grid-column: 1 / -1; }
+  button {
+    background: var(--panel2); color: var(--txt); border: 1px solid var(--line);
+    border-radius: 9px; padding: 10px 14px; font-size: 14px; cursor: pointer; user-select: none;
+    transition: background .08s, border-color .08s, transform .05s;
+  }
+  button:hover { border-color: var(--accent); }
+  button:active { transform: translateY(1px); }
+  button.pressed { background: var(--accent); border-color: var(--accent); color: #04101f; }
+  button.danger { border-color: #5a2b2b; }
+  button.danger:hover { background: var(--warn); border-color: var(--warn); color: #2a0606; }
+  .dpad { display: grid; grid-template-columns: repeat(3, 64px); grid-template-rows: repeat(3, 56px);
+          gap: 8px; justify-content: center; }
+  .dpad button { font-size: 18px; height: 100%; }
+  .dpad .empty { visibility: hidden; }
+  .row { display: flex; align-items: center; gap: 12px; margin: 12px 0; }
+  .row label { width: 80px; color: var(--muted); }
+  input[type=range] { flex: 1; accent-color: var(--accent); height: 6px; }
+  .val { width: 78px; text-align: right; font-variant-numeric: tabular-nums; color: var(--accent); }
+  .tabs { display: inline-flex; border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+  .tabs button { border: none; border-radius: 0; }
+  .tabs button.active { background: var(--accent); color: #04101f; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  .nudge { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .readout { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 13px; }
+  .readout b { color: var(--txt); font-weight: 600; }
+  .hint { color: var(--muted); font-size: 12.5px; margin-top: 8px; }
+  .pill { font-size: 12px; padding: 2px 9px; border-radius: 999px; background: var(--panel2); border: 1px solid var(--line); color: var(--muted); }
+  kbd { background: var(--panel2); border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px; padding: 1px 6px; font-size: 12px; }
+  @media (max-width: 760px) { .wrap { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>M1 Control Panel</h1>
+  <div class="status"><span id="dot" class="dot"></span><span id="conn">waiting for robot…</span></div>
+  <div class="spacer"></div>
+  <span class="pill" id="njoints">0 joints</span>
+  <button class="danger" id="estop">STOP BASE</button>
+</header>
+
+<div class="wrap">
+  <!-- BASE -->
+  <div class="card">
+    <h2>Base drive (swerve)</h2>
+    <div class="dpad">
+      <button class="empty"></button>
+      <button data-vx="1"  title="Forward (W)">▲</button>
+      <button class="empty"></button>
+      <button data-yaw="1" title="Turn left (A)">⟲</button>
+      <button id="basestop" title="Stop (Space)">■</button>
+      <button data-yaw="-1" title="Turn right (D)">⟳</button>
+      <button data-vy="1"  title="Strafe left (Q)">◀</button>
+      <button data-vx="-1" title="Backward (S)">▼</button>
+      <button data-vy="-1" title="Strafe right (E)">▶</button>
+    </div>
+    <div class="row" style="margin-top:16px">
+      <label>Speed</label>
+      <input type="range" id="speed" min="0.1" max="1" step="0.05" value="0.6" />
+      <span class="val" id="speedv">0.60×</span>
+    </div>
+    <div class="readout" id="baseread">vx 0.00 · vy 0.00 · yaw 0.00</div>
+    <div class="hint">Hold a button (or <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd><kbd>Q</kbd><kbd>E</kbd>) to drive; release to stop. The base never moves on its own.</div>
+  </div>
+
+  <!-- ARM -->
+  <div class="card">
+    <h2>Arm reach target</h2>
+    <div class="row" style="justify-content:space-between">
+      <div class="tabs" id="armtabs">
+        <button data-arm="left" class="active">Left arm</button>
+        <button data-arm="right">Right arm</button>
+      </div>
+      <button id="home">Re-seed / Home</button>
+    </div>
+    <div class="row"><label>X · fwd</label><input type="range" id="tx" /><span class="val" id="txv">0.00</span></div>
+    <div class="row"><label>Y · left</label><input type="range" id="ty" /><span class="val" id="tyv">0.00</span></div>
+    <div class="row"><label>Z · up</label><input type="range" id="tz" /><span class="val" id="tzv">0.00</span></div>
+    <div class="nudge" style="margin-top:6px">
+      <button data-nx="-1">−X</button><button data-ny="1">+Y</button><button data-nz="1">+Z</button>
+      <button data-nx="1">+X</button><button data-ny="-1">−Y</button><button data-nz="-1">−Z</button>
+    </div>
+    <div class="readout" style="margin-top:12px" id="armread">target — · tip — · error —</div>
+    <div class="hint">Targets are in the <b>base_link</b> frame (metres). The arm + shared lift reach toward the point; orientation is ignored.</div>
+  </div>
+
+  <!-- GRIPPERS -->
+  <div class="card full">
+    <h2>Grippers</h2>
+    <div class="grid2">
+      <div>
+        <div class="row"><label>Left</label><input type="range" id="gl" min="0" max="1" step="0.02" value="0" /><span class="val" id="glv">0%</span></div>
+        <div class="row" style="gap:8px"><button data-grip="left" data-v="1">Open</button><button data-grip="left" data-v="0">Close</button></div>
+      </div>
+      <div>
+        <div class="row"><label>Right</label><input type="range" id="gr" min="0" max="1" step="0.02" value="0" /><span class="val" id="grv">0%</span></div>
+        <div class="row" style="gap:8px"><button data-grip="right" data-v="1">Open</button><button data-grip="right" data-v="0">Close</button></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let activeArm = "left";
+let limits = { x:[-0.9,0.9], y:[-0.9,0.9], z:[0.1,1.5] };
+let sliderHeld = false;          // don't fight the user while dragging
+let armSeeded = { left:false, right:false };
+
+async function post(body) {
+  try {
+    await fetch("/api/cmd", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body) });
+  } catch (e) { /* ignore transient errors */ }
+}
+
+// ---- Base driving (hold to move) ----
+const baseCmd = { vx:0, vy:0, yaw:0 };
+let baseTimer = null;
+function speed() { return parseFloat($("speed").value); }
+function sendBase() { post({ type:"cmd_vel", vx:baseCmd.vx, vy:baseCmd.vy, yaw:baseCmd.yaw }); }
+function startBase() { if (!baseTimer) baseTimer = setInterval(sendBase, 100); sendBase(); }
+function stopBase() {
+  baseCmd.vx = baseCmd.vy = baseCmd.yaw = 0;
+  if (baseTimer) { clearInterval(baseTimer); baseTimer = null; }
+  post({ type:"stop" });
+}
+function setAxis(axis, sign) {
+  const s = speed();
+  if (axis === "vx")  baseCmd.vx  = sign * s;
+  if (axis === "vy")  baseCmd.vy  = sign * s * 0.8;
+  if (axis === "yaw") baseCmd.yaw = sign * s * 1.8;
+}
+function clearAxes() { baseCmd.vx = baseCmd.vy = baseCmd.yaw = 0; }
+
+document.querySelectorAll(".dpad button:not(.empty):not(#basestop)").forEach(btn => {
+  const press = (e) => { e.preventDefault(); btn.classList.add("pressed");
+    if (btn.dataset.vx)  setAxis("vx",  +btn.dataset.vx);
+    if (btn.dataset.vy)  setAxis("vy",  +btn.dataset.vy);
+    if (btn.dataset.yaw) setAxis("yaw", +btn.dataset.yaw);
+    startBase();
+  };
+  const release = () => { btn.classList.remove("pressed"); clearAxes(); stopBase(); };
+  btn.addEventListener("mousedown", press);
+  btn.addEventListener("touchstart", press, {passive:false});
+  btn.addEventListener("mouseup", release);
+  btn.addEventListener("mouseleave", release);
+  btn.addEventListener("touchend", release);
+});
+$("basestop").addEventListener("click", stopBase);
+$("estop").addEventListener("click", stopBase);
+$("speed").addEventListener("input", () => $("speedv").textContent = speed().toFixed(2) + "×");
+
+// ---- Keyboard (mirrors the buttons) ----
+const keyAxis = { w:["vx",1], s:["vx",-1], q:["vy",1], e:["vy",-1], a:["yaw",1], d:["yaw",-1] };
+const down = new Set();
+window.addEventListener("keydown", (ev) => {
+  const k = ev.key.toLowerCase();
+  if (k === " ") { stopBase(); return; }
+  if (keyAxis[k] && !down.has(k)) { down.add(k); const [ax,sg]=keyAxis[k]; setAxis(ax,sg); startBase(); }
+});
+window.addEventListener("keyup", (ev) => {
+  const k = ev.key.toLowerCase();
+  if (keyAxis[k]) { down.delete(k); clearAxes();
+    // re-apply any still-held keys
+    down.forEach(h => { const [ax,sg]=keyAxis[h]; setAxis(ax,sg); });
+    if (down.size === 0) stopBase(); else startBase();
+  }
+});
+
+// ---- Arm target sliders ----
+function setupSlider(id, axis) {
+  const el = $(id);
+  el.min = limits[axis][0]; el.max = limits[axis][1]; el.step = 0.01;
+  el.addEventListener("input", () => {
+    sliderHeld = true;
+    $(id+"v").textContent = parseFloat(el.value).toFixed(2);
+    sendTarget();
+  });
+  el.addEventListener("change", () => { sliderHeld = false; });
+}
+function curTarget() { return [parseFloat($("tx").value), parseFloat($("ty").value), parseFloat($("tz").value)]; }
+function sendTarget() { post({ type:"target", arm:activeArm, xyz: curTarget() }); }
+function setSliders(xyz) {
+  $("tx").value = xyz[0]; $("ty").value = xyz[1]; $("tz").value = xyz[2];
+  $("txv").textContent = xyz[0].toFixed(2);
+  $("tyv").textContent = xyz[1].toFixed(2);
+  $("tzv").textContent = xyz[2].toFixed(2);
+}
+["tx","ty","tz"].forEach((id,i) => setupSlider(id, ["x","y","z"][i]));
+
+document.querySelectorAll(".nudge button").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const d = [0,0,0];
+    if (btn.dataset.nx) d[0] = 0.03 * +btn.dataset.nx;
+    if (btn.dataset.ny) d[1] = 0.03 * +btn.dataset.ny;
+    if (btn.dataset.nz) d[2] = 0.03 * +btn.dataset.nz;
+    post({ type:"nudge", arm:activeArm, d });
+  });
+});
+
+$("armtabs").addEventListener("click", (e) => {
+  const b = e.target.closest("button"); if (!b) return;
+  activeArm = b.dataset.arm;
+  document.querySelectorAll("#armtabs button").forEach(x => x.classList.toggle("active", x===b));
+});
+$("home").addEventListener("click", () => { armSeeded={left:false,right:false}; post({ type:"home" }); });
+
+// ---- Grippers ----
+function gripIn(id, arm) {
+  $(id).addEventListener("input", () => {
+    $(id+"v").textContent = Math.round(parseFloat($(id).value)*100) + "%";
+    post({ type:"gripper", arm, value: parseFloat($(id).value) });
+  });
+}
+gripIn("gl","left"); gripIn("gr","right");
+document.querySelectorAll("[data-grip]").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const arm = btn.dataset.grip, v = +btn.dataset.v;
+    const sl = arm==="left" ? $("gl") : $("gr");
+    sl.value = v; $((arm==="left"?"gl":"gr")+"v").textContent = Math.round(v*100)+"%";
+    post({ type:"gripper", arm, value: v });
+  });
+});
+
+// ---- Live state polling ----
+async function poll() {
+  try {
+    const r = await fetch("/api/state");
+    const s = await r.json();
+    limits = s.limits;
+    $("dot").classList.toggle("ok", s.connected);
+    $("conn").textContent = s.connected ? "robot connected" : "no /joint_states yet";
+    $("njoints").textContent = s.njoints + " joints";
+    $("baseread").textContent =
+      `vx ${s.cmd_vel.vx.toFixed(2)} · vy ${s.cmd_vel.vy.toFixed(2)} · yaw ${s.cmd_vel.yaw.toFixed(2)}`;
+
+    // Seed sliders from the robot's actual target the first time per arm.
+    if (s.target[activeArm] && (!armSeeded[activeArm] || !sliderHeld)) {
+      if (!sliderHeld) setSliders(s.target[activeArm]);
+      armSeeded[activeArm] = true;
+    }
+    const tgt = s.target[activeArm], tip = s.tip[activeArm], dist = s.dist[activeArm];
+    const fmt = (a) => a ? `(${a[0].toFixed(2)}, ${a[1].toFixed(2)}, ${a[2].toFixed(2)})` : "—";
+    $("armread").innerHTML =
+      `target <b>${fmt(tgt)}</b> · tip <b>${fmt(tip)}</b> · error <b>${dist!=null ? (dist*100).toFixed(1)+" cm" : "—"}</b>`;
+  } catch (e) {
+    $("dot").classList.remove("ok");
+    $("conn").textContent = "panel disconnected";
+  }
+}
+setInterval(poll, 150);
+poll();
+</script>
+</body>
+</html>

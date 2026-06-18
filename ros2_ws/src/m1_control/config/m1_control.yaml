@@ -1,0 +1,7 @@
+m1_controller:
+  ros__parameters:
+    control_rate: 60.0
+    command_topic: /m1/joint_command
+    # urdf_path defaults to the installed ranger_air_description URDF; override
+    # here if you keep the URDF elsewhere.
+    # urdf_path: /home/jerry/Downloads/m1-ros2-setup/assets/ranger_air_description/urdf/ranger_air_description.urdf

@@ -1,0 +1,12 @@
+.DS_Store
+
+# Isaac Sim generated artifacts
+assets/usd/
+isaac/last_run_report.txt
+isaac/last_teleop_report.txt
+isaac/last_ros_sim_report.txt
+
+# colcon / ROS 2 build artifacts
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
