@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
-"""Build-time converter: URDF visual meshes -> decimated glTF for the Quest viz.
+"""Build-time converter: URDF visual meshes -> decimated, *coloured* glTF for the
+Quest viz.
 
 This is an *offline* tool, not part of the robot runtime. It reads the combined
 robot URDF, and for every link's ``<visual>`` mesh it:
 
-  * loads the mesh (DAE/STL, via trimesh + pycollada),
+  * loads the mesh (DAE/STL, via trimesh + pycollada) **keeping its per-solid
+    materials** -- a CAD DAE like the Agilex base is an assembly of hundreds of
+    separate solids (white body, black tyres/trim, red accents, grey hubs), and
+    each solid carries its own diffuse colour,
+  * bakes each solid's material colour onto its vertices (vertex colours), so the
+    final single-mesh export still carries the real part colours instead of one
+    flat grey -- this is what makes the base read as the actual robot,
   * bakes the URDF ``<origin>`` (link->visual transform) and the ``<mesh
     scale>`` into the geometry, so each output mesh is expressed directly in its
     *link frame* (the client then only needs the per-link FK transform),
   * flips the triangle winding when the scale mirrors (negative determinant,
     e.g. the right-arm ``1 -1 1``) so normals/back-face culling stay correct,
-  * decimates to a triangle budget so the whole robot runs on the Quest GPU,
-  * exports a self-contained ``.glb`` (geometry + normals embedded).
+  * decimates to a triangle budget so the whole robot runs on the Quest GPU, then
+    transfers the colours back onto the decimated vertices by nearest-neighbour
+    (quadric decimation does not carry vertex attributes),
+  * exports a self-contained ``.glb`` (geometry + normals + vertex colours).
 
 Identical (file, scale, origin) visuals are converted once and shared. A
 ``manifest.json`` maps each link instance to its ``.glb`` URL; the Quest page
@@ -22,7 +31,7 @@ committed, so a normal checkout already has the meshes. To run it, make a
 throwaway venv with the conversion deps (kept out of the repo):
 
     python3 -m venv .meshconv_venv
-    .meshconv_venv/bin/pip install "trimesh>=4" pycollada fast-simplification numpy
+    .meshconv_venv/bin/pip install "trimesh>=4" pycollada fast-simplification numpy scipy
     .meshconv_venv/bin/python tools/convert_meshes.py
     # then rebuild so colcon copies the new meshes into the package:
     (cd ros2_ws && colcon build --symlink-install --packages-select m1_control)
@@ -42,6 +51,7 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 import trimesh
+from scipy.spatial import cKDTree
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 URDF = os.path.join(
@@ -57,6 +67,10 @@ MESH_OUT = os.path.join(OUT_DIR, "meshes")
 # are far too heavy for a mobile XR GPU; this keeps each link light while still
 # clearly readable as the real part.
 FACE_BUDGET = 3500
+
+# Fallback colour for a solid with no usable material (RGBA, 0-255). A neutral
+# light grey, matching what the old material-less pipeline rendered everything as.
+DEFAULT_COLOR = np.array([200, 200, 200, 255], dtype=np.uint8)
 
 
 def _rpy(roll: float, pitch: float, yaw: float) -> np.ndarray:
@@ -77,21 +91,95 @@ def _resolve(filename: str) -> str:
     return filename
 
 
-def _load_mesh(path: str) -> trimesh.Trimesh | None:
-    """Load a mesh path into a single concatenated Trimesh (or None)."""
+def _srgb_to_linear(c: np.ndarray) -> np.ndarray:
+    """sRGB display values (0..1) -> linear (0..1).
+
+    The CAD/DAE material colours are authored as sRGB display colours, but glTF
+    ``COLOR_0`` vertex colours are **linear** (three.js r161 has colour
+    management on and encodes the lit result back to sRGB on output). Baking the
+    sRGB value straight in would wash the darks out to grey; converting to linear
+    here makes the headset reproduce the true part colours (proper black tyres).
+    """
+    c = np.clip(np.asarray(c, dtype=np.float64), 0.0, 1.0)
+    return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+
+
+def _material_color(geom: trimesh.Trimesh) -> np.ndarray:
+    """Best-effort **linear** RGBA (0-255 uint8) for one source solid's material.
+
+    Handles both glTF-style PBR materials (``baseColorFactor``, 0..1 floats) and
+    classic materials (``diffuse``, usually 0..255), and falls back to any
+    vertex colours already on the solid, then to a neutral grey. The RGB is
+    converted sRGB->linear (see :func:`_srgb_to_linear`) so the headset shows the
+    real base colours (black tyres, red accents, white body) instead of a flat
+    grey blob.
+    """
+    def _to_linear_u8(c: np.ndarray) -> np.ndarray:
+        """sRGB RGBA in 0..1 -> linear RGBA uint8 (alpha left linear/unchanged)."""
+        c = np.asarray(c, dtype=np.float64).reshape(-1)
+        if c.size == 3:
+            c = np.concatenate([c, [1.0]])
+        rgb = _srgb_to_linear(c[:3])
+        out = np.concatenate([rgb, [np.clip(c[3], 0.0, 1.0)]])
+        return np.clip(out * 255.0, 0, 255).astype(np.uint8)
+
+    vis = getattr(geom, "visual", None)
+    if vis is not None:
+        mat = getattr(vis, "material", None)
+        if mat is not None:
+            for attr in ("baseColorFactor", "diffuse"):
+                c = getattr(mat, attr, None)
+                if c is None:
+                    continue
+                c = np.asarray(c, dtype=np.float64).reshape(-1)
+                if c.size < 3:
+                    continue
+                if c.max() > 1.0 + 1e-6:  # 0..255 -> 0..1
+                    c = c / 255.0
+                return _to_linear_u8(c)
+        # Already-coloured solids (rare for CAD DAEs): take the first colour.
+        vc = getattr(vis, "vertex_colors", None)
+        if vc is not None and len(vc):
+            return _to_linear_u8(np.asarray(vc[0], dtype=np.float64) / 255.0)
+    return _to_linear_u8(DEFAULT_COLOR.astype(np.float64) / 255.0)
+
+
+def _load_colored(path: str) -> trimesh.Trimesh | None:
+    """Load a mesh into one Trimesh, baking each solid's material as vertex colour.
+
+    Loaded with ``process=False`` so the DAE scene's per-solid geometry and
+    materials survive (force='mesh' would flatten the materials away). Each solid
+    gets a uniform vertex colour from its material, then all solids are
+    concatenated -- so the merged mesh keeps the multi-colour appearance of the
+    real part.
+    """
     try:
-        loaded = trimesh.load(path, force="mesh", process=False)
+        loaded = trimesh.load(path, process=False)
     except Exception as exc:  # noqa: BLE001
         print(f"    ! load failed: {exc}")
         return None
+
     if isinstance(loaded, trimesh.Scene):
-        geoms = [g for g in loaded.geometry.values() if isinstance(g, trimesh.Trimesh)]
-        if not geoms:
-            return None
-        loaded = trimesh.util.concatenate(geoms)
-    if not isinstance(loaded, trimesh.Trimesh) or loaded.faces.shape[0] == 0:
+        items = [g for g in loaded.geometry.values()
+                 if isinstance(g, trimesh.Trimesh) and g.faces.shape[0]]
+    elif isinstance(loaded, trimesh.Trimesh):
+        items = [loaded] if loaded.faces.shape[0] else []
+    else:
+        items = []
+    if not items:
         return None
-    return loaded
+
+    colored = []
+    for g in items:
+        col = _material_color(g)
+        g = g.copy()
+        g.visual = trimesh.visual.ColorVisuals(
+            mesh=g, vertex_colors=np.tile(col, (len(g.vertices), 1)))
+        colored.append(g)
+    merged = trimesh.util.concatenate(colored)
+    if not isinstance(merged, trimesh.Trimesh) or merged.faces.shape[0] == 0:
+        return None
+    return merged
 
 
 def _bake(mesh: trimesh.Trimesh, scale: np.ndarray, xyz: np.ndarray,
@@ -103,7 +191,8 @@ def _bake(mesh: trimesh.Trimesh, scale: np.ndarray, xyz: np.ndarray,
     M[:3, 3] = xyz
     m.apply_transform(M)
     # A mirroring transform (det<0) inverts triangle winding; flip it back so
-    # outward normals and back-face culling remain correct.
+    # outward normals and back-face culling remain correct. Vertex colours are
+    # per-vertex and unaffected by the winding flip.
     if np.linalg.det(M[:3, :3]) < 0:
         m.invert()
     return m
@@ -119,7 +208,8 @@ def _weld(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
     coherently and instead emits giant degenerate slivers spanning the whole
     part (and holes) -- which is why heavily-decimated parts like the lift column
     rendered as invisible/shattered fragments. Welding first gives the decimator
-    a connected surface so it simplifies cleanly.
+    a connected surface so it simplifies cleanly. ``merge_vertices`` keeps the
+    per-solid vertex colours (it only merges vertices that also share a colour).
     """
     m = mesh.copy()
     try:
@@ -130,6 +220,14 @@ def _weld(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
     return m
 
 
+def _vertex_colors(mesh: trimesh.Trimesh) -> np.ndarray | None:
+    vis = getattr(mesh, "visual", None)
+    vc = getattr(vis, "vertex_colors", None) if vis is not None else None
+    if vc is None or len(vc) != len(mesh.vertices):
+        return None
+    return np.asarray(vc).copy()
+
+
 def _decimate(mesh: trimesh.Trimesh, budget: int) -> trimesh.Trimesh:
     # Weld first (see ``_weld``): decimating an unwelded triangle soup shatters
     # the part into spikes/holes -- the bug that left the lift column invisible.
@@ -137,16 +235,32 @@ def _decimate(mesh: trimesh.Trimesh, budget: int) -> trimesh.Trimesh:
     # topology of multi-body CAD parts); that's fine -- the result is correct and
     # still far lighter than full res, which matters more than hitting the budget.
     mesh = _weld(mesh)
-    if mesh.faces.shape[0] <= budget:
-        return mesh
-    try:
-        out = mesh.simplify_quadric_decimation(face_count=budget)
-    except Exception as exc:  # noqa: BLE001
-        print(f"    ! decimate failed ({exc}); keeping welded full res")
-        return mesh
-    if out is None or out.faces.shape[0] == 0:
-        print("    ! decimation produced empty mesh; keeping welded full res")
-        return mesh
+    ref_pts = mesh.vertices.copy()
+    ref_col = _vertex_colors(mesh)
+
+    out = mesh
+    if mesh.faces.shape[0] > budget:
+        try:
+            out = mesh.simplify_quadric_decimation(face_count=budget)
+        except Exception as exc:  # noqa: BLE001
+            print(f"    ! decimate failed ({exc}); keeping welded full res")
+            out = mesh
+        if out is None or out.faces.shape[0] == 0:
+            print("    ! decimation produced empty mesh; keeping welded full res")
+            out = mesh
+
+    # Quadric decimation drops vertex attributes, so re-attach colours by
+    # nearest source vertex. Colour regions are spatially coherent (a solid is
+    # one colour), so nearest-neighbour transfer is exact except within a
+    # triangle of a colour boundary -- imperceptible at viz scale.
+    if ref_col is not None and len(out.vertices):
+        if len(out.vertices) == len(ref_pts) and out is mesh:
+            new_col = ref_col
+        else:
+            _, idx = cKDTree(ref_pts).query(out.vertices)
+            new_col = ref_col[idx]
+        out = out.copy()
+        out.visual = trimesh.visual.ColorVisuals(mesh=out, vertex_colors=new_col)
     return out
 
 
@@ -189,7 +303,7 @@ def main() -> int:
                     print(f"  - {lname}: missing source {src}")
                     continue
                 print(f"  + {lname}: {os.path.basename(fname)}")
-                mesh = _load_mesh(src)
+                mesh = _load_colored(src)
                 if mesh is None:
                     continue
                 in_faces = mesh.faces.shape[0]

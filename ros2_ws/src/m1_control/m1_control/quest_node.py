@@ -732,11 +732,17 @@ let lastViz=null, inFlight=false, meshesLoaded=false;
 const linkNodes={}, targetMesh={}, tipMesh={}, errLine={}, wire={};
 const recenterPrev={left:false, right:false};
 
-// One clean, opaque, mostly-non-metallic material for the whole robot (the
-// converted meshes ship geometry only). Double-sided so heavy decimation can't
-// leave see-through holes.
+// Robot materials. The converted meshes now carry per-solid VERTEX COLOURS
+// baked from the real CAD materials (white body, black tyres/trim, red accents),
+// so links with colour data use a vertex-colour material to render the real
+// part; links without (e.g. plain STL solids) fall back to a neutral grey. Both
+// are matte and double-sided so heavy decimation can't leave see-through holes.
 const ROBOT_MAT=new THREE.MeshStandardMaterial({
   color:0xc7ccd4, metalness:0.15, roughness:0.62, side:THREE.DoubleSide,
+});
+const ROBOT_MAT_VC=new THREE.MeshStandardMaterial({
+  color:0xffffff, vertexColors:true, metalness:0.12, roughness:0.65,
+  side:THREE.DoubleSide,
 });
 
 async function chooseMode(){
@@ -798,15 +804,16 @@ async function loadRobot(){
     try{
       if(!cache[e.mesh]) cache[e.mesh]=await loader.loadAsync(e.mesh);
       const obj=cache[e.mesh].scene.clone(true);
-      // The converted glTFs carry geometry only (no materials/colors), so
-      // GLTFLoader would hand back three's default fully-metallic material,
-      // which renders dark/patchy and looks see-through. Replace it with one
-      // clean opaque matte material (double-sided so decimated winding never
-      // leaves holes).
+      // GLTFLoader hands back three's default fully-metallic material, which
+      // renders dark/patchy and looks see-through. Replace it: meshes that carry
+      // baked vertex colours get the vertex-colour material (so the real part
+      // colours show); colourless ones get the neutral grey. Double-sided so
+      // decimated winding never leaves holes.
       obj.traverse((o)=>{ if(o.isMesh){
         if(!o.geometry.attributes.normal) o.geometry.computeVertexNormals();
+        const hasColor=!!o.geometry.attributes.color;
         if(o.material && o.material.dispose) o.material.dispose();
-        o.material=ROBOT_MAT;
+        o.material=hasColor?ROBOT_MAT_VC:ROBOT_MAT;
       }});
       let node=linkNodes[e.link];
       if(!node){ node=new THREE.Group(); linkNodes[e.link]=node; robotRoot.add(node); }

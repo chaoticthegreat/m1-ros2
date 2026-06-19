@@ -56,16 +56,26 @@ real driver; everything in `ros2_ws/` is unchanged.
     DOFs can't drift between elbow/base branches. Result: no random snaps, the
     held arm stays put when the other moves, and ~1 ms/tick.
   * **Cold** (first solve / arm-set change / big jump): full multi-seed restart
-    search, but (a) arm joints regularize to mid-range while the **lift stays
-    free** so very high/low targets still solve, (b) any arm whose target barely
-    moved is *pinned* to its cached branch and kept out of the restart shuffle
-    (only the jumping arm + shared lift are re-searched), and (c) candidates are
-    chosen by residual with a proximity tie-break, so a distant IK branch is
-    taken only when it genuinely reaches better — never to shave off a sub-mm.
-  The solved goal is cached while the target holds. Benchmarks: `_solver_bench.py`
-  (cold reach) 100% of reachable single-arm targets <1 mm; `_teleop_stress.py`
-  (continuous tracking) drove single-arm goal jumps from ~5 rad → <0.03 rad and
-  per-tick time from ~19 ms → ~1 ms with 0% over the 60 Hz budget.
+    search, but (a) the primary solve regularizes arm joints to mid-range while
+    the **lift stays free** so very high/low targets still solve, while the
+    **restart probes run pure-task** on the re-searched DOFs (the mid-range pull
+    drags an extreme near-boundary target short, so the probes drop it and reach
+    sub-mm), (b) any arm whose target barely moved is *pinned* to its cached
+    branch (and the shared lift is anchored toward its cached height) so a big
+    move on one arm doesn't drag the held one, and (c) candidates are chosen by
+    residual with a proximity tie-break. The cold search is **amortized across
+    ticks**: each tick spends a bounded iteration budget (`_IK_COLD_BUDGET`) and
+    carries the unfinished primary/probe state in the cache (`job`, resumable via
+    `_pump_restart`), so the worst-case `solve_step` stays ~7 ms (was ~120 ms when
+    the whole search ran in one tick) while the *total* search is more thorough.
+  Every tick also applies a small capped per-arm Cartesian **hold correction** to
+  the command (each arm's own joints, shared lift fixed) so the arms are
+  decoupled through the lift. The solved goal is cached while the target holds.
+  Benchmarks (`_solver_test.py`, the full suite — 15/15 gates): **100% of
+  reachable single-arm targets <1 mm from cold** (was 22 mm worst), dual-arm
+  <1.2 mm, **worst-case `solve_step` ~6.6 ms / 0% over the 60 Hz budget** (was
+  ~122 ms), held-arm far-jump disturbance 25 mm → ~10 mm; `_teleop_stress.py`
+  continuous tracking still 0.17 mm at ~1 ms.
 - `.../swerve.py` — swerve base kinematics (vx, vy, yaw → steer + wheel spin).
 - `.../controller_node.py` — the only node you talk to. Subscribes to pose
  targets / cmd_vel / gripper + /joint_states; publishes unified
@@ -98,10 +108,14 @@ real driver; everything in `ros2_ws/` is unchanged.
  the `/api/xr` response (`UrdfModel.link_transforms` + `mat_to_quat`). A target
  sphere per arm turns green→amber→red by fingertip distance (so impossible goals
  are obvious); B/Y recenters the model, which is anchored ~1.1 m in front on the
- floor. The glTF meshes (`web_assets/meshes/*.glb`, ~4 MB, decimated to ~3.5k
+ floor. The glTF meshes (`web_assets/meshes/*.glb`, ~5 MB, decimated to ~3.5k
  faces/link, visual origin+scale baked in, mirrored winding flipped) are produced
  offline by `tools/convert_meshes.py` (needs a throwaway trimesh venv — see its
- docstring; re-run + rebuild only when meshes/URDF change). The node serves
+ docstring; re-run + rebuild only when meshes/URDF change). Each solid's real CAD
+ **material colour is baked in as glTF vertex colours** (sRGB→linear), so the base
+ reads as the actual robot — white body, black tyres/trim, red accents — instead
+ of the old flat grey; the client renders COLOR_0 with a vertex-colour material
+ (`ROBOT_MAT_VC`), falling back to grey for any colourless solid. The node serves
  `/manifest.json`, `/vendor/*`, `/meshes/*` as static files. Falls back to a
  wireframe (from `arms.points`) if the manifest is missing. three.js is the only
  third-party dep and it's vendored, so it stays a self-contained web app.
@@ -144,13 +158,15 @@ is not running — the web panel's status dot makes this obvious.
 ## Status / what's verified
 
 - `colcon build` clean (4 pkgs). All Python syntax-checked.
-- IK converges to the optimal reachable configuration, recruits the lift, and
-  shares the lift across both arms. Benchmarked standalone (`_solver_bench.py`,
-  no ROS) against targets generated as the FK of real joint configs: **100% of
-  reachable single-arm targets reach <1 mm** (mean ~0.3 mm) and **100% of
-  jointly-feasible dual-arm targets reach <5 mm** (mean ~0.4 mm). Steady-state
-  `solve_step` cost ~0.6 ms; the heavy iterate-and-restart search runs only on a
-  cold target change (cached / refined otherwise).
+- **Full solver suite `_solver_test.py` (no ROS): 15/15 gates pass.** Covers
+  reachability (single+dual), continuous tracking, hold-under-disturbance,
+  latency distribution, and stress. Key results: **100% of reachable single-arm
+  targets <1 mm *from a cold start*** (mean 0.21 mm, was 95% / 22 mm worst before
+  the amortized pure-task restart), dual-arm 100% <5 mm (max 1.2 mm), **worst-case
+  `solve_step` ~6.6 ms with 0% over the 60 Hz budget** (was ~122 ms), held-arm
+  far-jump disturbance ~10 mm (was 25 mm). `_solver_bench.py` agrees (single/dual
+  100%, max `solve_step` 6.5 ms). Steady-state `solve_step` ~0.6–1 ms; the cold
+  iterate-and-restart search is amortized across ticks so no tick blows the budget.
 - **Teleop tracking verified** (`_teleop_stress.py`, no ROS): streams a smoothly
   moving target like the Quest does. Continuous single-arm tracking holds <1 mm
   with goal jumps <0.03 rad (was: tens-to-hundreds of mm with ~5 rad branch
@@ -202,18 +218,19 @@ is not running — the web panel's status dot makes this obvious.
  minimises the combined (equal-weight) fingertip error. Two arms with targets at
  very different heights therefore share the lift as a compromise; clear one
  arm's target if you want the lift to commit entirely to the other.
-- Worst-case `solve_step` latency: only a *cold* target (first solve / arm-set
-  change / jump > `_IK_TRACK_JUMP`) triggers the iterate-and-restart search
-  (bounded, ~tens of ms, up to ~120 ms in the rare hard dual-arm cold case);
-  continuous tracking and steady ticks are ~1 ms (warm-start refine / cache
-  reuse, no restart). If you ever need a hard real-time bound on the cold case,
-  amortise the restart seeds across ticks.
+- Worst-case `solve_step` latency is now bounded ~7 ms: the cold iterate-and-
+  restart search is **amortized across ticks** (`_IK_COLD_BUDGET` + a resumable
+  `job` in the cache), so no single tick runs the whole multi-seed search.
+  Continuous tracking / steady ticks remain ~1 ms. The trade-off is that a hard
+  cold target now *converges over a handful of ticks* (~100–200 ms wall) instead
+  of one slow tick — the command leads toward the best-so-far meanwhile, so the
+  arm starts moving immediately and the goal only sharpens.
 - A big *discontinuous* target jump on one arm (e.g. typing a far XYZ in the web
-  panel, or `send_pose`) still re-solves the coupled two-arm system once; the
-  held arm is pinned to its branch but the shared lift may swing to serve the
-  jumping arm, so the held gripper can transiently ride the lift before its
-  joints recompensate. Quest teleop never does this (the clutch moves the target
-  continuously), so it stays in the smooth tracking path.
+  panel, or `send_pose`) re-solves the coupled two-arm system; the held arm is
+  pinned, the shared lift is anchored toward its cached height, and a per-arm
+  Cartesian hold correction keeps the held gripper planted — its transient ride
+  is down to ~10 mm (was ~25 mm) and recovers. Quest teleop never does this (the
+  clutch moves the target continuously), so it stays in the smooth tracking path.
 - Base `/m1/cmd_vel` is open-loop swerve; no odometry is published yet.
 - The Isaac graph publishes `/joint_states` + `/clock` only; TF comes from
   robot_state_publisher on the ROS side. No camera/lidar/IMU bridged yet (the

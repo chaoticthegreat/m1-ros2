@@ -27,6 +27,17 @@ teleports to a far IK branch. While tracking, the cached goal is an excellent
 warm start, so each tick just refines a few in-branch iterations: smooth (no
 random elbow/base flips), cheap, and decoupled (nudging one arm's target leaves
 the other arm's solution put).
+
+The cold multi-seed search is *amortized* across control ticks: each tick spends
+a bounded iteration budget and carries the unfinished primary/probe state in the
+cache, advancing it on the following ticks while the command already leads toward
+the best-so-far goal. So the worst-case ``solve_step`` stays well inside the
+60 Hz budget (~7 ms, vs ~120 ms when the whole search ran in one tick) even as
+the *total* search is more thorough than before -- which is what lifts hard,
+near-workspace-boundary targets to sub-mm. Finally, every tick applies a small
+per-arm Cartesian "hold" correction to the command (each arm's own joints,
+shared lift fixed), so the two arms are decoupled through the lift: a held arm
+keeps its fingertip planted while the lift slews to serve the other arm.
 """
 
 from __future__ import annotations
@@ -54,7 +65,21 @@ import numpy as np
 IK_SV_EPS = 0.04          # smallest singular value below which damping turns on
 IK_DAMPING_MAX = 0.06     # peak DLS damping injected right at a singularity
 IK_NULL_GAIN = 0.04       # null-space pull toward mid-range (posture quality)
+# When one arm holds a target while the other makes a big (cold) jump, the shared
+# lift would otherwise swing across to serve the jumping arm and drag the held
+# gripper with it (the held arm's joints can't recompensate the lift travel
+# instantly, so its fingertip rides the lift through the transition). Anchoring
+# the lift toward its cached height with this gain keeps that swing small, so the
+# held arm barely moves; the jumping arm just leans more on its own 7 joints.
+IK_LIFT_HOLD_GAIN = 0.12
 IK_MAX_DQ = 0.22          # max joint motion (rad) the command leads per tick
+# Per-arm Cartesian hold correction applied to the *command* each tick: with the
+# shared lift fixed, a small capped damped step on each arm's own 7 joints pulls
+# its gripper onto its target. This decouples the two arms through the shared
+# lift -- a held arm keeps its fingertip planted while the lift slews to serve the
+# other arm, instead of riding the lift through the transition. Capped small so it
+# only trims the Cartesian error and never overrides the global IK branch choice.
+_IK_ARM_HOLD_CAP = 0.06   # max joint motion (rad) of the per-arm hold correction
 IK_POS_TOL = 0.001        # internal-solve convergence tolerance (m)
 IK_CMD_DEADBAND = 1e-4    # hold the command still once the solved step (rad) is tiny
 
@@ -67,6 +92,39 @@ _IK_STEP_TOL = 1e-6       # stop iterating once the internal step is this small
 _IK_RESTART_TOL = 0.005   # residual (m) above which we try alternate seeds
 _IK_RANK_TOL = 1e-6       # singular values below this are treated as zero
 _IK_TARGET_EPS = 1e-4     # target move (m) under which a cached solve is reused
+
+# Posture (null-space) regularization toward a reference pose helps the redundant
+# resolution converge cleanly on well-conditioned solves (notably the dual-arm
+# shared-lift compromise) -- so the *primary* solve keeps it. But it drags an arm
+# reaching for an *extreme* (near workspace-boundary, e.g. very high) target short
+# of the goal: with the lift clamped at its limit the null space can no longer
+# hold the gripper, so the pull toward mid-range leaks into the task and the arm
+# settles ~18-22 mm short. Those targets are exactly the ones whose primary solve
+# overshoots the restart tolerance, so the restart probes run as *pure task* (no
+# posture pull) -- which reaches them sub-mm -- and the residual comparison keeps
+# whichever is best. Normal/dual targets converge in the primary (posture kept);
+# only a genuinely hard target falls through to the pure-task restart.
+
+# Stall detection: a solve that stops making progress (a poor basin or a
+# transiently-unreachable target) should bail instead of burning the whole
+# iteration budget -- this is what bounds the cold-solve worst-case latency.
+_IK_STALL_ITERS = 6       # consecutive non-improving iters before bailing a solve
+# Only a *flat/worsening* residual counts as a stall -- near a singularity a solve
+# converges slowly but steadily, and bailing that slow progress leaves extreme
+# targets short. So the bar for "progress" is tiny: anything still decreasing is
+# kept; only a genuine plateau (an unreachable target at its closest config) bails.
+_IK_STALL_REL = 1e-5      # relative residual improvement that still counts as progress
+
+# Cold-solve latency bound (amortized restart). The multi-seed restart search is
+# the only thing that ever blew the 60 Hz budget (~120 ms when it ran every seed
+# in one tick). We instead spend at most this many internal iterations per tick
+# and carry the unfinished restart seeds in the cache, advancing them on the
+# following (still-steady) ticks -- the command meanwhile leads toward the
+# best-so-far goal, so the arm starts moving immediately and the goal only
+# sharpens over the next few ms. This makes every tick bounded while the *total*
+# search done is actually larger (more seeds), which also lifts hard/extreme
+# targets the old one-shot search left short.
+_IK_COLD_BUDGET = 18      # max internal GN iterations spent on a cold search per tick
 
 # Continuous-tracking gate. A teleop bridge (Quest/web/keyboard) nudges the
 # target a little every tick, so a move smaller than this is treated as
@@ -405,7 +463,7 @@ class ReachController:
         objective onto the task null space.
         """
         U, s, Vt = np.linalg.svd(J, full_matrices=False)
-        s_min = s[-1] if s.size else 0.0
+        s_min = float(s[-1]) if s.size else 0.0
         if s_min >= IK_SV_EPS:
             lam2 = 0.0
         else:
@@ -431,10 +489,23 @@ class ReachController:
         """
         q = np.clip(np.asarray(seed, dtype=np.float64), lo, hi)
         dist = {}
+        prev_res = float("inf")
+        stall = 0
+        iters = 0
         for _ in range(max_iters):
+            iters += 1
             J, e, dist = self._stack(q, joint_order, arms, targets)
-            if max(dist.values()) < IK_POS_TOL:
+            res = max(dist.values())
+            if res < IK_POS_TOL:
                 break
+            # Bail out of a basin that has stopped improving (bounds latency).
+            if res > prev_res * (1.0 - _IK_STALL_REL):
+                stall += 1
+                if stall >= _IK_STALL_ITERS:
+                    break
+            else:
+                stall = 0
+            prev_res = res
             dq_task, N = self._dls(J, e)
             dq_null = null_gain * (null_target - q)
             dq = dq_task + N @ dq_null
@@ -445,7 +516,7 @@ class ReachController:
             if nrm < _IK_STEP_TOL:
                 _, _, dist = self._stack(q, joint_order, arms, targets)
                 break
-        return q, dist
+        return q, dist, iters
 
     @staticmethod
     def _better(res_try, ref_try, res_best, ref_best):
@@ -467,20 +538,91 @@ class ReachController:
         """Diverse seeds used to escape a local minimum / poor start pose.
 
         Sweeping the shared lift (last entry) over its range with the arms at
-        mid-range covers the dominant reachability factor (target height); a
-        couple of random arm postures add coverage for awkward orientations.
-        These only run on a target change whose primary solve fell short, so the
-        list is kept short to bound the worst-case re-solve latency.
+        mid-range covers the dominant reachability factor (target height); a set
+        of random arm postures adds coverage for awkward orientations and extreme
+        (near workspace-boundary) targets a mid-range arm can't reach. The search
+        is amortized across ticks (see ``_IK_COLD_BUDGET``), so we can afford a
+        generous seed list -- the per-tick cost stays bounded regardless.
         """
         mid = 0.5 * (lo + hi)
         seeds = []
-        for frac in (0.0, 0.35, 0.7, 1.0):
+        for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
             s = mid.copy()
             s[-1] = lo[-1] + frac * (hi[-1] - lo[-1])
             seeds.append(s)
-        for _ in range(2):
+        for _ in range(7):
             seeds.append(lo + self._restart_rng.random(lo.shape[0]) * (hi - lo))
         return seeds
+
+    def _pump_restart(self, job, joint_order, arms, targets, lo, hi, budget):
+        """Advance a pending cold restart search by up to ``budget`` GN iters.
+
+        Finishes the (resumable) primary solve first, then probes the remaining
+        diverse seeds -- pure task on the free DOFs -- keeping the best by
+        residual with the proximity tie-break. Mutates ``job`` in place and sets
+        ``job['done']`` once the seed list is exhausted or the best is already at
+        tolerance. Because the work is capped per tick and carried in the cache,
+        the heavy multi-seed search never blows the control-loop budget while
+        still, in total, searching more thoroughly than the old one-shot pass.
+        """
+        used = 0
+
+        def consider(q, dist):
+            res = max(dist.values())
+            ref = float(np.linalg.norm(q - job["ref"]))
+            if self._better(res, ref, job["best_res"], job["best_ref"]):
+                job["q_best"], job["dist_best"] = q, dist
+                job["best_res"], job["best_ref"] = res, ref
+
+        # Resume the primary solve until it converges, stalls, or hits the cap.
+        if not job["primary_done"]:
+            b = min(budget - used, _IK_MAX_ITERS - job["primary_iters"])
+            if b > 0:
+                q, dist, it = self._solve_from(
+                    job["q_primary"], joint_order, arms, targets, lo, hi,
+                    job["null_target"], job["null_gain"], max_iters=b)
+                job["q_primary"], job["primary_iters"] = q, job["primary_iters"] + it
+                used += it
+                consider(q, dist)
+                # Done if it converged, stalled early (it < b), or hit the cap.
+                if (job["best_res"] < IK_POS_TOL or it < b
+                        or job["primary_iters"] >= _IK_MAX_ITERS):
+                    job["primary_done"] = True
+                # A good-enough primary needs no restart probes at all.
+                if job["best_res"] <= _IK_RESTART_TOL:
+                    job["seeds"] = []
+
+        # Probe the remaining seeds within the leftover budget. Each probe is
+        # *resumable*: it advances by at most the per-tick budget and continues on
+        # the next tick(s) until it converges/stalls, so a probe is never cut
+        # mid-convergence (which would waste a seed) yet no single tick runs more
+        # than ``budget`` iterations.
+        while (job["primary_done"] and used < budget
+               and job["best_res"] > IK_POS_TOL):
+            if job["probe_q"] is None:
+                if not job["seeds"]:
+                    break
+                raw = np.asarray(job["seeds"].pop(0), dtype=np.float64)
+                pq = job["base_seed"].copy()
+                pq[job["free"]] = raw[job["free"]]
+                job["probe_q"], job["probe_iters"] = pq, 0
+            b = min(budget - used, _IK_PROBE_ITERS - job["probe_iters"])
+            if b <= 0:
+                break
+            q, dist, it = self._solve_from(
+                job["probe_q"], joint_order, arms, targets, lo, hi,
+                job["null_target"], job["probe_gain"], max_iters=b)
+            job["probe_q"], job["probe_iters"] = q, job["probe_iters"] + it
+            used += it
+            consider(q, dist)
+            # Probe finished if it converged, stalled (it < b), or hit its cap.
+            if (max(dist.values()) < IK_POS_TOL or it < b
+                    or job["probe_iters"] >= _IK_PROBE_ITERS):
+                job["probe_q"] = None
+
+        job["done"] = job["primary_done"] and job["probe_q"] is None and (
+            not job["seeds"] or job["best_res"] <= IK_POS_TOL)
+        return job["q_best"], job["dist_best"]
 
     def solve_step(self, q_meas: dict, targets: dict) -> dict:
         """Drive the command one bounded step toward the optimal reach solution.
@@ -537,23 +679,35 @@ class ReachController:
             arm_jump = {a: float("inf") for a in arms}
             jump = float("inf")
 
-        if cache_arms_match and jump < _IK_TARGET_EPS:
-            # Target is steady (operator bridges republish it every tick): reuse
-            # the goal we already solved instead of re-running the full IK.
+        job = cache.get("job") if cache_arms_match else None
+
+        if cache_arms_match and jump < _IK_TARGET_EPS and job is not None:
+            # Target is steady but a multi-seed restart search is still pending
+            # from a recent cold solve: advance it within this tick's budget. The
+            # command keeps leading toward the best-so-far goal meanwhile, so the
+            # arm is already moving while the goal sharpens over the next few ticks.
+            q_best, dist_best = self._pump_restart(
+                job, joint_order, arms, targets, lo, hi, _IK_COLD_BUDGET)
+            self._cache = {
+                "arms": tuple(arms), "targets": tgt_vecs,
+                "q_best": q_best, "dist": dist_best,
+                "job": None if job["done"] else job,
+            }
+        elif cache_arms_match and jump < _IK_TARGET_EPS:
+            # Steady, nothing pending: reuse the goal we already solved.
             q_best, dist_best = cache["q_best"], cache["dist"]
         elif cache_arms_match and jump < _IK_TRACK_JUMP:
             # Continuous tracking: the target only nudged, so the previous goal
             # is an excellent warm start. Refine a few in-branch iterations and
             # DO NOT restart -- a global search here is what made the arm snap to
-            # a random branch and made one moving arm disturb the other.
-            q_best, dist_best = self._solve_from(
+            # a random branch and made one moving arm disturb the other. (Any
+            # pending cold search is dropped: the target has moved on.)
+            q_best, dist_best, _ = self._solve_from(
                 cache["q_best"], joint_order, arms, targets, lo, hi,
                 cache["q_best"], track_gain, max_iters=_IK_TRACK_ITERS)
             self._cache = {
-                "arms": tuple(arms),
-                "targets": tgt_vecs,
-                "q_best": q_best,
-                "dist": dist_best,
+                "arms": tuple(arms), "targets": tgt_vecs,
+                "q_best": q_best, "dist": dist_best,
             }
         else:
             # Cold target (first solve / arm-set change / large jump). When the
@@ -567,6 +721,7 @@ class ReachController:
             null_gain = cold_gain.copy()
             free = np.zeros(len(joint_order), dtype=bool)
             free[lift_idx] = True  # the shared lift is always free to re-search
+            held_exists = False
             for a in arms:
                 sl = slice(joint_order.index(ARM_JOINTS[a][0]),
                            joint_order.index(ARM_JOINTS[a][0]) + 7)
@@ -575,40 +730,44 @@ class ReachController:
                     # toward the cached goal); it stays out of the restart shuffle.
                     null_target[sl] = cache["q_best"][sl]
                     null_gain[sl] = IK_NULL_GAIN
+                    held_exists = True
                 else:
                     free[sl] = True
+            # If an arm is being held, anchor the shared lift toward its cached
+            # height (see IK_LIFT_HOLD_GAIN) so it doesn't swing across to serve
+            # the jumping arm and drag the held gripper through the transition.
+            if held_exists:
+                null_target[lift_idx] = cache["q_best"][lift_idx]
+                null_gain[lift_idx] = IK_LIFT_HOLD_GAIN
 
-            base_seed = cache["q_best"].copy() if cache_arms_match else q_meas_vec
-            q_best, dist_best = self._solve_from(
-                base_seed, joint_order, arms, targets, lo, hi,
-                null_target, null_gain)
-            best_res = max(dist_best.values())
-            best_ref = float(np.linalg.norm(q_best - ref))
-
-            # Large residual means a poor basin (e.g. the singular zero pose or a
-            # distant new target): search diverse seeds for the free DOFs only.
-            # We prefer the lowest residual, but break near-ties toward the
-            # configuration closest to the reference, for continuity.
-            if best_res > _IK_RESTART_TOL:
-                for raw in [q_meas_vec] + self._restart_seeds(lo, hi):
-                    seed = base_seed.copy()
-                    seed[free] = np.asarray(raw, dtype=np.float64)[free]
-                    q_try, dist_try = self._solve_from(
-                        seed, joint_order, arms, targets, lo, hi, null_target,
-                        null_gain, max_iters=_IK_PROBE_ITERS)
-                    res_try = max(dist_try.values())
-                    ref_try = float(np.linalg.norm(q_try - ref))
-                    if self._better(res_try, ref_try, best_res, best_ref):
-                        q_best, dist_best, best_res, best_ref = (
-                            q_try, dist_try, res_try, ref_try)
-                        if best_res < IK_POS_TOL:
-                            break
-
+            base_seed = (cache["q_best"].copy() if cache_arms_match
+                         else q_meas_vec.copy())
+            # The restart probes drop the posture pull on the *free* (re-searched)
+            # DOFs -- pure task -- so an extreme target the posture-regularized
+            # primary settled short of is reached sub-mm; a held arm keeps its
+            # pinning gain (and the lift anchor above). The whole search is run
+            # amortized across ticks (_pump_restart) so no single tick exceeds the
+            # latency budget.
+            probe_gain = null_gain.copy()
+            probe_gain[free] = 0.0
+            if held_exists:
+                probe_gain[lift_idx] = IK_LIFT_HOLD_GAIN
+            job = {
+                "base_seed": base_seed, "q_primary": base_seed.copy(),
+                "primary_iters": 0, "primary_done": False,
+                "null_target": null_target, "null_gain": null_gain,
+                "probe_gain": probe_gain, "free": free, "ref": ref,
+                "seeds": [q_meas_vec.copy()] + self._restart_seeds(lo, hi),
+                "probe_q": None, "probe_iters": 0,  # resumable in-flight probe
+                "q_best": base_seed.copy(), "dist_best": {a: float("inf") for a in arms},
+                "best_res": float("inf"), "best_ref": float("inf"), "done": False,
+            }
+            q_best, dist_best = self._pump_restart(
+                job, joint_order, arms, targets, lo, hi, _IK_COLD_BUDGET)
             self._cache = {
-                "arms": tuple(arms),
-                "targets": tgt_vecs,
-                "q_best": q_best,
-                "dist": dist_best,
+                "arms": tuple(arms), "targets": tgt_vecs,
+                "q_best": q_best, "dist": dist_best,
+                "job": None if job["done"] else job,
             }
 
         # Command stepping: lead the measured pose toward the solved goal by a
@@ -622,6 +781,26 @@ class ReachController:
         if nrm > IK_MAX_DQ:
             dq *= IK_MAX_DQ / nrm
         q_cmd = np.clip(q_meas_vec + dq, lo, hi)
+
+        # Per-arm Cartesian hold (see _IK_ARM_HOLD_CAP): with the shared lift held
+        # at its commanded height, trim each arm's own 7 joints so its gripper
+        # stays on its target. Keeps a held arm planted while the lift slews for
+        # the other arm; on a steadily-tracking arm the error is sub-mm so this is
+        # a negligible refinement.
+        q_cmd_d = {jn: float(q_cmd[k]) for k, jn in enumerate(joint_order)}
+        for a in arms:
+            aj = ARM_JOINTS[a]
+            tip, Ja = self.chains[a].position_jacobian(q_cmd_d, aj)
+            err = np.asarray(targets[a], dtype=np.float64) - tip
+            if float(np.linalg.norm(err)) < IK_POS_TOL:
+                continue
+            dq_a, _ = self._dls(Ja, err)
+            n = float(np.linalg.norm(dq_a))
+            if n > _IK_ARM_HOLD_CAP:
+                dq_a *= _IK_ARM_HOLD_CAP / n
+            for k, j in enumerate(aj):
+                gi = joint_order.index(j)
+                q_cmd[gi] = min(hi[gi], max(lo[gi], q_cmd[gi] + float(dq_a[k])))
 
         out = {jname: float(q_cmd[k]) for k, jname in enumerate(joint_order)}
         out["_dist"] = dist_best
