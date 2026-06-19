@@ -129,6 +129,61 @@ or the robot first). Override the bind address/port with parameters:
 ros2 run m1_control m1_web --ros-args -p host:=0.0.0.0 -p port:=9000
 ```
 
+## Meta Quest controller teleop (WebXR, sim and real robot)
+
+`m1_quest` lets you drive the two gripper target poses with the Quest's hand
+controllers using **only the headset's built-in browser** — no app install, no
+sideloading, no ADB, no Unity. It serves one WebXR page; the Quest opens it,
+enters an immersive AR (passthrough) session, and streams both controllers'
+6-DoF poses + buttons back over the LAN. Those map onto the same `/m1/*` topics
+as everything else, so it drives the simulator and the real robot identically.
+No extra Python dependencies (stdlib HTTPS server + plain HTML/JS).
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source /home/jerry/Downloads/m1-ros2-setup/ros2_ws/install/setup.bash
+ros2 run m1_control m1_quest      # prints the https URLs to open on the Quest
+```
+
+WebXR needs a **secure context**, so the server speaks **HTTPS** with a
+self-signed certificate it auto-generates on first run (via `openssl`, cached in
+`~/.cache/m1_quest/`). The node logs the `https://<ip>:8443` URLs for this
+machine's LAN addresses.
+
+On the Quest (same Wi‑Fi as this machine):
+
+1. Open the **Meta Quest Browser** and go to the printed `https://<ip>:8443`.
+2. You'll get a "connection is not private" warning (self-signed cert) — tap
+   **Advanced → Proceed**. (One-time per URL.)
+3. Tap **Enter (passthrough)**. You'll see your real room with the robot's
+   targets driven by your hands.
+
+Controls (each hand drives the same-side arm):
+
+```
+Grip (squeeze) ... CLUTCH — hold to "grab" that arm; the gripper target follows
+                   your hand's motion. Release to freeze & recenter your hand.
+Trigger .......... that arm's gripper, analog (squeeze = close).
+Left stick ....... drive the base (push to translate forward/back/strafe).
+Right stick ...... turn (yaw).
+A / X button ..... re-home that arm's target to its current fingertip.
+```
+
+The motion is **clutched + relative** (move a little, release, recenter,
+continue — like lifting a mouse) so you don't have to match the robot's
+workspace with your shoulders. Tune the hand→robot ratio and disable base
+driving with parameters:
+
+```bash
+ros2 run m1_control m1_quest --ros-args \
+  -p motion_scale:=1.5 -p enable_base:=false -p port:=9443
+```
+
+Same safety model as the web panel: arm targets only move while you hold the
+clutch, and the base is dead-man'd (zeros if updates stop). If `/joint_states`
+isn't arriving (sim/robot not running) nothing moves — the page shows a "robot
+feedback" status dot.
+
 ## Interactive teleop in a terminal (sim and real robot)
 
 `m1_teleop` is the operator console. It only publishes to the controller's

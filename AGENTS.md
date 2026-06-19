@@ -65,6 +65,16 @@ real driver; everything in `ros2_ws/` is unchanged.
  `isaac/teleop.py` which drives the Isaac articulation directly and is sim-only).
  Keeps a per-arm Cartesian target seeded from `/joint_states` FK so the arm
  doesn't jump on connect.
+- `.../quest_node.py` — `ros2 run m1_control m1_quest`: Meta Quest WebXR teleop.
+ Serves ONE self-contained WebXR page over **HTTPS** (self-signed cert auto-made
+ with openssl into `~/.cache/m1_quest/`; WebXR needs a secure context over LAN
+ IP). The Quest browser opens it, enters immersive-ar (passthrough) and POSTs
+ both controllers' grip-space poses + buttons to `/api/xr`. The node maps each
+ hand to the same-side arm with **clutched relative** motion (hold Grip to move,
+ release to recenter), Trigger→gripper, thumbsticks→base, A/X→re-seed. Publishes
+ only to `/m1/*`, so sim + real, exactly like `web_node`/`teleop_node`. WebXR
+ axes (x right, y up, −z fwd) → ROS base_link (x fwd, y left, z up) in
+ `_webxr_to_ros`. No extra deps (stdlib HTTPS + embedded HTML/JS).
 - `.../web_node.py` — `ros2 run m1_control m1_web`: browser control panel on
  http://localhost:8080. Same `/m1/*`-only bridge (sim + real). Stdlib HTTP
  server + embedded HTML/JS (no extra deps); base drive pad, per-arm Cartesian

@@ -29,6 +29,7 @@ setup(
             "m1_send_pose = m1_control.send_pose:main",
             "m1_teleop = m1_control.teleop_node:main",
             "m1_web = m1_control.web_node:main",
+            "m1_quest = m1_control.quest_node:main",
         ],
     },
 )
