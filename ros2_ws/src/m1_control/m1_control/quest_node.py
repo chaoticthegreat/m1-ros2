@@ -262,8 +262,11 @@ class M1QuestNode(Node):
             self._last_update = self._now()
             controllers = data.get("controllers", {})
             head_fwd = data.get("head")  # headset forward vector (WebXR space)
+            # Physical controllers are cross-mapped: the LEFT controller drives
+            # the RIGHT arm and vice versa.
+            controller_for_arm = {"left": "right", "right": "left"}
             for arm in ("left", "right"):
-                c = controllers.get(arm)
+                c = controllers.get(controller_for_arm[arm])
                 if not c or not c.get("valid"):
                     # Lost tracking for this hand: drop the clutch so we don't
                     # jump when it returns.
@@ -295,9 +298,9 @@ class M1QuestNode(Node):
                     d = (hand - self.clutch_hand0[arm]) * self.motion_scale
                     F, L = self.clutch_F[arm], self.clutch_L[arm]
                     robot_delta = np.array([
-                        float(d @ L),   # left     -> +x  (x/y swapped)
-                        float(d @ F),   # forward  -> +y  (x/y swapped)
-                        float(d[1]),    # up       -> +z
+                        float(-(d @ L)),  # right    -> +x  (x/y swapped, x reversed)
+                        float(d @ F),     # forward  -> +y  (x/y swapped)
+                        float(d[1]),      # up       -> +z
                     ])
                     self._set_target(arm, self.clutch_target0[arm] + robot_delta)
                 elif not squeeze:

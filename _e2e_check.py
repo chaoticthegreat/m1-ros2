@@ -93,8 +93,8 @@ def main():
     web = M1WebNode()
 
     from http.server import ThreadingHTTPServer
-    from m1_control.web_node import _make_handler, _resolve_web_dir
-    httpd = ThreadingHTTPServer(("127.0.0.1", PORT), _make_handler(web, _resolve_web_dir()))
+    from m1_control.web_node import _make_handler
+    httpd = ThreadingHTTPServer(("127.0.0.1", PORT), _make_handler(web))
     httpd.daemon_threads = True
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
 

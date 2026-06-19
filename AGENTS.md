@@ -43,12 +43,29 @@ real driver; everything in `ros2_ws/` is unchanged.
   geometric Jacobian + damped-least-squares (DLS) Cartesian reach. Jacobian
   verified against finite differences. The reach is a full iterated Gauss-Newton
   IK: each call iterates the model to the optimal joint configuration for the
-  target(s) with adaptive (singularity-aware) damping and multi-seed restarts to
-  avoid local minima, then leads the measured pose toward it by a bounded step.
-  Reachable targets converge sub-mm; unreachable ones settle at the closest the
-  joints allow. The solved goal is cached while the target holds, so the heavy
-  search runs only on a target change (steady ticks cost one bounded step;
-  benchmark `_solver_bench.py`: 100% of reachable single-arm targets <1 mm).
+  target(s) with adaptive (singularity-aware) damping, then leads the measured
+  pose toward it by a bounded step. Reachable targets converge sub-mm;
+  unreachable ones settle at the closest the joints allow. `solve_step`
+  distinguishes two regimes so it is smooth for teleop AND globally optimal for
+  cold targets (this split fixed the Quest "arm snaps to a random pose / moving
+  one arm wrecks the other / sometimes slow" bugs):
+  * **Tracking** (same arms active, target moved < `_IK_TRACK_JUMP`≈6 cm, i.e. a
+    bridge nudging the goal each tick): warm-start from the cached goal, refine a
+    few in-branch iterations, **no global restart**. The whole config (lift
+    included) is gently regularized toward the previous goal, so the redundant
+    DOFs can't drift between elbow/base branches. Result: no random snaps, the
+    held arm stays put when the other moves, and ~1 ms/tick.
+  * **Cold** (first solve / arm-set change / big jump): full multi-seed restart
+    search, but (a) arm joints regularize to mid-range while the **lift stays
+    free** so very high/low targets still solve, (b) any arm whose target barely
+    moved is *pinned* to its cached branch and kept out of the restart shuffle
+    (only the jumping arm + shared lift are re-searched), and (c) candidates are
+    chosen by residual with a proximity tie-break, so a distant IK branch is
+    taken only when it genuinely reaches better — never to shave off a sub-mm.
+  The solved goal is cached while the target holds. Benchmarks: `_solver_bench.py`
+  (cold reach) 100% of reachable single-arm targets <1 mm; `_teleop_stress.py`
+  (continuous tracking) drove single-arm goal jumps from ~5 rad → <0.03 rad and
+  per-tick time from ~19 ms → ~1 ms with 0% over the 60 Hz budget.
 - `.../swerve.py` — swerve base kinematics (vx, vy, yaw → steer + wheel spin).
 - `.../controller_node.py` — the only node you talk to. Subscribes to pose
  targets / cmd_vel / gripper + /joint_states; publishes unified
@@ -119,16 +136,30 @@ is not running — the web panel's status dot makes this obvious.
   no ROS) against targets generated as the FK of real joint configs: **100% of
   reachable single-arm targets reach <1 mm** (mean ~0.3 mm) and **100% of
   jointly-feasible dual-arm targets reach <5 mm** (mean ~0.4 mm). Steady-state
-  `solve_step` cost ~0.7 ms; the heavy iterate-and-restart search runs only on a
-  target change (cached otherwise).
+  `solve_step` cost ~0.6 ms; the heavy iterate-and-restart search runs only on a
+  cold target change (cached / refined otherwise).
+- **Teleop tracking verified** (`_teleop_stress.py`, no ROS): streams a smoothly
+  moving target like the Quest does. Continuous single-arm tracking holds <1 mm
+  with goal jumps <0.03 rad (was: tens-to-hundreds of mm with ~5 rad branch
+  flips — the reported "snaps to a random pose"); a held arm stays at ~0 mm while
+  the other sweeps (was: >130 mm); per-tick time ~1 ms, 0% over the 60 Hz budget
+  (was ~19 ms mean, 22% over). A separate scenario covers a large single-arm
+  jump (cold re-solve) keeping the held arm's transient small.
 - Lift recruitment verified standalone: commanding one arm high drives the lift
  up so the gripper reaches; commanding both arms together shares the lift as the
  least-squares compromise. Both arms with targets are solved together in one
  stacked system, so the lift serves both grippers optimally.
-- End-to-end ROS test (fake /joint_states, real DDS): both arms reach FK-derived
-  targets to ~0 cm and recruit the shared lift; /m1/cmd_vel → correct wheel
-  velocities + steer angles. (`_e2e_check.py` has a pre-existing unrelated
-  web-node import error; the reach path itself is verified.)
+- End-to-end ROS test (`_ros_reach_check.py`, fake /joint_states, real DDS,
+  timer-driven so the executor isn't GIL-starved): static target converges to
+  <1 mm, a smoothly moving target tracks with <5 mm fingertip steps and no
+  jumps, and the held arm stays within ~2 mm while the other sweeps. Stable
+  across repeated runs. (NB: drive target/metric loops from ROS timers, not a
+  main-thread `sleep` loop — the latter starves callbacks and makes the
+  controller see the target *teleport*, which falsely looks like a solver bug.)
+- `_e2e_check.py` (web-panel path): its web-node import was repaired
+  (`_make_handler(node)`; `_resolve_web_dir` no longer exists), but it still has
+  further stale web-panel API assumptions (`/api/state` no longer returns
+  `njoints`); the reach path is covered by `_ros_reach_check.py` instead.
 - `isaac/ros_sim.py` itself was NOT run end-to-end by the agent (no GPU/display
   in the sandbox). The user confirmed it loads after the `set_target_prims` fix.
 
@@ -158,10 +189,18 @@ is not running — the web panel's status dot makes this obvious.
  minimises the combined (equal-weight) fingertip error. Two arms with targets at
  very different heights therefore share the lift as a compromise; clear one
  arm's target if you want the lift to commit entirely to the other.
-- Worst-case `solve_step` latency: a target *change* triggers the iterate-and-
-  restart search (bounded, ~tens of ms in the rare hard/cold case); steady ticks
-  reuse the cached solution. If you ever need a hard real-time bound, amortise
-  the restart seeds across ticks.
+- Worst-case `solve_step` latency: only a *cold* target (first solve / arm-set
+  change / jump > `_IK_TRACK_JUMP`) triggers the iterate-and-restart search
+  (bounded, ~tens of ms, up to ~120 ms in the rare hard dual-arm cold case);
+  continuous tracking and steady ticks are ~1 ms (warm-start refine / cache
+  reuse, no restart). If you ever need a hard real-time bound on the cold case,
+  amortise the restart seeds across ticks.
+- A big *discontinuous* target jump on one arm (e.g. typing a far XYZ in the web
+  panel, or `send_pose`) still re-solves the coupled two-arm system once; the
+  held arm is pinned to its branch but the shared lift may swing to serve the
+  jumping arm, so the held gripper can transiently ride the lift before its
+  joints recompensate. Quest teleop never does this (the clutch moves the target
+  continuously), so it stays in the smooth tracking path.
 - Base `/m1/cmd_vel` is open-loop swerve; no odometry is published yet.
 - The Isaac graph publishes `/joint_states` + `/clock` only; TF comes from
   robot_state_publisher on the ROS side. No camera/lidar/IMU bridged yet (the

@@ -17,10 +17,16 @@ saturate at the closest configuration the limits allow.
 
 When both arms reach at once they are solved together in one stacked system, so
 the shared lift column is resolved as the least-squares compromise that best
-serves both grippers (instead of the two arms fighting over the lift). The
-solved goal is cached and reused while the target holds steady, so the heavy
-search runs only when a target actually changes -- each control tick otherwise
-costs a single bounded step.
+serves both grippers (instead of the two arms fighting over the lift).
+
+The solver distinguishes a *cold* target (first solve, a changed arm set, or a
+big jump) from *tracking* (a teleop bridge nudging the goal a little each tick).
+Only a cold target runs the heavy multi-seed search -- and even then it breaks
+near-ties toward the pose closest to where the arm already is, so it never
+teleports to a far IK branch. While tracking, the cached goal is an excellent
+warm start, so each tick just refines a few in-branch iterations: smooth (no
+random elbow/base flips), cheap, and decoupled (nudging one arm's target leaves
+the other arm's solution put).
 """
 
 from __future__ import annotations
@@ -55,11 +61,25 @@ IK_CMD_DEADBAND = 1e-4    # hold the command still once the solved step (rad) is
 # Internal Gauss-Newton iteration controls.
 _IK_MAX_ITERS = 80        # max iterations for the primary solve
 _IK_PROBE_ITERS = 40      # max iterations for each restart-seed probe
+_IK_TRACK_ITERS = 24      # max iterations when refining a warm-started track
 _IK_INT_MAX_DQ = 0.40     # cap on a single internal iteration's joint step (rad)
 _IK_STEP_TOL = 1e-6       # stop iterating once the internal step is this small
 _IK_RESTART_TOL = 0.005   # residual (m) above which we try alternate seeds
 _IK_RANK_TOL = 1e-6       # singular values below this are treated as zero
 _IK_TARGET_EPS = 1e-4     # target move (m) under which a cached solve is reused
+
+# Continuous-tracking gate. A teleop bridge (Quest/web/keyboard) nudges the
+# target a little every tick, so a move smaller than this is treated as
+# *tracking*: we warm-start from the cached goal and refine in-branch instead of
+# launching the global multi-seed restart search. That keeps the arm locked to
+# the same elbow/shoulder solution (smooth, no random snaps) and cheap, while a
+# genuinely new/cold target (a bigger jump) still gets the full search below.
+_IK_TRACK_JUMP = 0.06     # target move (m) at/under which we stay in-branch
+# When the cold search compares restart seeds, two solutions whose residuals are
+# within this band are considered equally good, so we break the tie by joint-
+# space proximity to the current pose -- never snapping to a far IK branch just
+# because it shaves a fraction of a millimetre off an already-tiny residual.
+_IK_CONTINUITY_BAND = 0.002
 
 # End-effector link + fingertip offset (ee-local frame), from teleop.py.
 EE_LINK_NAME = {
@@ -254,13 +274,6 @@ class ReachController:
     def __init__(self, model: UrdfModel):
         self.model = model
         self.chains = {arm: ArmChain(model, arm) for arm in ("left", "right")}
-        self.arm_mid = {}
-        for arm in ("left", "right"):
-            mids = []
-            for j in ARM_JOINTS[arm]:
-                joint = model.joints[j]
-                mids.append(0.5 * (joint.lower + joint.upper))
-            self.arm_mid[arm] = np.array(mids, dtype=np.float64)
         self._restart_rng = np.random.default_rng(0xC0FFEE)
         # Cache of the last fully-solved goal. The optimal joint configuration
         # depends only on the (fixed) target, not on where the arm currently is,
@@ -315,12 +328,17 @@ class ReachController:
         N = np.eye(J.shape[1], dtype=np.float64) - Vr.T @ Vr
         return dq, N
 
-    def _solve_from(self, seed, joint_order, arms, targets, lo, hi, null_slices,
-                    max_iters=_IK_MAX_ITERS):
+    def _solve_from(self, seed, joint_order, arms, targets, lo, hi,
+                    null_target, null_gain, max_iters=_IK_MAX_ITERS):
         """Iterate damped Gauss-Newton from ``seed`` to convergence.
 
         Joint limits are enforced by clamping every iterate, so an unreachable
         target naturally settles at the closest configuration the joints allow.
+        The secondary (null-space) objective pulls each DOF toward
+        ``null_target`` with per-DOF weight ``null_gain``; callers use this to
+        keep the redundant DOFs well-behaved (arms toward mid-range on a cold
+        solve, or the whole config toward the previous goal while tracking, so
+        the shared lift cannot drift into a local minimum it can't escape).
         """
         q = np.clip(np.asarray(seed, dtype=np.float64), lo, hi)
         dist = {}
@@ -329,9 +347,7 @@ class ReachController:
             if max(dist.values()) < IK_POS_TOL:
                 break
             dq_task, N = self._dls(J, e)
-            dq_null = np.zeros(len(joint_order), dtype=np.float64)
-            for base, mid in null_slices:
-                dq_null[base:base + 7] = IK_NULL_GAIN * (mid - q[base:base + 7])
+            dq_null = null_gain * (null_target - q)
             dq = dq_task + N @ dq_null
             nrm = float(np.linalg.norm(dq))
             if nrm > _IK_INT_MAX_DQ:
@@ -341,6 +357,22 @@ class ReachController:
                 _, _, dist = self._stack(q, joint_order, arms, targets)
                 break
         return q, dist
+
+    @staticmethod
+    def _better(res_try, ref_try, res_best, ref_best):
+        """Is the candidate a better cold-solve pick than the incumbent?
+
+        Primary key is the Cartesian residual; but when two candidates reach
+        within ``_IK_CONTINUITY_BAND`` of each other we treat them as equally
+        good and prefer the one closest (joint space) to the current pose. This
+        is what stops the search from snapping to a distant IK branch merely to
+        trim a sub-millimetre off an already-converged residual.
+        """
+        if res_try < res_best - _IK_CONTINUITY_BAND:
+            return True
+        if res_try <= res_best + _IK_CONTINUITY_BAND:
+            return ref_try < ref_best
+        return False
 
     def _restart_seeds(self, lo, hi):
         """Diverse seeds used to escape a local minimum / poor start pose.
@@ -367,6 +399,19 @@ class ReachController:
         ``targets`` maps arm -> 3D world point (base frame). Returns a dict of
         joint name -> new commanded position plus ``"_dist"`` (per-arm residual
         of the solved configuration). ``q_meas`` is the measured joint dict.
+
+        Two regimes share one code path:
+
+        * **Tracking** -- the same arms are active and the target moved only a
+          little (an operator bridge nudging the goal each tick): we warm-start
+          from the cached goal and refine *in branch*, never launching the
+          global restart search. This keeps teleop smooth (no random elbow/base
+          flips) and cheap, and it isolates the arms -- nudging one arm's target
+          leaves the other's solution where it was.
+        * **Cold** -- first solve, the active arm set changed, or the target
+          jumped far: run the full multi-seed search, but choose among seeds by
+          residual *with a proximity tie-break*, so a distant IK branch is taken
+          only when it genuinely reaches better, not to shave off a sub-mm.
         """
         arms = [a for a in ("left", "right") if targets.get(a) is not None]
         if not arms:
@@ -379,44 +424,94 @@ class ReachController:
         if LIFT_JOINT not in joint_order:
             joint_order.append(LIFT_JOINT)
         lo, hi = self._bounds(joint_order)
-        null_slices = [
-            (joint_order.index(ARM_JOINTS[a][0]), self.arm_mid[a]) for a in arms
-        ]
+        mid_vec = 0.5 * (lo + hi)
+        lift_idx = joint_order.index(LIFT_JOINT)
+        # Cold solve: regularize the arm joints toward mid-range but leave the
+        # lift free, so an extreme (e.g. very high) target can drive the lift to
+        # its limit -- this is what keeps every reachable target solvable.
+        cold_gain = np.full(len(joint_order), IK_NULL_GAIN, dtype=np.float64)
+        cold_gain[lift_idx] = 0.0
+        # Tracking: regularize the whole config (lift included) toward the
+        # previous goal, damping redundant drift so the solution stays in-branch.
+        track_gain = np.full(len(joint_order), IK_NULL_GAIN, dtype=np.float64)
 
         q_meas_vec = np.array([q_meas.get(j, 0.0) for j in joint_order], dtype=np.float64)
         tgt_vecs = [np.asarray(targets[a], dtype=np.float64) for a in arms]
 
         cache = self._cache
         cache_arms_match = cache is not None and cache["arms"] == tuple(arms)
-        unchanged = cache_arms_match and all(
-            np.linalg.norm(c - t) < _IK_TARGET_EPS
-            for c, t in zip(cache["targets"], tgt_vecs))
+        if cache_arms_match:
+            arm_jump = {a: float(np.linalg.norm(c - t))
+                        for a, c, t in zip(arms, cache["targets"], tgt_vecs)}
+            jump = max(arm_jump.values())
+        else:
+            arm_jump = {a: float("inf") for a in arms}
+            jump = float("inf")
 
-        if unchanged:
+        if cache_arms_match and jump < _IK_TARGET_EPS:
             # Target is steady (operator bridges republish it every tick): reuse
             # the goal we already solved instead of re-running the full IK.
             q_best, dist_best = cache["q_best"], cache["dist"]
-        else:
-            # Warm-start from the cached goal when the same arms are reaching (a
-            # nudged target reconverges in a few iterations); otherwise seed from
-            # the measured pose. Either way we stay in the nearest IK branch.
-            seed0 = cache["q_best"] if cache_arms_match else q_meas_vec
+        elif cache_arms_match and jump < _IK_TRACK_JUMP:
+            # Continuous tracking: the target only nudged, so the previous goal
+            # is an excellent warm start. Refine a few in-branch iterations and
+            # DO NOT restart -- a global search here is what made the arm snap to
+            # a random branch and made one moving arm disturb the other.
             q_best, dist_best = self._solve_from(
-                seed0, joint_order, arms, targets, lo, hi, null_slices)
+                cache["q_best"], joint_order, arms, targets, lo, hi,
+                cache["q_best"], track_gain, max_iters=_IK_TRACK_ITERS)
+            self._cache = {
+                "arms": tuple(arms),
+                "targets": tgt_vecs,
+                "q_best": q_best,
+                "dist": dist_best,
+            }
+        else:
+            # Cold target (first solve / arm-set change / large jump). When the
+            # same arms are active we *pin* any arm whose target barely moved to
+            # its cached configuration and only re-search the arm(s) that jumped
+            # (plus the shared lift). That stops a big move on one arm from
+            # flinging the other one onto a different IK branch -- the held arm's
+            # joints just compensate for the shared lift instead of teleporting.
+            ref = cache["q_best"] if cache_arms_match else q_meas_vec
+            null_target = mid_vec.copy()
+            null_gain = cold_gain.copy()
+            free = np.zeros(len(joint_order), dtype=bool)
+            free[lift_idx] = True  # the shared lift is always free to re-search
+            for a in arms:
+                sl = slice(joint_order.index(ARM_JOINTS[a][0]),
+                           joint_order.index(ARM_JOINTS[a][0]) + 7)
+                if cache_arms_match and arm_jump[a] < _IK_TRACK_JUMP:
+                    # Held arm: keep it on its current branch (pin + regularize
+                    # toward the cached goal); it stays out of the restart shuffle.
+                    null_target[sl] = cache["q_best"][sl]
+                    null_gain[sl] = IK_NULL_GAIN
+                else:
+                    free[sl] = True
+
+            base_seed = cache["q_best"].copy() if cache_arms_match else q_meas_vec
+            q_best, dist_best = self._solve_from(
+                base_seed, joint_order, arms, targets, lo, hi,
+                null_target, null_gain)
             best_res = max(dist_best.values())
+            best_ref = float(np.linalg.norm(q_best - ref))
 
             # Large residual means a poor basin (e.g. the singular zero pose or a
-            # distant new target): search diverse seeds and keep the global best
-            # so we converge to the optimal reachable configuration, never a
-            # local minimum. This only runs when the target actually changes.
+            # distant new target): search diverse seeds for the free DOFs only.
+            # We prefer the lowest residual, but break near-ties toward the
+            # configuration closest to the reference, for continuity.
             if best_res > _IK_RESTART_TOL:
-                for seed in [q_meas_vec] + self._restart_seeds(lo, hi):
+                for raw in [q_meas_vec] + self._restart_seeds(lo, hi):
+                    seed = base_seed.copy()
+                    seed[free] = np.asarray(raw, dtype=np.float64)[free]
                     q_try, dist_try = self._solve_from(
-                        seed, joint_order, arms, targets, lo, hi, null_slices,
-                        max_iters=_IK_PROBE_ITERS)
+                        seed, joint_order, arms, targets, lo, hi, null_target,
+                        null_gain, max_iters=_IK_PROBE_ITERS)
                     res_try = max(dist_try.values())
-                    if res_try < best_res:
-                        q_best, dist_best, best_res = q_try, dist_try, res_try
+                    ref_try = float(np.linalg.norm(q_try - ref))
+                    if self._better(res_try, ref_try, best_res, best_ref):
+                        q_best, dist_best, best_res, best_ref = (
+                            q_try, dist_try, res_try, ref_try)
                         if best_res < IK_POS_TOL:
                             break
 
