@@ -9,6 +9,19 @@ setup(
     name=package_name,
     version="0.1.0",
     packages=find_packages(exclude=["test"]),
+    # Vendored Quest web assets (three.js + converted glTF meshes + manifest)
+    # served by m1_quest. Kept inside the package so they ship with a plain
+    # (non-symlink) install too; the node locates them via __file__.
+    package_data={
+        package_name: [
+            "web_assets/manifest.json",
+            "web_assets/vendor/*.js",
+            "web_assets/vendor/addons/loaders/*.js",
+            "web_assets/vendor/addons/utils/*.js",
+            "web_assets/meshes/*.glb",
+        ],
+    },
+    include_package_data=True,
     data_files=[
         ("share/ament_index/resource_index/packages",
             ["resource/" + package_name]),

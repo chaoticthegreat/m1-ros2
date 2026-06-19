@@ -63,7 +63,22 @@ from m1_control.kinematics import (
     LIFT_JOINT,
     ReachController,
     UrdfModel,
+    mat_to_quat,
 )
+
+# Vendored web assets (three.js + converted glTF meshes + manifest) served by
+# this node so the headset page is fully self-contained over the LAN.
+WEB_ASSETS = os.path.join(os.path.dirname(__file__), "web_assets")
+_STATIC_TYPES = {
+    ".js": "text/javascript; charset=utf-8",
+    ".mjs": "text/javascript; charset=utf-8",
+    ".json": "application/json",
+    ".glb": "model/gltf-binary",
+    ".gltf": "model/gltf+json",
+    ".bin": "application/octet-stream",
+    ".png": "image/png",
+    ".html": "text/html; charset=utf-8",
+}
 
 # --- Command / safety limits -------------------------------------------------
 MAX_LINEAR = 0.5         # forward / reverse speed (m/s)
@@ -335,8 +350,20 @@ class M1QuestNode(Node):
         points are in the robot ``base_link`` frame; the page anchors that
         frame to a fixed spot in the room.
         """
-        viz = {"frame": "base_link", "arms": {}}
+        viz = {"frame": "base_link", "arms": {}, "links": {}}
         have_js = bool(self.q_meas)
+        if self.reach is not None and have_js:
+            # Full-robot link poses (base_link frame) so the page can drive each
+            # mesh; cheap matrix walk over the URDF tree.
+            try:
+                Ts = self.reach.model.link_transforms(self.q_meas)
+                for name, T in Ts.items():
+                    viz["links"][name] = {
+                        "p": [round(float(T[i, 3]), 4) for i in range(3)],
+                        "q": [round(float(c), 5) for c in mat_to_quat(T[:3, :3])],
+                    }
+            except Exception:  # noqa: BLE001
+                pass
         for arm in ("left", "right"):
             a = {"target": [round(float(v), 4) for v in self.target[arm]]}
             if (
@@ -442,11 +469,34 @@ def _make_handler(node: M1QuestNode):
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
+        def _send_static(self, rel: str):
+            """Serve a vendored asset (three.js / glTF / manifest) safely."""
+            rel = rel.split("?", 1)[0].lstrip("/")
+            full = os.path.normpath(os.path.join(WEB_ASSETS, rel))
+            if not full.startswith(os.path.realpath(WEB_ASSETS) + os.sep) and \
+               not full.startswith(WEB_ASSETS + os.sep):
+                self._send(403, json.dumps({"error": "forbidden"}))
+                return
+            if not os.path.isfile(full):
+                self._send(404, json.dumps({"error": "not found"}))
+                return
+            ctype = _STATIC_TYPES.get(os.path.splitext(full)[1].lower(),
+                                      "application/octet-stream")
+            try:
+                with open(full, "rb") as fh:
+                    self._send(200, fh.read(), ctype)
+            except OSError:
+                self._send(404, json.dumps({"error": "not found"}))
+
         def do_GET(self):
-            if self.path in ("/", "/index.html"):
+            path = self.path.split("?", 1)[0]
+            if path in ("/", "/index.html"):
                 self._send(200, INDEX_HTML, "text/html; charset=utf-8")
-            elif self.path == "/api/state":
+            elif path == "/api/state":
                 self._send(200, json.dumps(node.snapshot()))
+            elif path == "/manifest.json" or path.startswith("/vendor/") \
+                    or path.startswith("/meshes/"):
+                self._send_static(path)
             else:
                 self._send(404, json.dumps({"error": "not found"}))
 
@@ -553,10 +603,16 @@ def main(args=None):
 
 
 # ---------------------------------------------------------------------------
-# WebXR page (served at "/"). Plain HTML/JS, no build step, no dependencies.
-# Requests an immersive-ar session (passthrough so you still see your room),
-# falling back to immersive-vr. Each XR frame it reads both controllers' grip
-# poses + buttons and POSTs them to /api/xr (one request in flight at a time).
+# WebXR page (served at "/"). Self-contained: the only third-party code is
+# three.js, vendored locally under web_assets/ and served by this node (no CDN,
+# no build step, no install on the headset). Requests an immersive-ar session
+# (passthrough so you still see your room), falling back to immersive-vr.
+#
+# It renders an RViz-like hologram of the robot: each link's converted glTF mesh
+# is posed every frame from the per-link FK transforms streamed in the /api/xr
+# response, with a coloured target sphere per arm (green=reaching, red=out of
+# reach). Each XR frame it also reads both controllers' grip poses + buttons and
+# POSTs them to /api/xr (one request in flight at a time).
 # ---------------------------------------------------------------------------
 INDEX_HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -591,6 +647,12 @@ INDEX_HTML = r"""<!DOCTYPE html>
   #log{font-family:ui-monospace,monospace;font-size:12px;color:var(--muted);
        white-space:pre-wrap;margin-top:10px;}
 </style>
+<script type="importmap">
+{ "imports": {
+    "three": "/vendor/three.module.js",
+    "three/addons/": "/vendor/addons/"
+} }
+</script>
 </head>
 <body>
 <header><h1>M1 — Quest controller teleop</h1></header>
@@ -623,19 +685,20 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <kbd>B</kbd>/<kbd>Y</kbd> — recenter the robot hologram in front of you.
     </p>
     <p class="muted">
-      In the headset you'll see a translucent 3D "hologram" of the robot drawn
-      over your room (passthrough): a wireframe of both arms plus a coloured
-      sphere at each Cartesian target. The target sphere turns
-      <span style="color:var(--good)">green</span> when the arm is reaching it
-      and <span style="color:var(--bad)">red</span> when the pose is out of
-      reach, so you can see impossible goals immediately.
+      In the headset you'll see a 3D model of the robot (its real meshes) drawn
+      over your room in passthrough, posed live from the robot's joints, plus a
+      coloured sphere at each Cartesian target. The target turns
+      <span style="color:var(--good)">green</span> when the arm reaches it and
+      <span style="color:var(--bad)">red</span> when the pose is out of reach,
+      so you can see impossible goals immediately. (First load streams ~4 MB of
+      meshes; it's cached afterward.)
     </p>
   </div>
   <div id="log"></div>
 </main>
 
 <script>
-const log = (m)=>{ const el=document.getElementById("log");
+window.log = (m)=>{ const el=document.getElementById("log");
   el.textContent=(new Date().toLocaleTimeString()+"  "+m+"\n"+el.textContent).slice(0,2000); };
 
 /* ---- live state from the robot (2D page poll) ---- */
@@ -654,21 +717,234 @@ async function poll(){
 }
 setInterval(poll,300); poll();
 
-/* ---- WebXR teleop + in-headset 3D hologram (RViz-like, passthrough) ---- */
-let xrSession=null, refSpace=null, refIsFloor=false, gl=null, inFlight=false;
-let lastViz=null;                 // most recent geometry from /api/xr
-const recenterPrev={left:false, right:false};
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
 const enterBtn=document.getElementById("enter");
 const hint=document.getElementById("xrhint");
 
+let renderer=null, scene=null, camera=null, robotRoot=null;
+let xrSession=null, refSpace=null, refIsFloor=false, robotPlaced=false;
+let lastViz=null, inFlight=false, meshesLoaded=false;
+const linkNodes={}, targetMesh={}, tipMesh={}, errLine={}, wire={};
+const recenterPrev={left:false, right:false};
+
+// One clean, opaque, mostly-non-metallic material for the whole robot (the
+// converted meshes ship geometry only). Double-sided so heavy decimation can't
+// leave see-through holes.
+const ROBOT_MAT=new THREE.MeshStandardMaterial({
+  color:0xc7ccd4, metalness:0.15, roughness:0.62, side:THREE.DoubleSide,
+});
+
 async function chooseMode(){
-  if(!navigator.xr){ return null; }
+  if(!navigator.xr) return null;
   if(await navigator.xr.isSessionSupported("immersive-ar")) return "immersive-ar";
   if(await navigator.xr.isSessionSupported("immersive-vr")) return "immersive-vr";
   return null;
 }
 
+function reachColor(d){
+  if(d<0.02) return new THREE.Color(0x4cd964);   // reaching
+  if(d<0.08) return new THREE.Color(0xf2b33a);   // marginal
+  return new THREE.Color(0xe64d40);              // out of reach
+}
+
+/* ---- three.js scene: robot meshes + target markers, drawn over passthrough ---- */
+function initThree(){
+  renderer=new THREE.WebGLRenderer({antialias:true, alpha:true});
+  renderer.setClearAlpha(0);                  // transparent -> passthrough shows through
+  renderer.xr.enabled=true;
+  renderer.domElement.style.display="none";   // only used inside the XR session
+  document.body.appendChild(renderer.domElement);
+
+  scene=new THREE.Scene();
+  camera=new THREE.PerspectiveCamera(70, 1, 0.02, 50);
+  // Soft, even lighting so a matte robot reads well over passthrough: sky/ground
+  // hemisphere fill + a touch of ambient + two opposed directionals for shape.
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x555a60, 1.1));
+  scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+  const key=new THREE.DirectionalLight(0xffffff, 1.1); key.position.set(1.5,3,1.5);
+  scene.add(key);
+  const fill=new THREE.DirectionalLight(0xffffff, 0.5); fill.position.set(-1.5,1,-1.5);
+  scene.add(fill);
+
+  // base_link-frame container; its matrix is the room anchor (Z-up robot -> XR).
+  robotRoot=new THREE.Group(); robotRoot.matrixAutoUpdate=false; scene.add(robotRoot);
+
+  for(const arm of ["left","right"]){
+    const tg=new THREE.Mesh(new THREE.SphereGeometry(0.05,24,16),
+      new THREE.MeshStandardMaterial({color:0x4cd964, transparent:true, opacity:0.42}));
+    tg.visible=false; robotRoot.add(tg); targetMesh[arm]=tg;
+    const tp=new THREE.Mesh(new THREE.SphereGeometry(0.02,16,12),
+      new THREE.MeshStandardMaterial({color:0x33ccee, emissive:0x114455}));
+    tp.visible=false; robotRoot.add(tp); tipMesh[arm]=tp;
+    const g=new THREE.BufferGeometry().setFromPoints(
+      [new THREE.Vector3(), new THREE.Vector3()]);
+    const ln=new THREE.Line(g, new THREE.LineBasicMaterial({color:0x4cd964}));
+    ln.visible=false; robotRoot.add(ln); errLine[arm]=ln;
+  }
+}
+
+/* ---- load the converted robot meshes once (cached by the browser after) ---- */
+async function loadRobot(){
+  let manifest;
+  try{ manifest=await (await fetch("/manifest.json")).json(); }
+  catch(e){ log("no mesh manifest — using wireframe fallback"); return; }
+  const loader=new GLTFLoader(); const cache={};
+  for(const e of (manifest.links||[])){
+    try{
+      if(!cache[e.mesh]) cache[e.mesh]=await loader.loadAsync(e.mesh);
+      const obj=cache[e.mesh].scene.clone(true);
+      // The converted glTFs carry geometry only (no materials/colors), so
+      // GLTFLoader would hand back three's default fully-metallic material,
+      // which renders dark/patchy and looks see-through. Replace it with one
+      // clean opaque matte material (double-sided so decimated winding never
+      // leaves holes).
+      obj.traverse((o)=>{ if(o.isMesh){
+        if(!o.geometry.attributes.normal) o.geometry.computeVertexNormals();
+        if(o.material && o.material.dispose) o.material.dispose();
+        o.material=ROBOT_MAT;
+      }});
+      let node=linkNodes[e.link];
+      if(!node){ node=new THREE.Group(); linkNodes[e.link]=node; robotRoot.add(node); }
+      node.add(obj);
+    }catch(err){ log("mesh "+e.mesh+" failed: "+err); }
+  }
+  meshesLoaded=Object.keys(linkNodes).length>0;
+  log("loaded "+Object.keys(linkNodes).length+" robot links");
+}
+
+/* ---- per-frame: pose every link mesh + target markers from lastViz ---- */
+function updateRobot(){
+  if(!lastViz) return;
+  if(lastViz.links){
+    for(const name in lastViz.links){
+      const node=linkNodes[name]; if(!node) continue;
+      const t=lastViz.links[name];
+      node.position.set(t.p[0], t.p[1], t.p[2]);
+      node.quaternion.set(t.q[0], t.q[1], t.q[2], t.q[3]);
+    }
+  }
+  if(!meshesLoaded) updateWire();
+  for(const arm of ["left","right"]){
+    const a=lastViz.arms ? lastViz.arms[arm] : null;
+    const tg=targetMesh[arm], tp=tipMesh[arm], ln=errLine[arm];
+    if(!a || !a.target){ tg.visible=tp.visible=ln.visible=false; continue; }
+    const col=reachColor(a.dist==null?9:a.dist);
+    tg.position.set(a.target[0],a.target[1],a.target[2]);
+    tg.material.color.copy(col); tg.visible=true;
+    if(a.tip){
+      tp.position.set(a.tip[0],a.tip[1],a.tip[2]); tp.visible=true;
+      const pos=ln.geometry.attributes.position;
+      pos.setXYZ(0, a.tip[0],a.tip[1],a.tip[2]);
+      pos.setXYZ(1, a.target[0],a.target[1],a.target[2]);
+      pos.needsUpdate=true; ln.material.color.copy(col); ln.visible=true;
+    } else { tp.visible=false; ln.visible=false; }
+  }
+}
+
+/* ---- wireframe fallback when meshes are unavailable ---- */
+function updateWire(){
+  for(const arm of ["left","right"]){
+    const a=lastViz.arms ? lastViz.arms[arm] : null;
+    if(!a || !a.points){ if(wire[arm]) wire[arm].visible=false; continue; }
+    const pts=[];
+    for(let i=0;i<a.points.length-1;i++) pts.push(...a.points[i], ...a.points[i+1]);
+    let w=wire[arm];
+    if(!w){ w=new THREE.LineSegments(new THREE.BufferGeometry(),
+        new THREE.LineBasicMaterial({color:0x8c99b8}));
+      robotRoot.add(w); wire[arm]=w; }
+    w.geometry.setAttribute("position", new THREE.Float32BufferAttribute(pts,3));
+    w.geometry.attributes.position.needsUpdate=true; w.visible=true;
+  }
+}
+
+/* ---- place base_link ~1.1 m in front of the operator, on the floor ---- */
+function setAnchor(vpose, head){
+  const p=vpose.transform.position;
+  const n=Math.hypot(head[0],head[2]);
+  const F=n>1e-4?[head[0]/n,0,head[2]/n]:[0,0,-1];   // horizontal forward
+  const fy=refIsFloor?0:(p.y-1.1);                    // floor height
+  const m=new THREE.Matrix4();
+  // robot axes -> world: x=F (fwd), y=(Fz,0,-Fx) (left), z=(0,1,0) (up)
+  m.makeBasis(new THREE.Vector3(F[0],0,F[2]),
+              new THREE.Vector3(F[2],0,-F[0]),
+              new THREE.Vector3(0,1,0));
+  m.setPosition(p.x+F[0]*1.1, fy, p.z+F[2]*1.1);
+  robotRoot.matrix.copy(m); robotRoot.matrixWorldNeedsUpdate=true;
+  log("placed robot model");
+}
+
+function readController(src, frame){
+  if(!src || !src.gripSpace || !src.gamepad) return null;
+  const pose=frame.getPose(src.gripSpace, refSpace);
+  if(!pose) return {valid:false};
+  const p=pose.transform.position; const gp=src.gamepad;
+  // Quest mapping: buttons[0]=trigger,[1]=grip,[4]=A/X,[5]=B/Y; axes[2,3]=stick.
+  const trigger=gp.buttons[0]?gp.buttons[0].value:0;
+  const squeeze=gp.buttons[1]?gp.buttons[1].pressed:false;
+  const button=gp.buttons[4]?gp.buttons[4].pressed:false;
+  const recenter=gp.buttons[5]?gp.buttons[5].pressed:false;
+  const ax=gp.axes||[];
+  const stick=[ax.length>2?ax[2]:(ax[0]||0), ax.length>3?ax[3]:(ax[1]||0)];
+  return {valid:true, pos:[p.x,p.y,p.z], trigger, squeeze, button, recenter, stick};
+}
+
+/* ---- three.js animation loop: read controllers, POST, pose meshes, render ---- */
+function onFrame(t, frame){
+  if(frame && xrSession){
+    refSpace=renderer.xr.getReferenceSpace();
+    const out={left:null, right:null};
+    for(const src of xrSession.inputSources){
+      if(src.handedness==="left"||src.handedness==="right")
+        out[src.handedness]=readController(src, frame);
+    }
+    let recenter=false;
+    for(const h of ["left","right"]){
+      const c=out[h]; const now=!!(c&&c.recenter);
+      if(now && !recenterPrev[h]) recenter=true; recenterPrev[h]=now;
+    }
+    let head=null;
+    const vpose=frame.getViewerPose(refSpace);
+    if(vpose){
+      const q=vpose.transform.orientation;     // rotate (0,0,-1) by q
+      head=[ -2*(q.x*q.z + q.w*q.y),
+             -2*(q.y*q.z - q.w*q.x),
+             -(1 - 2*(q.x*q.x + q.y*q.y)) ];
+      if(!robotPlaced || recenter){ setAnchor(vpose, head); robotPlaced=true; }
+    }
+    if(!inFlight){
+      inFlight=true;
+      fetch("/api/xr",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({controllers:out, head:head}),keepalive:true})
+        .then(r=>r.json()).then(j=>{ if(j&&j.viz) lastViz=j.viz; })
+        .catch(()=>{}).finally(()=>{inFlight=false;});
+    }
+    updateRobot();
+  }
+  if(renderer) renderer.render(scene, camera);
+}
+
+async function startXR(mode){
+  try{ xrSession=await navigator.xr.requestSession(mode,
+        {optionalFeatures:["local-floor"]}); }
+  catch(e){ log("requestSession failed: "+e); return; }
+  robotPlaced=false;
+  renderer.xr.setReferenceSpaceType("local-floor"); refIsFloor=true;
+  try{ await renderer.xr.setSession(xrSession); }
+  catch(e){ log("setSession failed: "+e); xrSession=null; return; }
+  xrSession.addEventListener("end",()=>{
+    xrSession=null; renderer.setAnimationLoop(null); log("session ended"); });
+  log("session started ("+mode+")");
+  renderer.setAnimationLoop(onFrame);
+}
+
 (async ()=>{
+  initThree();
+  loadRobot();                                 // kicks off mesh download in the background
   if(!navigator.xr){
     enterBtn.textContent="WebXR not available";
     hint.textContent="Open this page in the Meta Quest browser over HTTPS. If you see a "+
@@ -681,234 +957,8 @@ async function chooseMode(){
   enterBtn.disabled=false;
   enterBtn.textContent=(mode==="immersive-ar"?"Enter (passthrough)":"Enter VR");
   enterBtn.onclick=()=>startXR(mode);
-  hint.textContent="Tip: the robot hologram appears ~1 m in front of you. Squeeze a Grip to move an arm; press B/Y to recenter the hologram.";
+  hint.textContent="Tip: the robot appears ~1 m in front of you. Squeeze a Grip to move an arm; press B/Y to recenter the model.";
 })();
-
-/* ===================== tiny column-major mat4 / vec3 ===================== */
-function m4mul(a,b){ const o=new Float32Array(16);
-  for(let c=0;c<4;c++) for(let r=0;r<4;r++){ let s=0;
-    for(let k=0;k<4;k++) s+=a[k*4+r]*b[c*4+k]; o[c*4+r]=s; } return o; }
-function cross(a,b){ return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]; }
-function vnorm(a){ const n=Math.hypot(a[0],a[1],a[2])||1; return [a[0]/n,a[1]/n,a[2]/n]; }
-
-/* ===================== GL program + unit meshes ===================== */
-let prog,locPos,locNor,locMVP,locModel,locColor,locAlpha;
-let sphere,cyl, anchorMat=null;
-
-function makeMesh(g,pos,nor,idx){
-  const p=g.createBuffer(); g.bindBuffer(g.ARRAY_BUFFER,p);
-  g.bufferData(g.ARRAY_BUFFER,new Float32Array(pos),g.STATIC_DRAW);
-  const n=g.createBuffer(); g.bindBuffer(g.ARRAY_BUFFER,n);
-  g.bufferData(g.ARRAY_BUFFER,new Float32Array(nor),g.STATIC_DRAW);
-  const e=g.createBuffer(); g.bindBuffer(g.ELEMENT_ARRAY_BUFFER,e);
-  g.bufferData(g.ELEMENT_ARRAY_BUFFER,new Uint16Array(idx),g.STATIC_DRAW);
-  return {p,n,e,count:idx.length};
-}
-function buildSphere(g,lat,lon){
-  const pos=[],nor=[],idx=[];
-  for(let i=0;i<=lat;i++){ const th=i/lat*Math.PI, st=Math.sin(th), ct=Math.cos(th);
-    for(let j=0;j<=lon;j++){ const ph=j/lon*2*Math.PI;
-      const x=st*Math.cos(ph), y=ct, z=st*Math.sin(ph);
-      pos.push(x,y,z); nor.push(x,y,z); } }
-  for(let i=0;i<lat;i++) for(let j=0;j<lon;j++){
-    const a=i*(lon+1)+j, b=a+lon+1; idx.push(a,b,a+1, b,b+1,a+1); }
-  return makeMesh(g,pos,nor,idx);
-}
-function buildCylinder(g,seg){           // unit cylinder, +Z from 0..1, radius 1
-  const pos=[],nor=[],idx=[];
-  for(let j=0;j<=seg;j++){ const ph=j/seg*2*Math.PI, c=Math.cos(ph), s=Math.sin(ph);
-    pos.push(c,s,0); nor.push(c,s,0); pos.push(c,s,1); nor.push(c,s,0); }
-  for(let j=0;j<seg;j++){ const a=j*2; idx.push(a,a+1,a+2, a+1,a+3,a+2); }
-  return makeMesh(g,pos,nor,idx);
-}
-function initGL(){
-  const vs="attribute vec3 aPos; attribute vec3 aNor; uniform mat4 uMVP; uniform mat4 uModel;"+
-    "varying vec3 vN; void main(){ gl_Position=uMVP*vec4(aPos,1.0); vN=mat3(uModel)*aNor; }";
-  const fs="precision mediump float; varying vec3 vN; uniform vec3 uColor; uniform float uAlpha;"+
-    "void main(){ vec3 n=normalize(vN); float d=max(dot(n,normalize(vec3(0.4,0.85,0.5))),0.0);"+
-    " gl_FragColor=vec4(uColor*(0.4+0.6*d), uAlpha); }";
-  const mk=(t,s)=>{ const sh=gl.createShader(t); gl.shaderSource(sh,s); gl.compileShader(sh);
-    if(!gl.getShaderParameter(sh,gl.COMPILE_STATUS)) log("shader: "+gl.getShaderInfoLog(sh)); return sh; };
-  prog=gl.createProgram();
-  gl.attachShader(prog,mk(gl.VERTEX_SHADER,vs));
-  gl.attachShader(prog,mk(gl.FRAGMENT_SHADER,fs));
-  gl.linkProgram(prog);
-  locPos=gl.getAttribLocation(prog,"aPos"); locNor=gl.getAttribLocation(prog,"aNor");
-  locMVP=gl.getUniformLocation(prog,"uMVP"); locModel=gl.getUniformLocation(prog,"uModel");
-  locColor=gl.getUniformLocation(prog,"uColor"); locAlpha=gl.getUniformLocation(prog,"uAlpha");
-  sphere=buildSphere(gl,12,16); cyl=buildCylinder(gl,12);
-  gl.enable(gl.DEPTH_TEST);
-}
-
-/* model matrices in base_link frame (anchorMat maps them into the room) */
-function sphMat(p,r){ return new Float32Array([r,0,0,0, 0,r,0,0, 0,0,r,0, p[0],p[1],p[2],1]); }
-function segMat(p0,p1,r){
-  const d=[p1[0]-p0[0],p1[1]-p0[1],p1[2]-p0[2]];
-  const len=Math.hypot(d[0],d[1],d[2]); if(len<1e-5) return null;
-  const z=[d[0]/len,d[1]/len,d[2]/len];
-  const up=Math.abs(z[1])>0.99?[1,0,0]:[0,1,0];
-  const x=vnorm(cross(up,z)); const y=cross(z,x);
-  return new Float32Array([
-    x[0]*r, x[1]*r, x[2]*r, 0,
-    y[0]*r, y[1]*r, y[2]*r, 0,
-    z[0]*len, z[1]*len, z[2]*len, 0,
-    p0[0], p0[1], p0[2], 1]);
-}
-function drawMesh(mesh,viewProj,localMat,color,alpha){
-  if(!localMat) return;
-  const modelW=m4mul(anchorMat, localMat);
-  gl.uniformMatrix4fv(locMVP,false,m4mul(viewProj,modelW));
-  gl.uniformMatrix4fv(locModel,false,modelW);
-  gl.uniform3fv(locColor,color); gl.uniform1f(locAlpha,alpha==null?1:alpha);
-  gl.bindBuffer(gl.ARRAY_BUFFER,mesh.p); gl.enableVertexAttribArray(locPos);
-  gl.vertexAttribPointer(locPos,3,gl.FLOAT,false,0,0);
-  gl.bindBuffer(gl.ARRAY_BUFFER,mesh.n); gl.enableVertexAttribArray(locNor);
-  gl.vertexAttribPointer(locNor,3,gl.FLOAT,false,0,0);
-  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,mesh.e);
-  gl.drawElements(gl.TRIANGLES,mesh.count,gl.UNSIGNED_SHORT,0);
-}
-const drawSph=(vp,p,r,c,a)=>drawMesh(sphere,vp,sphMat(p,r),c,a);
-const drawSeg=(vp,p0,p1,r,c,a)=>drawMesh(cyl,vp,segMat(p0,p1,r),c,a);
-
-function reachColor(d){ if(d<0.02) return [0.30,0.85,0.40];
-  if(d<0.08) return [0.95,0.70,0.20]; return [0.90,0.30,0.25]; }
-
-function drawScene(viewProj){
-  // base_link axes (R=x fwd, G=y left, B=z up) so the hologram is oriented.
-  drawSeg(viewProj,[0,0,0],[0.2,0,0],0.012,[0.85,0.25,0.20],1);
-  drawSeg(viewProj,[0,0,0],[0,0.2,0],0.012,[0.30,0.70,0.30],1);
-  drawSeg(viewProj,[0,0,0],[0,0,0.2],0.012,[0.30,0.50,0.85],1);
-  if(!lastViz||!lastViz.arms) return;
-  // Opaque pass: arm skeletons, joints, fingertips.
-  for(const arm of ["left","right"]){
-    const a=lastViz.arms[arm]; if(!a) continue;
-    if(a.points){
-      for(let i=0;i<a.points.length-1;i++)
-        drawSeg(viewProj,a.points[i],a.points[i+1],0.018,[0.55,0.60,0.72],1);
-      for(let i=0;i<a.points.length;i++)
-        drawSph(viewProj,a.points[i],0.026,[0.78,0.82,0.90],1);
-    }
-    if(a.tip) drawSph(viewProj,a.tip,0.03,[0.20,0.80,0.92],1);
-  }
-  // Translucent pass: target spheres + error line (depth-test, no depth write).
-  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
-  for(const arm of ["left","right"]){
-    const a=lastViz.arms[arm]; if(!a||!a.target) continue;
-    const col=reachColor(a.dist==null?9:a.dist);
-    drawSph(viewProj,a.target,0.05,col,0.45);
-    if(a.tip) drawSeg(viewProj,a.tip,a.target,0.006,col,0.9);
-  }
-  gl.depthMask(true); gl.disable(gl.BLEND);
-}
-
-/* place base_link ~1.1 m in front of the operator, on the floor, facing away */
-function setAnchor(vpose, head){
-  const p=vpose.transform.position;
-  const n=Math.hypot(head[0],head[2]);
-  const F=n>1e-4?[head[0]/n,0,head[2]/n]:[0,0,-1];   // horizontal forward
-  const fy=refIsFloor?0:(p.y-1.1);                    // floor height
-  const ax=p.x+F[0]*1.1, ay=fy, az=p.z+F[2]*1.1;
-  // robot->world rotation columns: x=F (fwd), y=(Fz,0,-Fx) (left), z=(0,1,0) (up)
-  anchorMat=new Float32Array([
-    F[0], 0, F[2], 0,
-    F[2], 0, -F[0], 0,
-    0, 1, 0, 0,
-    ax, ay, az, 1]);
-  log("placed robot hologram");
-}
-
-async function startXR(mode){
-  try{ xrSession=await navigator.xr.requestSession(mode,{optionalFeatures:["local-floor"]}); }
-  catch(e){ log("requestSession failed: "+e); return; }
-
-  const canvas=document.createElement("canvas");
-  gl=canvas.getContext("webgl",{xrCompatible:true,alpha:true});
-  await gl.makeXRCompatible();
-  xrSession.updateRenderState({baseLayer:new XRWebGLLayer(xrSession,gl)});
-  try{ refSpace=await xrSession.requestReferenceSpace("local-floor"); refIsFloor=true; }
-  catch(e){ refSpace=await xrSession.requestReferenceSpace("local"); refIsFloor=false; }
-  initGL(); anchorMat=null;
-
-  xrSession.addEventListener("end",()=>{ xrSession=null; log("session ended"); });
-  log("session started ("+mode+")");
-  xrSession.requestAnimationFrame(onXRFrame);
-}
-
-function readController(src, frame){
-  if(!src || !src.gripSpace || !src.gamepad) return null;
-  const pose=frame.getPose(src.gripSpace, refSpace);
-  if(!pose) return {valid:false};
-  const p=pose.transform.position;
-  const gp=src.gamepad;
-  // Quest mapping: buttons[0]=trigger,[1]=grip,[4]=A/X,[5]=B/Y; axes[2,3]=stick.
-  const trigger=gp.buttons[0]?gp.buttons[0].value:0;
-  const squeeze=gp.buttons[1]?gp.buttons[1].pressed:false;
-  const button=gp.buttons[4]?gp.buttons[4].pressed:false;
-  const recenter=gp.buttons[5]?gp.buttons[5].pressed:false;
-  const ax=gp.axes||[];
-  const stick=[ax.length>2?ax[2]:(ax[0]||0), ax.length>3?ax[3]:(ax[1]||0)];
-  return {valid:true, pos:[p.x,p.y,p.z], trigger, squeeze, button, recenter, stick};
-}
-
-function onXRFrame(t, frame){
-  if(!xrSession) return;
-  xrSession.requestAnimationFrame(onXRFrame);
-
-  // Required for an immersive session: bind + clear the XR framebuffer.
-  const glLayer=xrSession.renderState.baseLayer;
-  gl.bindFramebuffer(gl.FRAMEBUFFER, glLayer.framebuffer);
-  gl.clearColor(0,0,0,0);            // transparent -> passthrough shows through
-  gl.clearDepth(1.0);
-  gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
-
-  const out={left:null, right:null};
-  for(const src of xrSession.inputSources){
-    if(src.handedness==="left"||src.handedness==="right"){
-      out[src.handedness]=readController(src, frame);
-    }
-  }
-
-  // B/Y edge re-anchors the hologram in front of the operator.
-  let recenter=false;
-  for(const h of ["left","right"]){
-    const c=out[h]; const now=!!(c&&c.recenter);
-    if(now && !recenterPrev[h]) recenter=true;
-    recenterPrev[h]=now;
-  }
-
-  // Headset forward vector (WebXR space): used both to map hand motion on the
-  // server and to orient/anchor the hologram on the client.
-  let head=null;
-  const vpose=frame.getViewerPose(refSpace);
-  if(vpose){
-    const q=vpose.transform.orientation;   // rotate (0,0,-1) by q
-    head=[ -2*(q.x*q.z + q.w*q.y),
-           -2*(q.y*q.z - q.w*q.x),
-           -(1 - 2*(q.x*q.x + q.y*q.y)) ];
-    if(!anchorMat || recenter) setAnchor(vpose, head);
-  }
-
-  // Throttle: at most one POST in flight. The response carries the latest
-  // robot/target geometry, which we cache and render every frame.
-  if(!inFlight){
-    inFlight=true;
-    fetch("/api/xr",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({controllers:out, head:head}),keepalive:true})
-      .then(r=>r.json()).then(j=>{ if(j&&j.viz) lastViz=j.viz; })
-      .catch(()=>{}).finally(()=>{inFlight=false;});
-  }
-
-  // Draw the hologram for each eye.
-  if(vpose && anchorMat){
-    gl.useProgram(prog);
-    for(const view of vpose.views){
-      const vp=glLayer.getViewport(view);
-      gl.viewport(vp.x,vp.y,vp.width,vp.height);
-      const viewProj=m4mul(view.projectionMatrix, view.transform.inverse.matrix);
-      drawScene(viewProj);
-    }
-  }
-}
 </script>
 </body>
 </html>

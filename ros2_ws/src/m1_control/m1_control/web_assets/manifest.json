@@ -1,0 +1,149 @@
+{
+ "root": "base_link",
+ "links": [
+  {
+   "link": "base_link",
+   "mesh": "/meshes/9829cd6fad.glb"
+  },
+  {
+   "link": "imu_link",
+   "mesh": "/meshes/116dc20fcb.glb"
+  },
+  {
+   "link": "front_lidar_link",
+   "mesh": "/meshes/4e6ecf1819.glb"
+  },
+  {
+   "link": "back_lidar_link",
+   "mesh": "/meshes/359e389e7e.glb"
+  },
+  {
+   "link": "camera_link",
+   "mesh": "/meshes/d910ac203c.glb"
+  },
+  {
+   "link": "fl_steering_link",
+   "mesh": "/meshes/dcb4ea42c6.glb"
+  },
+  {
+   "link": "fl_wheel_link",
+   "mesh": "/meshes/76ce0cda02.glb"
+  },
+  {
+   "link": "fr_steering_link",
+   "mesh": "/meshes/7232b420cd.glb"
+  },
+  {
+   "link": "fr_wheel_link",
+   "mesh": "/meshes/221b87946c.glb"
+  },
+  {
+   "link": "rr_steering_link",
+   "mesh": "/meshes/78f85391ba.glb"
+  },
+  {
+   "link": "rr_wheel_link",
+   "mesh": "/meshes/54ae45e73e.glb"
+  },
+  {
+   "link": "rl_steering_link",
+   "mesh": "/meshes/e6dfb5f91b.glb"
+  },
+  {
+   "link": "rl_wheel_link",
+   "mesh": "/meshes/316df2e68d.glb"
+  },
+  {
+   "link": "lift_base_link",
+   "mesh": "/meshes/3fba1bc6a0.glb"
+  },
+  {
+   "link": "lift_link",
+   "mesh": "/meshes/b65fd926d3.glb"
+  },
+  {
+   "link": "openarm_body_link0",
+   "mesh": "/meshes/b6a19a0437.glb"
+  },
+  {
+   "link": "openarm_left_base_link",
+   "mesh": "/meshes/514d760237.glb"
+  },
+  {
+   "link": "openarm_left_link1",
+   "mesh": "/meshes/d498603198.glb"
+  },
+  {
+   "link": "openarm_left_link2",
+   "mesh": "/meshes/365fd9fefa.glb"
+  },
+  {
+   "link": "openarm_left_link3",
+   "mesh": "/meshes/3dd77c62aa.glb"
+  },
+  {
+   "link": "openarm_left_link4",
+   "mesh": "/meshes/88bb767263.glb"
+  },
+  {
+   "link": "openarm_left_link5",
+   "mesh": "/meshes/c9ca6b262f.glb"
+  },
+  {
+   "link": "openarm_left_link6",
+   "mesh": "/meshes/ed2e33bab8.glb"
+  },
+  {
+   "link": "openarm_left_ee_base_link",
+   "mesh": "/meshes/7231cfe347.glb"
+  },
+  {
+   "link": "openarm_left_ee_link1",
+   "mesh": "/meshes/caa8ee3386.glb"
+  },
+  {
+   "link": "openarm_left_ee_link2",
+   "mesh": "/meshes/41dd34a6a4.glb"
+  },
+  {
+   "link": "openarm_right_base_link",
+   "mesh": "/meshes/df568cb0e1.glb"
+  },
+  {
+   "link": "openarm_right_link1",
+   "mesh": "/meshes/0a1aae2dd8.glb"
+  },
+  {
+   "link": "openarm_right_link2",
+   "mesh": "/meshes/a4964de0ed.glb"
+  },
+  {
+   "link": "openarm_right_link3",
+   "mesh": "/meshes/3dd77c62aa.glb"
+  },
+  {
+   "link": "openarm_right_link4",
+   "mesh": "/meshes/88bb767263.glb"
+  },
+  {
+   "link": "openarm_right_link5",
+   "mesh": "/meshes/1ec7ab88b4.glb"
+  },
+  {
+   "link": "openarm_right_link6",
+   "mesh": "/meshes/9cdf2151c9.glb"
+  },
+  {
+   "link": "openarm_right_ee_base_link",
+   "mesh": "/meshes/20297bff60.glb"
+  },
+  {
+   "link": "openarm_right_ee_link1",
+   "mesh": "/meshes/efc3b77208.glb"
+  },
+  {
+   "link": "openarm_right_ee_link2",
+   "mesh": "/meshes/84b0277ccd.glb"
+  }
+ ]
+}

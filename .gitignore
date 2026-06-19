@@ -10,3 +10,6 @@ isaac/last_ros_sim_report.txt
 ros2_ws/build/
 ros2_ws/install/
 ros2_ws/log/
+
+# throwaway venv for the offline mesh converter (tools/convert_meshes.py)
+.meshconv_venv/

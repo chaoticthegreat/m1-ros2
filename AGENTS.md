@@ -91,7 +91,20 @@ real driver; everything in `ros2_ws/` is unchanged.
  release to recenter), Trigger→gripper, thumbsticks→base, A/X→re-seed. Publishes
  only to `/m1/*`, so sim + real, exactly like `web_node`/`teleop_node`. WebXR
  axes (x right, y up, −z fwd) → ROS base_link (x fwd, y left, z up) in
- `_webxr_to_ros`. No extra deps (stdlib HTTPS + embedded HTML/JS).
+ `_webxr_to_ros`. **In-headset RViz-like 3D viz:** the page renders the real
+ robot meshes over passthrough with **three.js** (vendored locally under
+ `m1_control/web_assets/vendor/`, served by the node — no CDN, no build step on
+ device), posing each link every frame from per-link FK transforms streamed in
+ the `/api/xr` response (`UrdfModel.link_transforms` + `mat_to_quat`). A target
+ sphere per arm turns green→amber→red by fingertip distance (so impossible goals
+ are obvious); B/Y recenters the model, which is anchored ~1.1 m in front on the
+ floor. The glTF meshes (`web_assets/meshes/*.glb`, ~4 MB, decimated to ~3.5k
+ faces/link, visual origin+scale baked in, mirrored winding flipped) are produced
+ offline by `tools/convert_meshes.py` (needs a throwaway trimesh venv — see its
+ docstring; re-run + rebuild only when meshes/URDF change). The node serves
+ `/manifest.json`, `/vendor/*`, `/meshes/*` as static files. Falls back to a
+ wireframe (from `arms.points`) if the manifest is missing. three.js is the only
+ third-party dep and it's vendored, so it stays a self-contained web app.
 - `.../web_node.py` — `ros2 run m1_control m1_web`: browser control panel on
  http://localhost:8080. Same `/m1/*`-only bridge (sim + real). Stdlib HTTP
  server + embedded HTML/JS (no extra deps); base drive pad, per-arm Cartesian

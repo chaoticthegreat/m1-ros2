@@ -120,6 +120,37 @@ def _axis_rotation(axis: np.ndarray, angle: float) -> np.ndarray:
     )
 
 
+def mat_to_quat(R: np.ndarray) -> list:
+    """Rotation matrix (3x3) -> unit quaternion ``[x, y, z, w]``."""
+    m = R
+    tr = m[0, 0] + m[1, 1] + m[2, 2]
+    if tr > 0.0:
+        s = math.sqrt(tr + 1.0) * 2.0
+        w = 0.25 * s
+        x = (m[2, 1] - m[1, 2]) / s
+        y = (m[0, 2] - m[2, 0]) / s
+        z = (m[1, 0] - m[0, 1]) / s
+    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        s = math.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
+        w = (m[2, 1] - m[1, 2]) / s
+        x = 0.25 * s
+        y = (m[0, 1] + m[1, 0]) / s
+        z = (m[0, 2] + m[2, 0]) / s
+    elif m[1, 1] > m[2, 2]:
+        s = math.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
+        w = (m[0, 2] - m[2, 0]) / s
+        x = (m[0, 1] + m[1, 0]) / s
+        y = 0.25 * s
+        z = (m[1, 2] + m[2, 1]) / s
+    else:
+        s = math.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
+        w = (m[1, 0] - m[0, 1]) / s
+        x = (m[0, 2] + m[2, 0]) / s
+        y = (m[1, 2] + m[2, 1]) / s
+        z = 0.25 * s
+    return [x, y, z, w]
+
+
 def _homogeneous(rot: np.ndarray, trans: np.ndarray) -> np.ndarray:
     T = np.eye(4, dtype=np.float64)
     T[:3, :3] = rot
@@ -191,6 +222,39 @@ class UrdfModel:
             )
             model.child_to_joint[child] = name
         return model
+
+    def link_transforms(self, q: dict) -> dict:
+        """World 4x4 transform of every link given joint values ``q``.
+
+        Walks the kinematic tree from the root link(s), applying each joint's
+        fixed origin then its actuated motion. Used to pose every link mesh in
+        the headset viz from a single measured joint state. Links whose joints
+        aren't in ``q`` default to 0 (e.g. static base frames).
+        """
+        children: dict = {}
+        for jn, j in self.joints.items():
+            children.setdefault(j.parent, []).append(jn)
+        child_links = {j.child for j in self.joints.values()}
+        all_links = set(children) | child_links
+        roots = [lk for lk in all_links if lk not in child_links]
+
+        transforms = {lk: np.eye(4, dtype=np.float64) for lk in roots}
+        stack = list(roots)
+        while stack:
+            link = stack.pop()
+            T_parent = transforms[link]
+            for jn in children.get(link, []):
+                joint = self.joints[jn]
+                T = T_parent @ joint.origin_matrix
+                if joint.actuated:
+                    qj = float(q.get(jn, 0.0))
+                    if joint.jtype == "prismatic":
+                        T = T @ _homogeneous(np.eye(3), joint.axis * qj)
+                    else:  # revolute / continuous
+                        T = T @ _homogeneous(_axis_rotation(joint.axis, qj), np.zeros(3))
+                transforms[joint.child] = T
+                stack.append(joint.child)
+        return transforms
 
     def chain(self, base: str, tip: str) -> list:
         """Ordered list of joint names along the path base -> tip."""
