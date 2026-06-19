@@ -240,6 +240,31 @@ class ArmChain:
         tip_pos = T[:3, 3] + T[:3, :3] @ GRIPPER_TIP_OFFSET
         return tip_pos, cols
 
+    def link_points(self, q: dict):
+        """Ordered world points tracing the chain base->tip for visualization.
+
+        Returns a list of 3D positions: the origin of every joint frame along
+        the chain (base_link, the lift, then each arm joint) followed by the
+        gripper fingertip. Straight segments between consecutive points give a
+        compact wireframe ("skeleton") of the arm at the supplied joint config,
+        enough to see the pose and whether the fingertip reaches the target.
+        """
+        T = np.eye(4, dtype=np.float64)
+        pts = [T[:3, 3].copy()]
+        for jname in self.chain:
+            joint = self.model.joints[jname]
+            T = T @ joint.origin_matrix
+            pts.append(T[:3, 3].copy())
+            if joint.actuated:
+                qj = float(q.get(jname, 0.0))
+                if joint.jtype == "prismatic":
+                    T = T @ _homogeneous(np.eye(3), joint.axis * qj)
+                else:  # revolute / continuous
+                    T = T @ _homogeneous(_axis_rotation(joint.axis, qj), np.zeros(3))
+        tip_pos = T[:3, 3] + T[:3, :3] @ GRIPPER_TIP_OFFSET
+        pts.append(tip_pos)
+        return pts
+
     def position_jacobian(self, q: dict, joint_order: list):
         """3 x len(joint_order) linear Jacobian of the fingertip wrt joints.
 
