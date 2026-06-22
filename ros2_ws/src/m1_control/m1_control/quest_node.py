@@ -14,19 +14,29 @@ and the real hardware:
     in   /joint_states           sensor_msgs/JointState      (feedback + seeding)
 
 Controls (per hand):
-    * Grip (squeeze) ......... CLUTCH. Hold to "grab" that arm; the gripper
-                               target follows your hand's MOTION while held.
-                               Release to freeze the arm and reposition your
-                               hand (like lifting a mouse off the desk).
+    * Grip (squeeze) ......... CLUTCH. Hold to "grab" that arm; while held the
+                               gripper target follows your hand's MOTION (relative)
+                               and its ORIENTATION mirrors your controller
+                               ABSOLUTELY (full 6-DOF). Release to freeze the arm
+                               and reposition your hand (like lifting a mouse off
+                               the desk).
     * Trigger ................ that arm's gripper, analog 0 (open) .. 1 (closed).
-    * Thumbstick ............. (left hand) drive the base: push to translate,
+    * Thumbstick CLICK ....... lock / unlock that gripper's ROTATION -- while
+                               locked, hand twist no longer rotates the gripper, so
+                               you can re-orient your wrist (or translate) freely.
+    * Thumbstick (push) ...... (left hand) drive the base: push to translate,
                                (right hand) push left/right to yaw.
-    * A / X button ........... re-seed that arm's target to its live fingertip
-                               (undo drift) -- safe "home to current pose".
+    * A / X button ........... re-seed that arm's target to its live fingertip AND
+                               re-zero its rotation reference -- "home to here".
 
-Why relative + clutch? Absolute 1:1 mapping forces your shoulders to match the
-robot's workspace exactly. Clutched relative motion lets you move a small real
-distance, release, recenter, and continue -- standard for VR teleop.
+Why relative position but ABSOLUTE orientation? Relative + clutched *position*
+lets you move a small real distance, release, recenter, and continue (standard VR
+teleop) without matching the robot's whole reach with your shoulders. *Orientation*
+is instead absolute: the gripper mirrors the controller's actual orientation, so
+pointing the controller "up 90 deg" puts the gripper up 90 deg -- it does NOT add
+90 deg to wherever it already was each grab. The reference is zeroed to the live
+pose on first grab / A-X (no snap), and the thumbstick-click LOCK freezes it when
+you want to re-orient your wrist without the gripper following.
 
 WebXR requires a SECURE CONTEXT. ``http://<ip>`` is not secure, so this server
 speaks HTTPS with a self-signed certificate (auto-generated on first run via
@@ -64,6 +74,7 @@ from m1_control.kinematics import (
     ReachController,
     UrdfModel,
     mat_to_quat,
+    quat_to_mat,
 )
 
 # Vendored web assets (three.js + converted glTF meshes + manifest) served by
@@ -144,6 +155,24 @@ def _heading_basis(head_fwd) -> tuple[np.ndarray, np.ndarray]:
     return F, L
 
 
+def _webxr_to_robot_basis(F: np.ndarray, L: np.ndarray) -> np.ndarray:
+    """3x3 matrix C mapping a WebXR-space vector to robot base_link coordinates.
+
+    It is exactly the rotation behind the position map ``robot = [-(d.L), d.F,
+    d_up]`` (rows ``-L``, ``F``, ``up``), so a WebXR-space *rotation* ``R`` is
+    expressed in the robot frame by the similarity transform ``C @ R @ C.T``.
+    With ``F``/``L`` horizontal-orthonormal and ``F x L = up`` this C is a proper
+    rotation (det +1), so the operator's hand twist maps to the gripper with the
+    same handedness (no mirror-inverted feel).
+    """
+    return np.array(
+        [[-L[0], -L[1], -L[2]],
+         [F[0], F[1], F[2]],
+         [0.0, 1.0, 0.0]],
+        dtype=np.float64,
+    )
+
+
 def _ensure_cert(node: "M1QuestNode") -> tuple[str, str]:
     """Return (certfile, keyfile), generating a self-signed pair if needed."""
     cert = node.get_parameter("certfile").value
@@ -206,6 +235,11 @@ class M1QuestNode(Node):
         self._lock = threading.Lock()
         self.q_meas: dict = {}
         self.target = {a: list(DEFAULT_TARGET[a]) for a in ("left", "right")}
+        # Per-arm target gripper orientation (base frame) as a quaternion
+        # [x,y,z,w]. Seeded to the live gripper orientation so the arm holds its
+        # pose on connect; an identity quaternion (the un-seeded default) reads
+        # as position-only at the controller, so nothing rotates until seeded.
+        self.target_quat = {a: [0.0, 0.0, 0.0, 1.0] for a in ("left", "right")}
         self.seeded = {"left": False, "right": False}
         self.grip = {"left": 0.0, "right": 0.0}
         self.cmd_vel = {"vx": 0.0, "vy": 0.0, "yaw": 0.0}
@@ -214,9 +248,26 @@ class M1QuestNode(Node):
         self.clutch = {"left": False, "right": False}
         self.clutch_hand0 = {"left": None, "right": None}
         self.clutch_target0 = {"left": None, "right": None}
+        # ABSOLUTE gripper orientation. The target orientation is a fixed function
+        # of the controller's CURRENT orientation, not a twist accumulated each
+        # grab: ``R_target = C @ hand_R @ C.T @ ori_align``. The heading basis ``C``
+        # and the alignment ``ori_align`` are captured once per arm (preserving the
+        # live gripper orientation, so nothing snaps) and re-zeroed only on an
+        # explicit recenter (A/X) or when the rotation lock is released. So holding
+        # the controller a given way always commands the same gripper orientation
+        # -- controller up 90 deg -> gripper up 90 deg -- instead of adding 90 deg
+        # to wherever it already was.
+        self.ori_C = {"left": None, "right": None}
+        self.ori_align = {"left": None, "right": None}
+        # Rotation lock (thumbstick click, per arm): while set, hand twist no longer
+        # moves the gripper orientation, so the wrist can be re-oriented / the hand
+        # translated without rotating the gripper. Releasing it re-zeros ori_align
+        # to the held orientation so tracking resumes from there without a jump.
+        self.ori_locked = {"left": False, "right": False}
+        self.last_lock = {"left": False, "right": False}  # lock-toggle edge detect
         # Heading-relative basis (WebXR-space F/L vectors) captured at the
-        # instant the clutch is squeezed, so the mapping stays fixed for the
-        # duration of that grab even if the operator turns their head.
+        # instant the clutch is squeezed, so the position mapping stays fixed for
+        # the duration of that grab even if the operator turns their head.
         self.clutch_F = {"left": None, "right": None}
         self.clutch_L = {"left": None, "right": None}
         self.last_btn = {"left": False, "right": False}  # A/X edge detect
@@ -253,8 +304,9 @@ class M1QuestNode(Node):
                     continue
                 if all(j in self.q_meas for j in ARM_JOINTS[arm] + [LIFT_JOINT]):
                     try:
-                        tip = self.reach.fingertip(arm, self.q_meas)
+                        tip, R = self.reach.gripper_pose(arm, self.q_meas)
                         self.target[arm] = [float(tip[0]), float(tip[1]), float(tip[2])]
+                        self.target_quat[arm] = [float(c) for c in mat_to_quat(R)]
                         self.seeded[arm] = True
                     except Exception:  # noqa: BLE001
                         pass
@@ -264,11 +316,33 @@ class M1QuestNode(Node):
             return
         if all(j in self.q_meas for j in ARM_JOINTS[arm] + [LIFT_JOINT]):
             try:
-                tip = self.reach.fingertip(arm, self.q_meas)
+                tip, R = self.reach.gripper_pose(arm, self.q_meas)
                 self.target[arm] = [float(tip[0]), float(tip[1]), float(tip[2])]
+                self.target_quat[arm] = [float(c) for c in mat_to_quat(R)]
                 self.seeded[arm] = True
             except Exception:  # noqa: BLE001
                 pass
+
+    def _calibrate_ori(self, arm: str, hand_R, head_fwd):
+        """Zero the absolute-orientation map for ``arm`` to the current pose.
+
+        Captures the heading basis ``C`` and an alignment so that, right now, the
+        controller's orientation maps to the gripper target's CURRENT orientation
+        -- nothing jumps at calibration. Afterwards the target orientation is the
+        fixed function ``C @ hand_R @ C.T @ ori_align`` of the live controller
+        orientation, so a given controller pose always commands the same gripper
+        orientation (absolute, not accumulated). Re-called only on an explicit
+        recenter (A/X) or when the rotation lock is released, so it never drifts
+        grab-to-grab. ``ori_align = C @ hand_R^T @ C^T @ G`` inverts the map at the
+        current controller pose so it yields the current target orientation ``G``.
+        """
+        if hand_R is None:
+            return
+        F, L = _heading_basis(head_fwd)
+        C = _webxr_to_robot_basis(F, L)
+        G = quat_to_mat(self.target_quat[arm])
+        self.ori_C[arm] = C
+        self.ori_align[arm] = C @ hand_R.T @ C.T @ G
 
     # --- WebXR frame ingest (called from the HTTP handler thread) -----------
     def on_xr_frame(self, data: dict):
@@ -289,26 +363,48 @@ class M1QuestNode(Node):
                     continue
 
                 hand = np.array(c.get("pos", [0.0, 0.0, 0.0]), dtype=np.float64)
+                hand_quat = c.get("quat")
+                hand_R = quat_to_mat(hand_quat) if hand_quat else None
                 squeeze = bool(c.get("squeeze"))
                 trigger = _clamp(float(c.get("trigger", 0.0)), 0.0, 1.0)
                 button = bool(c.get("button"))
+                lock = bool(c.get("lock"))
 
-                # A/X edge: re-seed this arm's target to the live fingertip.
+                # A/X edge: re-seed this arm's target to the live fingertip AND
+                # re-zero the absolute-orientation map there ("recenter rotation").
                 if button and not self.last_btn[arm]:
                     self._reseed(arm)
+                    self._calibrate_ori(arm, hand_R, head_fwd)
                     self.clutch[arm] = False
                 self.last_btn[arm] = button
 
-                # Clutch logic: target follows hand delta only while squeezed.
-                # The delta (raw WebXR metres) is projected into the operator's
-                # heading frame captured at the squeeze, so "forward/left/up
-                # relative to where you're looking" map to robot x/y/z.
+                # Rotation-lock toggle (thumbstick click): freeze / unfreeze this
+                # gripper's target orientation so the wrist can be re-oriented (or
+                # the hand translated) without rotating the gripper. On UNLOCK,
+                # re-zero the map so hand twist resumes from the held orientation
+                # without a jump.
+                if lock and not self.last_lock[arm]:
+                    self.ori_locked[arm] = not self.ori_locked[arm]
+                    if not self.ori_locked[arm]:
+                        self._calibrate_ori(arm, hand_R, head_fwd)
+                self.last_lock[arm] = lock
+
+                # Clutch logic: target follows hand delta only while squeezed. The
+                # delta (raw WebXR metres) is projected into the operator's heading
+                # frame captured at the squeeze, so "forward/left/up relative to
+                # where you're looking" map to robot x/y/z. Orientation is separate
+                # and ABSOLUTE (below), not a per-grab delta.
                 if squeeze and not self.clutch[arm]:
                     self.clutch[arm] = True
                     self.clutch_hand0[arm] = hand
                     self.clutch_target0[arm] = np.array(self.target[arm])
-                    self.clutch_F[arm], self.clutch_L[arm] = _heading_basis(head_fwd)
+                    F, L = _heading_basis(head_fwd)
+                    self.clutch_F[arm], self.clutch_L[arm] = F, L
                     self.seeded[arm] = True
+                    # First grab for this arm: zero the absolute-orientation map to
+                    # the live pose so the gripper doesn't snap when tracking begins.
+                    if self.ori_align[arm] is None:
+                        self._calibrate_ori(arm, hand_R, head_fwd)
                 elif squeeze and self.clutch[arm]:
                     d = (hand - self.clutch_hand0[arm]) * self.motion_scale
                     F, L = self.clutch_F[arm], self.clutch_L[arm]
@@ -318,6 +414,15 @@ class M1QuestNode(Node):
                         float(d[1]),      # up       -> +z
                     ])
                     self._set_target(arm, self.clutch_target0[arm] + robot_delta)
+                    # ABSOLUTE orientation: the gripper target orientation is a
+                    # fixed function of the controller's CURRENT orientation (see
+                    # _calibrate_ori), so it mirrors the controller rather than
+                    # accumulating a twist each grab. The lock freezes it.
+                    if (hand_R is not None and self.ori_C[arm] is not None
+                            and not self.ori_locked[arm]):
+                        C = self.ori_C[arm]
+                        R_tgt = C @ hand_R @ C.T @ self.ori_align[arm]
+                        self.target_quat[arm] = [float(v) for v in mat_to_quat(R_tgt)]
                 elif not squeeze:
                     self.clutch[arm] = False
 
@@ -365,7 +470,12 @@ class M1QuestNode(Node):
             except Exception:  # noqa: BLE001
                 pass
         for arm in ("left", "right"):
-            a = {"target": [round(float(v), 4) for v in self.target[arm]]}
+            a = {
+                "target": [round(float(v), 4) for v in self.target[arm]],
+                # Target gripper orientation (quaternion x,y,z,w) so the page can
+                # draw the target's rotation, not just its point.
+                "target_quat": [round(float(v), 5) for v in self.target_quat[arm]],
+            }
             if (
                 self.reach is not None
                 and have_js
@@ -374,8 +484,13 @@ class M1QuestNode(Node):
                 try:
                     pts = self.reach.chains[arm].link_points(self.q_meas)
                     tip = pts[-1]
+                    _, R_tip = self.reach.gripper_pose(arm, self.q_meas)
                     a["points"] = [[round(float(c), 4) for c in p] for p in pts]
                     a["tip"] = [round(float(c), 4) for c in tip]
+                    # Live gripper orientation -> a second (current-pose) triad,
+                    # so the operator can see how close the gripper is to the
+                    # commanded orientation.
+                    a["tip_quat"] = [round(float(c), 5) for c in mat_to_quat(R_tip)]
                     a["dist"] = round(
                         float(np.linalg.norm(np.asarray(self.target[arm]) - tip)), 4
                     )
@@ -410,6 +525,7 @@ class M1QuestNode(Node):
                 self.cmd_vel = {"vx": 0.0, "vy": 0.0, "yaw": 0.0}
             cmd = dict(self.cmd_vel)
             targets = {a: list(self.target[a]) for a in ("left", "right")}
+            quats = {a: list(self.target_quat[a]) for a in ("left", "right")}
             grip = dict(self.grip)
 
         tw = Twist()
@@ -426,7 +542,11 @@ class M1QuestNode(Node):
             ps.pose.position.x = targets[arm][0]
             ps.pose.position.y = targets[arm][1]
             ps.pose.position.z = targets[arm][2]
-            ps.pose.orientation.w = 1.0
+            q = quats[arm]
+            ps.pose.orientation.x = q[0]
+            ps.pose.orientation.y = q[1]
+            ps.pose.orientation.z = q[2]
+            ps.pose.orientation.w = q[3]
             self.pose_pub[arm].publish(ps)
 
             g = Float64()
@@ -445,6 +565,7 @@ class M1QuestNode(Node):
                     "target": [round(v, 3) for v in self.target[arm]],
                     "grip": round(self.grip[arm], 3),
                     "clutch": self.clutch[arm],
+                    "rot_locked": self.ori_locked[arm],
                 }
             return out
 
@@ -677,17 +798,23 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <h3 style="margin:0 0 8px;font-family:var(--serif)">Controls</h3>
     <p class="muted">
       <kbd>Grip</kbd> (squeeze) — hold to "grab" that arm; the gripper follows your
-      hand's motion. Release to freeze &amp; recenter.<br/>
+      hand's motion, and its rotation <em>mirrors your controller absolutely</em>
+      (point the controller a way → the gripper points that way). Release to
+      reposition your hand.<br/>
       <kbd>Trigger</kbd> — that arm's gripper (squeeze to close).<br/>
+      <kbd>Stick click</kbd> — lock / unlock that gripper's rotation (twist your
+      wrist freely while locked).<br/>
       <kbd>Left stick</kbd> — drive the base (push to translate).<br/>
       <kbd>Right stick</kbd> — turn (yaw).<br/>
-      <kbd>A</kbd>/<kbd>X</kbd> — re-home that arm's target to where it is now.<br/>
+      <kbd>A</kbd>/<kbd>X</kbd> — re-home that arm's target <em>and</em> rotation to where it is now.<br/>
       <kbd>B</kbd>/<kbd>Y</kbd> — recenter the robot hologram in front of you.
     </p>
     <p class="muted">
       In the headset you'll see a 3D model of the robot (its real meshes) drawn
       over your room in passthrough, posed live from the robot's joints, plus a
-      coloured sphere at each Cartesian target. The target turns
+      coloured sphere at each Cartesian target with an <b>RGB orientation triad</b>
+      showing the target gripper rotation (a smaller, fainter triad tracks the
+      live gripper so you can see how well it's aligned). The target turns
       <span style="color:var(--good)">green</span> when the arm reaches it and
       <span style="color:var(--bad)">red</span> when the pose is out of reach,
       so you can see impossible goals immediately. (First load streams ~4 MB of
@@ -711,7 +838,8 @@ async function poll(){
     const f=(a)=>{ const arm=s.arms[a]; if(!arm) return;
       document.getElementById(a[0]+"t").textContent="["+arm.target.join(", ")+"]";
       document.getElementById(a[0]+"g").textContent="grip "+arm.grip.toFixed(2);
-      document.getElementById(a[0]+"c").textContent=arm.clutch?"● clutch":""; };
+      document.getElementById(a[0]+"c").textContent=
+        (arm.clutch?"● clutch":"")+(arm.rot_locked?"  🔒 rot":""); };
     f("left"); f("right");
   }catch(e){}
 }
@@ -729,7 +857,12 @@ const hint=document.getElementById("xrhint");
 let renderer=null, scene=null, camera=null, robotRoot=null;
 let xrSession=null, refSpace=null, refIsFloor=false, robotPlaced=false;
 let lastViz=null, inFlight=false, meshesLoaded=false;
+// Per-link bookkeeping so a mesh that fails to load is *visible as a gap* and
+// gets a wireframe fallback for that arm, instead of silently vanishing.
+let armLinks={left:[], right:[]};
+const armComplete={left:false, right:false};
 const linkNodes={}, targetMesh={}, tipMesh={}, errLine={}, wire={};
+const targetAxes={}, tipAxes={};
 const recenterPrev={left:false, right:false};
 
 // Robot materials. The converted meshes now carry per-solid VERTEX COLOURS
@@ -791,37 +924,89 @@ function initThree(){
       [new THREE.Vector3(), new THREE.Vector3()]);
     const ln=new THREE.Line(g, new THREE.LineBasicMaterial({color:0x4cd964}));
     ln.visible=false; robotRoot.add(ln); errLine[arm]=ln;
+    // Orientation triads (RGB = gripper X/Y/Z). The larger one is the TARGET
+    // pose's rotation; the smaller one tracks the live gripper, so the operator
+    // can see how close the gripper's rotation is to what was commanded. Drawn
+    // on top (depthTest off) so they read clearly over the robot mesh.
+    const tax=new THREE.AxesHelper(0.15);
+    tax.material.depthTest=false; tax.material.linewidth=2;
+    tax.renderOrder=5; tax.visible=false; robotRoot.add(tax); targetAxes[arm]=tax;
+    const pax=new THREE.AxesHelper(0.10);
+    pax.material.transparent=true; pax.material.opacity=0.6;
+    pax.renderOrder=4; pax.visible=false; robotRoot.add(pax); tipAxes[arm]=pax;
   }
 }
 
-/* ---- load the converted robot meshes once (cached by the browser after) ---- */
+/* ---- fetch one mesh with a few retries (a single dropped request used to
+       silently leave that link missing with no fallback) ---- */
+async function loadMeshWithRetry(loader, url, tries){
+  let lastErr;
+  for(let i=0;i<tries;i++){
+    try{ return await loader.loadAsync(url); }
+    catch(e){ lastErr=e; await new Promise(r=>setTimeout(r, 150*(i+1))); }
+  }
+  throw lastErr;
+}
+
+/* ---- load the converted robot meshes once (cached by the browser after) ----
+   Unique meshes are fetched in parallel WITH RETRY, then each link is instanced
+   from the cache. Anything that still fails is reported by name and left to the
+   per-arm wireframe fallback, so a missing mesh is obvious instead of a silent
+   hole in the model. */
 async function loadRobot(){
   let manifest;
   try{ manifest=await (await fetch("/manifest.json")).json(); }
   catch(e){ log("no mesh manifest — using wireframe fallback"); return; }
+  const entries=manifest.links||[];
+  // Which manifest links belong to each arm chain (for the per-arm wireframe
+  // fallback if any of them fail to load).
+  armLinks={
+    left: entries.filter(e=>e.link.indexOf("openarm_left")>=0).map(e=>e.link),
+    right: entries.filter(e=>e.link.indexOf("openarm_right")>=0).map(e=>e.link),
+  };
+
   const loader=new GLTFLoader(); const cache={};
-  for(const e of (manifest.links||[])){
+  const urls=[...new Set(entries.map(e=>e.mesh))];
+  await Promise.all(urls.map(async (u)=>{
+    try{ cache[u]=await loadMeshWithRetry(loader, u, 3); }
+    catch(e){ cache[u]=null; log("mesh load failed after retries: "+u+" ("+e+")"); }
+  }));
+
+  let ok=0; const failed=[];
+  for(const e of entries){
+    const g=cache[e.mesh];
+    if(!g){ failed.push(e.link); continue; }
     try{
-      if(!cache[e.mesh]) cache[e.mesh]=await loader.loadAsync(e.mesh);
-      const obj=cache[e.mesh].scene.clone(true);
+      const obj=g.scene.clone(true);
       // GLTFLoader hands back three's default fully-metallic material, which
       // renders dark/patchy and looks see-through. Replace it: meshes that carry
       // baked vertex colours get the vertex-colour material (so the real part
       // colours show); colourless ones get the neutral grey. Double-sided so
-      // decimated winding never leaves holes.
+      // decimated winding never leaves holes; frustumCulled off so a stale/bad
+      // bounding sphere under the non-standard anchor matrix can't cull a link.
       obj.traverse((o)=>{ if(o.isMesh){
         if(!o.geometry.attributes.normal) o.geometry.computeVertexNormals();
+        o.geometry.computeBoundingSphere();
         const hasColor=!!o.geometry.attributes.color;
         if(o.material && o.material.dispose) o.material.dispose();
         o.material=hasColor?ROBOT_MAT_VC:ROBOT_MAT;
+        o.frustumCulled=false;
       }});
       let node=linkNodes[e.link];
-      if(!node){ node=new THREE.Group(); linkNodes[e.link]=node; robotRoot.add(node); }
-      node.add(obj);
-    }catch(err){ log("mesh "+e.mesh+" failed: "+err); }
+      // Start hidden: a link mesh is only shown once it has a real FK pose, so a
+      // freshly-loaded link can't render clumped at base_link origin (0,0,0)
+      // before the first /joint_states frame streams its transform.
+      if(!node){ node=new THREE.Group(); node.visible=false; linkNodes[e.link]=node; robotRoot.add(node); }
+      node.add(obj); ok++;
+    }catch(err){ failed.push(e.link); log("mesh instance failed "+e.link+": "+err); }
   }
-  meshesLoaded=Object.keys(linkNodes).length>0;
-  log("loaded "+Object.keys(linkNodes).length+" robot links");
+
+  const loaded=new Set(Object.keys(linkNodes));
+  armComplete.left = armLinks.left.length>0 && armLinks.left.every(l=>loaded.has(l));
+  armComplete.right = armLinks.right.length>0 && armLinks.right.every(l=>loaded.has(l));
+  meshesLoaded = loaded.size>0;
+  log("robot meshes: "+ok+"/"+entries.length+" links"+
+      (failed.length ? (" — MISSING "+failed.join(", ")+" (wireframe fallback)") : " (all present)"));
 }
 
 /* ---- per-frame: pose every link mesh + target markers from lastViz ---- */
@@ -833,31 +1018,48 @@ function updateRobot(){
       const t=lastViz.links[name];
       node.position.set(t.p[0], t.p[1], t.p[2]);
       node.quaternion.set(t.q[0], t.q[1], t.q[2], t.q[3]);
+      node.visible=true;   // now it has a real pose -> safe to show
     }
   }
-  if(!meshesLoaded) updateWire();
+  updateWire(!meshesLoaded);   // both arms before load; per-arm gap fallback after
   for(const arm of ["left","right"]){
     const a=lastViz.arms ? lastViz.arms[arm] : null;
     const tg=targetMesh[arm], tp=tipMesh[arm], ln=errLine[arm];
-    if(!a || !a.target){ tg.visible=tp.visible=ln.visible=false; continue; }
+    const tax=targetAxes[arm], pax=tipAxes[arm];
+    if(!a || !a.target){
+      tg.visible=tp.visible=ln.visible=tax.visible=pax.visible=false; continue; }
     const col=reachColor(a.dist==null?9:a.dist);
     tg.position.set(a.target[0],a.target[1],a.target[2]);
     tg.material.color.copy(col); tg.visible=true;
+    // Target orientation triad at the target point.
+    if(a.target_quat){
+      tax.position.set(a.target[0],a.target[1],a.target[2]);
+      tax.quaternion.set(a.target_quat[0],a.target_quat[1],a.target_quat[2],a.target_quat[3]);
+      tax.visible=true;
+    } else tax.visible=false;
     if(a.tip){
       tp.position.set(a.tip[0],a.tip[1],a.tip[2]); tp.visible=true;
       const pos=ln.geometry.attributes.position;
       pos.setXYZ(0, a.tip[0],a.tip[1],a.tip[2]);
       pos.setXYZ(1, a.target[0],a.target[1],a.target[2]);
       pos.needsUpdate=true; ln.material.color.copy(col); ln.visible=true;
-    } else { tp.visible=false; ln.visible=false; }
+      // Live gripper orientation triad at the fingertip.
+      if(a.tip_quat){
+        pax.position.set(a.tip[0],a.tip[1],a.tip[2]);
+        pax.quaternion.set(a.tip_quat[0],a.tip_quat[1],a.tip_quat[2],a.tip_quat[3]);
+        pax.visible=true;
+      } else pax.visible=false;
+    } else { tp.visible=false; ln.visible=false; pax.visible=false; }
   }
 }
 
-/* ---- wireframe fallback when meshes are unavailable ---- */
-function updateWire(){
+/* ---- wireframe fallback: drawn for both arms before meshes load, and after
+       load only for an arm whose mesh(es) failed (so a gap is never silent) ---- */
+function updateWire(forceBoth){
   for(const arm of ["left","right"]){
     const a=lastViz.arms ? lastViz.arms[arm] : null;
-    if(!a || !a.points){ if(wire[arm]) wire[arm].visible=false; continue; }
+    const show = forceBoth || !armComplete[arm];
+    if(!show || !a || !a.points){ if(wire[arm]) wire[arm].visible=false; continue; }
     const pts=[];
     for(let i=0;i<a.points.length-1;i++) pts.push(...a.points[i], ...a.points[i+1]);
     let w=wire[arm];
@@ -889,15 +1091,18 @@ function readController(src, frame){
   if(!src || !src.gripSpace || !src.gamepad) return null;
   const pose=frame.getPose(src.gripSpace, refSpace);
   if(!pose) return {valid:false};
-  const p=pose.transform.position; const gp=src.gamepad;
-  // Quest mapping: buttons[0]=trigger,[1]=grip,[4]=A/X,[5]=B/Y; axes[2,3]=stick.
+  const p=pose.transform.position; const o=pose.transform.orientation; const gp=src.gamepad;
+  // Quest mapping: buttons[0]=trigger,[1]=grip,[3]=stick click,[4]=A/X,[5]=B/Y; axes[2,3]=stick.
   const trigger=gp.buttons[0]?gp.buttons[0].value:0;
   const squeeze=gp.buttons[1]?gp.buttons[1].pressed:false;
   const button=gp.buttons[4]?gp.buttons[4].pressed:false;
   const recenter=gp.buttons[5]?gp.buttons[5].pressed:false;
+  const lock=gp.buttons[3]?gp.buttons[3].pressed:false;   // thumbstick click -> rotation lock
   const ax=gp.axes||[];
   const stick=[ax.length>2?ax[2]:(ax[0]||0), ax.length>3?ax[3]:(ax[1]||0)];
-  return {valid:true, pos:[p.x,p.y,p.z], trigger, squeeze, button, recenter, stick};
+  // grip-space orientation (quaternion x,y,z,w) drives the gripper's rotation.
+  return {valid:true, pos:[p.x,p.y,p.z], quat:[o.x,o.y,o.z,o.w],
+          trigger, squeeze, button, recenter, lock, stick};
 }
 
 /* ---- three.js animation loop: read controllers, POST, pose meshes, render ---- */

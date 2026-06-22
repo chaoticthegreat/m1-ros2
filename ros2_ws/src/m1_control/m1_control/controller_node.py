@@ -22,7 +22,8 @@ target velocity so it holds its pose. This keeps the message free of NaNs,
 which the Isaac articulation controller handles more reliably.
 
 Given a target pose, the arms + shared lift run a damped-least-squares reach
-toward the requested point (position-only, orientation is currently ignored).
+toward the requested point. The reach is **position-only**: the gripper
+fingertip is driven to the target point and the pose's orientation is ignored.
 Targets are interpreted in the robot ``base_link`` frame.
 
 Each tick the solver iterates a full Gauss-Newton IK to the optimal joint
@@ -149,8 +150,9 @@ class M1Controller(Node):
         p = msg.pose.position
         new = np.array([p.x, p.y, p.z], dtype=np.float64)
         prev = self.targets[arm]
-        # Log only when the target meaningfully changes; operator bridges
-        # (web/teleop) re-publish the same target every tick.
+        # Position-only reach: the pose's orientation is ignored. Log only when
+        # the target meaningfully changes; operator bridges (web/teleop) re-
+        # publish the same target every tick.
         if prev is None or float(np.linalg.norm(new - prev)) > 1e-4:
             self.get_logger().info(
                 f"{arm} reach target -> ({p.x:.3f}, {p.y:.3f}, {p.z:.3f})")
@@ -180,9 +182,11 @@ class M1Controller(Node):
         #    stacked solve so the single lift is the least-squares compromise
         #    that best serves both grippers.
         if any(t is not None for t in self.targets.values()):
-            result = self.reach.solve_step(self.q_meas, self.targets)
+            # Position-only reach: each active arm's target is a bare point.
+            reach_targets = {arm: self.targets[arm] for arm in ("left", "right")}
+            result = self.reach.solve_step(self.q_meas, reach_targets)
             for jname, q in result.items():
-                if jname == "_dist":
+                if jname.startswith("_"):       # meta keys (e.g. "_dist")
                     continue
                 self.pos_cmd[jname] = q
 
