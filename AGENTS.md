@@ -76,7 +76,17 @@ real driver; everything in `ros2_ws/` is unchanged.
   <1.2 mm, **worst-case `solve_step` ~6.6 ms / 0% over the 60 Hz budget** (was
   ~122 ms), held-arm far-jump disturbance 25 mm → ~10 mm; `_teleop_stress.py`
   continuous tracking still 0.17 mm at ~1 ms.
-- `.../swerve.py` — swerve base kinematics (vx, vy, yaw → steer + wheel spin).
+- `.../swerve.py` — swerve base kinematics. `module_states` is the pure inverse
+  map (vx, vy, yaw → per-module heading+speed); `SwerveSolver.solve` adds heading
+  low-pass smoothing, the ≤90° flip-and-reverse optimisation, and **wheel-speed
+  desaturation** (a command that would over-speed a module is scaled down
+  uniformly, preserving the travel *direction*), then the per-joint sign fixups.
+  `forward_kinematics` recovers (vx, vy, yaw) from the module states (4-module
+  least-squares; exact inverse of `module_states`), and `SwerveOdometry`
+  dead-reckons an (x, y, θ) base pose with the **exact SE(2) arc integration** of
+  the body twist (turn-while-driving traces the true arc; pure spin keeps x,y
+  fixed). Verified by `_swerve_test.py` (16/16). Used by `controller_node` (the
+  solver) and `quest_node` (the odometry, to drive the headset model).
 - `.../controller_node.py` — the only node you talk to. Subscribes to pose
  targets / cmd_vel / gripper + /joint_states; publishes unified
  `/m1/joint_command` at 60 Hz. Recruits the shared lift for reaching: each arm
@@ -98,7 +108,17 @@ real driver; everything in `ros2_ws/` is unchanged.
  IP). The Quest browser opens it, enters immersive-ar (passthrough) and POSTs
  both controllers' grip-space poses + buttons to `/api/xr`. The node maps each
  hand to the same-side arm with **clutched relative** motion (hold Grip to move,
- release to recenter), Trigger→gripper, thumbsticks→base, A/X→re-seed. Publishes
+ release to recenter), Trigger→gripper, A/X→re-seed. **Base drive (thumbsticks):**
+ LEFT stick fwd/back→drive fwd/back (vx), left/right→strafe (vy); RIGHT stick
+ left/right→turn (yaw); smooth rescaled deadzone; cmd_vel is set every frame so
+ centring the stick stops at once (BASE_HOLD now only guards a lost connection).
+ The headset **robot model actually drives through the room**: `SwerveOdometry`
+ dead-reckons the commanded cmd_vel into a base pose streamed as `viz["base"]`,
+ and the page hangs all link meshes/markers off a `robotBase` group (inside the
+ room-anchored `robotRoot`) carrying that pose, so the body translates/rotates
+ while the wheels steer/spin from `/joint_states`. B/Y recenters and zeroes the
+ odom (the `place` flag is sticky so a recenter is never dropped on an in-flight
+ POST). Publishes
  only to `/m1/*`, so sim + real, exactly like `web_node`/`teleop_node`. WebXR
  axes (x right, y up, −z fwd) → ROS base_link (x fwd, y left, z up) in
  `_webxr_to_ros`. **In-headset RViz-like 3D viz:** the page renders the real
@@ -158,6 +178,13 @@ is not running — the web panel's status dot makes this obvious.
 ## Status / what's verified
 
 - `colcon build` clean (4 pkgs). All Python syntax-checked.
+- **Swerve suite `_swerve_test.py` (no ROS): 16/16 gates pass.** Covers IK↔FK
+  round-trip (≈1e-15), solver geometry (drive/strafe/turn-in-place point the
+  modules right; reverse uses the ≤90° flip), desaturation (caps + preserves
+  direction), settled-command→body-velocity round-trip, and odometry (straight,
+  strafe, turn-in-place, arc vs analytic, full-circle closure). The arm-solver
+  suite (`_solver_test.py` 15/15) and `_teleop_stress.py` are unaffected by the
+  swerve refactor.
 - **Full solver suite `_solver_test.py` (no ROS): 15/15 gates pass.** Covers
   reachability (single+dual), continuous tracking, hold-under-disturbance,
   latency distribution, and stress. Key results: **100% of reachable single-arm
@@ -231,7 +258,11 @@ is not running — the web panel's status dot makes this obvious.
   Cartesian hold correction keeps the held gripper planted — its transient ride
   is down to ~10 mm (was ~25 mm) and recovers. Quest teleop never does this (the
   clutch moves the target continuously), so it stays in the smooth tracking path.
-- Base `/m1/cmd_vel` is open-loop swerve; no odometry is published yet.
+- Base `/m1/cmd_vel` is open-loop swerve; no odometry is published on a ROS topic
+  yet. `swerve.SwerveOdometry` exists and the Quest viz dead-reckons cmd_vel with
+  it to drive the headset model, but it is *commanded*-velocity dead reckoning
+  (no encoder feedback / `/odom` publisher). Wiring `SwerveOdometry` into
+  `controller_node` to publish `nav_msgs/Odometry` + a TF is the next step.
 - The Isaac graph publishes `/joint_states` + `/clock` only; TF comes from
   robot_state_publisher on the ROS side. No camera/lidar/IMU bridged yet (the
   URDF has those frames if you want to add sensor graphs).

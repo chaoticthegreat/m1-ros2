@@ -19,8 +19,10 @@ Controls (per hand):
                                Release to freeze the arm and reposition your
                                hand (like lifting a mouse off the desk).
     * Trigger ................ that arm's gripper, analog 0 (open) .. 1 (closed).
-    * Thumbstick ............. (left hand) drive the base: push to translate,
-                               (right hand) push left/right to yaw.
+    * Thumbstick ............. LEFT hand drives the base: forward/back to drive
+                               forward/back, left/right to strafe (crab).
+                               RIGHT hand left/right turns (yaw). The robot model
+                               in the headset drives through the room to match.
     * A / X button ........... re-seed that arm's target to its live fingertip
                                (undo drift) -- safe "home to current pose".
 
@@ -44,6 +46,7 @@ zeroes after BASE_HOLD seconds.
 from __future__ import annotations
 
 import json
+import math
 import os
 import ssl
 import subprocess
@@ -65,6 +68,7 @@ from m1_control.kinematics import (
     UrdfModel,
     mat_to_quat,
 )
+from m1_control.swerve import SwerveOdometry
 
 # Vendored web assets (three.js + converted glTF meshes + manifest) served by
 # this node so the headset page is fully self-contained over the LAN.
@@ -222,6 +226,12 @@ class M1QuestNode(Node):
         self.last_btn = {"left": False, "right": False}  # A/X edge detect
         self._last_base_cmd = 0.0
         self._last_update = 0.0
+        # Dead-reckoned base pose (odom frame), integrated from the commanded
+        # body velocity each tick so the headset model actually drives through
+        # the room as the operator commands the swerve. Reset to the origin
+        # whenever the hologram is (re)placed so the robot sits at the anchor.
+        self.odom = SwerveOdometry()
+        self._last_tick = 0.0
 
         # --- ROS interface --------------------------------------------------
         self.pose_pub = {
@@ -277,6 +287,12 @@ class M1QuestNode(Node):
             self._last_update = self._now()
             controllers = data.get("controllers", {})
             head_fwd = data.get("head")  # headset forward vector (WebXR space)
+            # The page raises ``place`` when it (re)anchors the hologram (first
+            # frame or a B/Y recenter). Zero the dead-reckoned pose so the robot
+            # snaps back to the anchor in front of the operator instead of
+            # drifting off by however far it had already been driven.
+            if data.get("place"):
+                self.odom.reset()
             # Physical controllers are cross-mapped: the LEFT controller drives
             # the RIGHT arm and vice versa.
             controller_for_arm = {"left": "right", "right": "left"}
@@ -323,20 +339,24 @@ class M1QuestNode(Node):
 
                 self.grip[arm] = trigger
 
-            # Base from thumbsticks (left = translate, right.x = yaw).
+            # Base from the thumbsticks:
+            #   LEFT stick  forward/back -> drive forward/back (vx)
+            #   LEFT stick  left/right   -> strafe (crab) left/right (vy)
+            #   RIGHT stick left/right   -> turn (yaw)
+            # Driven every frame (so centring the stick stops the base at once);
+            # the dead-man (BASE_HOLD) then only guards a lost connection.
             if self.enable_base:
-                left = controllers.get("left") or {}
-                right = controllers.get("right") or {}
-                lx, ly = self._stick(left)
-                rx, _ = self._stick(right)
-                if abs(lx) > 0 or abs(ly) > 0 or abs(rx) > 0:
-                    self.cmd_vel = {
-                        # stick y is +down in gamepad convention -> push up = fwd
-                        "vx": _clamp(-ly * MAX_LINEAR, -MAX_LINEAR, MAX_LINEAR),
-                        "vy": _clamp(-lx * MAX_STRAFE, -MAX_STRAFE, MAX_STRAFE),
-                        "yaw": _clamp(-rx * MAX_YAW, -MAX_YAW, MAX_YAW),
-                    }
-                    self._last_base_cmd = self._now()
+                lx, ly = self._stick(controllers.get("left") or {})
+                rx, _ = self._stick(controllers.get("right") or {})
+                self.cmd_vel = {
+                    # gamepad stick y is +down -> push up (negative) = forward
+                    "vx": _clamp(-ly * MAX_LINEAR, -MAX_LINEAR, MAX_LINEAR),
+                    # stick x is +right -> push left (negative) = +y (robot left)
+                    "vy": _clamp(-lx * MAX_STRAFE, -MAX_STRAFE, MAX_STRAFE),
+                    # push right (positive) = turn right = clockwise = -yaw
+                    "yaw": _clamp(-rx * MAX_YAW, -MAX_YAW, MAX_YAW),
+                }
+                self._last_base_cmd = self._now()
             viz = self._viz_locked()
         return {"ok": True, "viz": viz}
 
@@ -348,9 +368,20 @@ class M1QuestNode(Node):
         fingertip->target distance so the page can colour the target by how
         well the arm is reaching (green=on target, red=out of reach). All
         points are in the robot ``base_link`` frame; the page anchors that
-        frame to a fixed spot in the room.
+        frame to a fixed spot in the room, then offsets it by ``base`` (the
+        dead-reckoned swerve pose) so the model drives around as commanded.
         """
-        viz = {"frame": "base_link", "arms": {}, "links": {}}
+        x, y, theta = self.odom.pose
+        viz = {
+            "frame": "base_link", "arms": {}, "links": {},
+            # base_link pose in the odom frame (x fwd, y left, +yaw = CCW about
+            # +z). The page applies this to the robot group so the whole model
+            # translates/turns through the room as the base drives.
+            "base": {
+                "p": [round(x, 4), round(y, 4), 0.0],
+                "q": [round(c, 5) for c in self.odom.quaternion()],
+            },
+        }
         have_js = bool(self.q_meas)
         if self.reach is not None and have_js:
             # Full-robot link poses (base_link frame) so the page can drive each
@@ -385,15 +416,22 @@ class M1QuestNode(Node):
         return viz
 
     @staticmethod
-    def _stick(c: dict) -> tuple[float, float]:
+    def _deadzone(v: float) -> float:
+        """Smooth radial deadzone: ignore tiny noise, then rescale so the live
+        range maps 0..1 with no jump at the deadzone edge (no sudden lurch as
+        the stick crosses the threshold)."""
+        a = abs(v)
+        if a < STICK_DEADZONE:
+            return 0.0
+        scaled = (a - STICK_DEADZONE) / (1.0 - STICK_DEADZONE)
+        return math.copysign(min(scaled, 1.0), v)
+
+    @classmethod
+    def _stick(cls, c: dict) -> tuple[float, float]:
         s = c.get("stick", [0.0, 0.0]) if c else [0.0, 0.0]
         x = float(s[0]) if len(s) > 0 else 0.0
         y = float(s[1]) if len(s) > 1 else 0.0
-        if abs(x) < STICK_DEADZONE:
-            x = 0.0
-        if abs(y) < STICK_DEADZONE:
-            y = 0.0
-        return x, y
+        return cls._deadzone(x), cls._deadzone(y)
 
     def _set_target(self, arm: str, xyz):
         self.target[arm] = [
@@ -409,6 +447,13 @@ class M1QuestNode(Node):
             if now - self._last_base_cmd > BASE_HOLD:
                 self.cmd_vel = {"vx": 0.0, "vy": 0.0, "yaw": 0.0}
             cmd = dict(self.cmd_vel)
+            # Dead-reckon the base pose from the command we are about to publish,
+            # so the headset model drives through the room in lockstep with the
+            # swerve. dt is clamped to the same band the controller uses.
+            dt = now - self._last_tick if self._last_tick else 0.0
+            self._last_tick = now
+            self.odom.update(cmd["vx"], cmd["vy"], cmd["yaw"],
+                             min(max(dt, 0.0), 0.05))
             targets = {a: list(self.target[a]) for a in ("left", "right")}
             grip = dict(self.grip)
 
@@ -679,8 +724,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <kbd>Grip</kbd> (squeeze) — hold to "grab" that arm; the gripper follows your
       hand's motion. Release to freeze &amp; recenter.<br/>
       <kbd>Trigger</kbd> — that arm's gripper (squeeze to close).<br/>
-      <kbd>Left stick</kbd> — drive the base (push to translate).<br/>
-      <kbd>Right stick</kbd> — turn (yaw).<br/>
+      <kbd>Left stick</kbd> — drive: forward/back = drive fwd/back, left/right = strafe.<br/>
+      <kbd>Right stick</kbd> — left/right = turn (yaw).<br/>
       <kbd>A</kbd>/<kbd>X</kbd> — re-home that arm's target to where it is now.<br/>
       <kbd>B</kbd>/<kbd>Y</kbd> — recenter the robot hologram in front of you.
     </p>
@@ -726,11 +771,16 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 const enterBtn=document.getElementById("enter");
 const hint=document.getElementById("xrhint");
 
-let renderer=null, scene=null, camera=null, robotRoot=null;
+let renderer=null, scene=null, camera=null, robotRoot=null, robotBase=null;
 let xrSession=null, refSpace=null, refIsFloor=false, robotPlaced=false;
 let lastViz=null, inFlight=false, meshesLoaded=false;
 const linkNodes={}, targetMesh={}, tipMesh={}, errLine={}, wire={};
 const recenterPrev={left:false, right:false};
+// Sticky "(re)anchor the robot" signal. Set when we place/recenter, sent to the
+// node so it zeroes the dead-reckoned base pose, and cleared only once a POST
+// that carried it actually reaches the server -- so a recenter that lands while
+// a POST is in flight is NOT dropped (it rides the next POST instead).
+let pendingPlace=false;
 
 // Robot materials. The converted meshes now carry per-solid VERTEX COLOURS
 // baked from the real CAD materials (white body, black tyres/trim, red accents),
@@ -777,20 +827,25 @@ function initThree(){
   const fill=new THREE.DirectionalLight(0xffffff, 0.5); fill.position.set(-1.5,1,-1.5);
   scene.add(fill);
 
-  // base_link-frame container; its matrix is the room anchor (Z-up robot -> XR).
+  // Room anchor: its matrix maps robot axes (x fwd, y left, z up) -> XR world
+  // and pins the odom origin to a fixed spot in the room.
   robotRoot=new THREE.Group(); robotRoot.matrixAutoUpdate=false; scene.add(robotRoot);
+  // base_link group: lives inside the anchor and carries the dead-reckoned
+  // swerve pose, so the whole robot (meshes, targets, wires) drives through the
+  // room as the base is commanded. Everything below hangs off robotBase.
+  robotBase=new THREE.Group(); robotRoot.add(robotBase);
 
   for(const arm of ["left","right"]){
     const tg=new THREE.Mesh(new THREE.SphereGeometry(0.05,24,16),
       new THREE.MeshStandardMaterial({color:0x4cd964, transparent:true, opacity:0.42}));
-    tg.visible=false; robotRoot.add(tg); targetMesh[arm]=tg;
+    tg.visible=false; robotBase.add(tg); targetMesh[arm]=tg;
     const tp=new THREE.Mesh(new THREE.SphereGeometry(0.02,16,12),
       new THREE.MeshStandardMaterial({color:0x33ccee, emissive:0x114455}));
-    tp.visible=false; robotRoot.add(tp); tipMesh[arm]=tp;
+    tp.visible=false; robotBase.add(tp); tipMesh[arm]=tp;
     const g=new THREE.BufferGeometry().setFromPoints(
       [new THREE.Vector3(), new THREE.Vector3()]);
     const ln=new THREE.Line(g, new THREE.LineBasicMaterial({color:0x4cd964}));
-    ln.visible=false; robotRoot.add(ln); errLine[arm]=ln;
+    ln.visible=false; robotBase.add(ln); errLine[arm]=ln;
   }
 }
 
@@ -816,7 +871,7 @@ async function loadRobot(){
         o.material=hasColor?ROBOT_MAT_VC:ROBOT_MAT;
       }});
       let node=linkNodes[e.link];
-      if(!node){ node=new THREE.Group(); linkNodes[e.link]=node; robotRoot.add(node); }
+      if(!node){ node=new THREE.Group(); linkNodes[e.link]=node; robotBase.add(node); }
       node.add(obj);
     }catch(err){ log("mesh "+e.mesh+" failed: "+err); }
   }
@@ -827,6 +882,15 @@ async function loadRobot(){
 /* ---- per-frame: pose every link mesh + target markers from lastViz ---- */
 function updateRobot(){
   if(!lastViz) return;
+  // Offset the whole robot inside the room anchor by the dead-reckoned swerve
+  // pose (base_link in the odom frame) so it drives around as commanded. While a
+  // place/recenter reset is still in flight the cached base is stale (not yet
+  // zeroed), so hold robotBase at the local anchor snap until it lands.
+  if(robotBase && lastViz.base && !pendingPlace){
+    const b=lastViz.base;
+    if(b.p) robotBase.position.set(b.p[0], b.p[1], b.p[2]);
+    if(b.q) robotBase.quaternion.set(b.q[0], b.q[1], b.q[2], b.q[3]);
+  }
   if(lastViz.links){
     for(const name in lastViz.links){
       const node=linkNodes[name]; if(!node) continue;
@@ -863,7 +927,7 @@ function updateWire(){
     let w=wire[arm];
     if(!w){ w=new THREE.LineSegments(new THREE.BufferGeometry(),
         new THREE.LineBasicMaterial({color:0x8c99b8}));
-      robotRoot.add(w); wire[arm]=w; }
+      robotBase.add(w); wire[arm]=w; }
     w.geometry.setAttribute("position", new THREE.Float32BufferAttribute(pts,3));
     w.geometry.attributes.position.needsUpdate=true; w.visible=true;
   }
@@ -921,13 +985,23 @@ function onFrame(t, frame){
       head=[ -2*(q.x*q.z + q.w*q.y),
              -2*(q.y*q.z - q.w*q.x),
              -(1 - 2*(q.x*q.x + q.y*q.y)) ];
-      if(!robotPlaced || recenter){ setAnchor(vpose, head); robotPlaced=true; }
+      if(!robotPlaced || recenter){
+        setAnchor(vpose, head); robotPlaced=true; pendingPlace=true;
+        // Snap the model back to the anchor immediately; updateRobot() holds it
+        // here (it skips the stale cached base while pendingPlace) until the
+        // server's zeroed pose comes back.
+        if(robotBase){ robotBase.position.set(0,0,0); robotBase.quaternion.set(0,0,0,1); }
+      }
     }
     if(!inFlight){
       inFlight=true;
+      // place tells the node to zero its dead-reckoned base pose so the robot
+      // sits exactly at the (re)anchored spot. Sticky: clear pendingPlace only
+      // after the POST that carried it succeeds, so a reset is never dropped.
+      const sentPlace=pendingPlace;
       fetch("/api/xr",{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({controllers:out, head:head}),keepalive:true})
-        .then(r=>r.json()).then(j=>{ if(j&&j.viz) lastViz=j.viz; })
+        body:JSON.stringify({controllers:out, head:head, place:sentPlace}),keepalive:true})
+        .then(r=>r.json()).then(j=>{ if(j&&j.viz) lastViz=j.viz; if(sentPlace) pendingPlace=false; })
         .catch(()=>{}).finally(()=>{inFlight=false;});
     }
     updateRobot();
