@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "ros2_ws/src/m1_contr
 
 from m1_control.quest_node import M1QuestNode  # noqa: E402
 from m1_control.kinematics import mat_to_quat, quat_to_mat  # noqa: E402
+from m1_control.swerve import SwerveOdometry  # noqa: E402
 
 ARMS = ("left", "right")
 
@@ -57,6 +58,8 @@ def make_node():
     n.last_btn = {a: False for a in ARMS}
     n._last_base_cmd = 0.0
     n._last_update = 0.0
+    n.odom = SwerveOdometry()     # base dead-reckoning used by _viz_locked/_tick
+    n._last_tick = 0.0
     return n
 
 
