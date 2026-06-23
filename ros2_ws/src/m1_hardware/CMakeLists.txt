@@ -32,6 +32,10 @@ find_package(hardware_interface REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
+# yaml-cpp for the motor_map YAML loader (FIX 1). yaml_cpp_vendor provides the
+# yaml-cpp::yaml-cpp imported target on Jazzy.
+find_package(yaml_cpp_vendor REQUIRED)
+find_package(yaml-cpp REQUIRED)
 
 # ---------------------------------------------------------------------------
 # Vendored openarm_can (Apache-2.0) -- built directly from sources, NOT via its
@@ -67,13 +71,14 @@ add_library(${PROJECT_NAME} SHARED
 target_include_directories(${PROJECT_NAME} PRIVATE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
-target_link_libraries(${PROJECT_NAME} openarm_can)
+target_link_libraries(${PROJECT_NAME} openarm_can yaml-cpp)
 
 ament_target_dependencies(${PROJECT_NAME}
   hardware_interface
   pluginlib
   rclcpp
   rclcpp_lifecycle
+  yaml_cpp_vendor
 )
 
 # Export the pluginlib description so controller_manager can discover the class.
@@ -112,6 +117,13 @@ if(BUILD_TESTING)
     ${OPENARM_CAN_DIR}/include
   )
   target_link_libraries(test_dm_mit_packing openarm_can)
+
+  # FIX 2: order-independent motor<->device matching by master_id.
+  ament_add_gtest(test_device_matching test/test_device_matching.cpp)
+  target_include_directories(test_device_matching PRIVATE
+    ${OPENARM_CAN_DIR}/include
+  )
+  target_link_libraries(test_device_matching openarm_can)
 endif()
 
 ament_export_include_directories(include)
@@ -120,6 +132,7 @@ ament_export_dependencies(
   pluginlib
   rclcpp
   rclcpp_lifecycle
+  yaml_cpp_vendor
 )
 
 ament_package()

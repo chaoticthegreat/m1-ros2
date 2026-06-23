@@ -101,27 +101,41 @@ launch as `motor_map:=...`.
 
 ## Wiring the motor map into the controller (bring-up TODO)
 
-The `m1_hardware/M1SystemInterface` plugin reads per-joint `can_id` / `master_id`
-/ `motor_model` / `kp` / `kd` / `dir` / `offset` from the URDF `<ros2_control>`
-`<joint><param>` tags, falling back to **sequential CAN IDs `0x01..` and model
-DM4310** when absent (fine for a no-bus load; NOT correct for live control). To
-drive real motors you must supply the real per-joint values. Two ways:
+The `m1_hardware/M1SystemInterface` plugin sources each joint's `can_id` /
+`master_id` / `motor_model` / `kp` / `kd` / `dir` / `offset` with this precedence:
+**URDF `<ros2_control><joint><param>` (if present) > the `motor_map:=` YAML >
+built-in default** (sequential CAN IDs `0x01..`, model DM4310, kp/kd 0). Two ways
+to supply the real per-joint values:
 
 1. **Edit `urdf/m1.ros2_control.xacro`** to emit `<param name="can_id">…` etc. per
-   joint (from the `m1_hwconfig` map), or
-2. **(preferred, TODO)** finish the `motor_map` hook in
-   `m1_hardware/src/m1_system_interface.cpp` (`parse_joints`) so the plugin loads
-   the `motor_map:=` YAML (the same schema `m1_hwconfig` writes:
-   `{joint: {id, master_id, model, dir, offset, soft_limits}}`) as the source of
-   truth for ids/models.
+   joint (highest precedence), or
+2. **(preferred) pass `motor_map:=<path>.yaml`** — the plugin now loads it via
+   yaml-cpp in `parse_joints`/`load_motor_map`. It is the SAME schema
+   `m1_hwconfig` writes (`{joint: {id, master_id, model, kp, kd, dir, offset,
+   soft_limits}}`), so the config-page map is the source of truth for ids/models/
+   gains with no xacro edit. (`soft_limits` is consumed by the controllers' limit
+   enforcement, not the plugin.)
 
-**Known wart:** the plugin currently creates a motor for all 19 ros2_control
-joints, including the two state-only mimic `*_finger_joint2`. Those have **no
-physical motor** (one gripper motor per arm drives the parallel fingers via the
-URDF `<mimic>`). With no bus this is harmless; before live control, either omit
-the two `finger_joint2` from the motor map or update `parse_joints` to skip joints
-without a `position` command interface. The brain commands `finger_joint1` and the
-mimic propagates.
+**Limp-arm safety guard:** if any COMMANDED joint ends up with `kp == 0` (e.g. a
+missing/empty motor_map on a `use_mock:=false` launch), the plugin logs a
+prominent `UNSAFE CONFIG` error and **refuses to open the CAN bus** (motors are
+never enabled) so the arms can't silently go limp/mis-scaled. The component still
+LOADS and runs no-bus/mock I/O — only LIVE driving is refused until kp is fixed.
+
+**Mimic joints (resolved):** `parse_joints` now skips any joint with no `position`
+command interface, so the two state-only mimic `*_finger_joint2` get **no motor
+and no command interface** (their STATE interfaces are still exported, so they
+appear in `/joint_states`). Result: **17 commanded motors, not 19**. One gripper
+motor per arm drives the parallel fingers via the URDF `<mimic>`; the brain
+commands `finger_joint1` and the mimic propagates.
+
+**Order-independent device wiring:** the openarm CAN device collection is a
+`std::map` keyed by `master_id`, so it iterates in ascending-master_id order — NOT
+URDF joint order. The plugin matches each motor to ITS device **by master_id**
+(`mit_control_one`/`get_motor` keyed on the resolved device index), and a startup
+check refuses to drive if the configured master_ids don't match the live device
+set. Operators can therefore reassign IDs via the config page without cross-wiring
+commands/feedback.
 
 ## AgileX base integration (path, not yet vendored)
 

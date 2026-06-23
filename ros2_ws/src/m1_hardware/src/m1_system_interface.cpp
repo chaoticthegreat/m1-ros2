@@ -29,6 +29,8 @@
 #include <openarm/can/socket/openarm.hpp>
 #include <openarm/damiao_motor/dm_motor_control.hpp>
 
+#include <yaml-cpp/yaml.h>
+
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
 #include "rclcpp/logging.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -105,6 +107,42 @@ std::string lookup(
   }
   return def;
 }
+
+// Read a scalar YAML node as a string ("" if missing/null). Lets the existing
+// string-based parse_id/parse_double/parse_bool reuse the same coercion rules
+// for both URDF <param> strings and motor_map YAML values.
+std::string yaml_str(const YAML::Node & node)
+{
+  if (!node || node.IsNull() || !node.IsScalar())
+  {
+    return "";
+  }
+  return node.as<std::string>();
+}
+
+// Reverse of model_from_string for logging (MotorType -> model name). Falls back
+// to the numeric enum value for any unexpected type.
+std::string model_string_of(openarm::damiao_motor::MotorType m)
+{
+  using MT = openarm::damiao_motor::MotorType;
+  switch (m)
+  {
+    case MT::DM3507: return "DM3507";
+    case MT::DM4310: return "DM4310";
+    case MT::DM4310_48V: return "DM4310_48V";
+    case MT::DM4340: return "DM4340";
+    case MT::DM4340_48V: return "DM4340_48V";
+    case MT::DM6006: return "DM6006";
+    case MT::DM8006: return "DM8006";
+    case MT::DM8009: return "DM8009";
+    case MT::DM10010L: return "DM10010L";
+    case MT::DM10010: return "DM10010";
+    case MT::DMH3510: return "DMH3510";
+    case MT::DMH6215: return "DMH6215";
+    case MT::DMG6220: return "DMG6220";
+    default: return "DM(" + std::to_string(static_cast<int>(m)) + ")";
+  }
+}
 }  // namespace
 
 namespace m1_hardware
@@ -159,53 +197,214 @@ void M1SystemInterface::parse_bus_params(const hardware_interface::HardwareInfo 
     motor_map_path_.empty() ? "(none)" : motor_map_path_.c_str());
 }
 
+std::unordered_map<std::string, JointMotor> M1SystemInterface::load_motor_map()
+{
+  // Schema (exactly what m1_can_tools.motor_bus.save_map writes), per joint:
+  //   joint_name:
+  //     id:         <int>        # CAN slave/send id
+  //     master_id:  <int>        # host/recv id (= id + 0x10)
+  //     model:      <str>        # DM model string
+  //     kp: <float>  kd: <float>  dir: +1|-1  offset: <float>
+  //     soft_limits: {pos:[lo,hi], vel:<float>, effort:<float>}  # not consumed here
+  std::unordered_map<std::string, JointMotor> out;
+  if (motor_map_path_.empty())
+  {
+    return out;
+  }
+
+  YAML::Node root;
+  try
+  {
+    root = YAML::LoadFile(motor_map_path_);
+  }
+  catch (const std::exception & e)
+  {
+    RCLCPP_WARN(
+      rclcpp::get_logger(kLogger),
+      "motor_map '%s' could not be loaded (%s) -- falling back to URDF/defaults.",
+      motor_map_path_.c_str(), e.what());
+    return out;
+  }
+  if (!root || !root.IsMap())
+  {
+    RCLCPP_WARN(
+      rclcpp::get_logger(kLogger),
+      "motor_map '%s' is empty or not a joint map -- falling back to URDF/defaults.",
+      motor_map_path_.c_str());
+    return out;
+  }
+
+  for (const auto & kv : root)
+  {
+    const std::string joint = kv.first.as<std::string>();
+    const YAML::Node & cfg = kv.second;
+    if (!cfg || !cfg.IsMap())
+    {
+      continue;
+    }
+    JointMotor m;
+    m.name = joint;
+    // id / master_id (mirror motor_bus: master defaults to id + 0x10).
+    const std::string id_s = yaml_str(cfg["id"]);
+    m.can_id = parse_id(id_s, 0);
+    m.master_id = parse_id(yaml_str(cfg["master_id"]), m.can_id + 0x10);
+
+    bool model_ok = true;
+    const std::string model_str = yaml_str(cfg["model"]);
+    if (!model_str.empty())
+    {
+      m.model = model_from_string(model_str, model_ok);
+      if (!model_ok)
+      {
+        RCLCPP_WARN(
+          rclcpp::get_logger(kLogger),
+          "motor_map joint '%s': unknown model '%s', defaulting to DM4310",
+          joint.c_str(), model_str.c_str());
+      }
+    }
+    m.kp = parse_double(yaml_str(cfg["kp"]), 0.0);
+    m.kd = parse_double(yaml_str(cfg["kd"]), 0.0);
+    m.direction = parse_double(yaml_str(cfg["dir"]), 1.0);
+    m.offset = parse_double(yaml_str(cfg["offset"]), 0.0);
+    out[joint] = m;
+  }
+
+  RCLCPP_INFO(
+    rclcpp::get_logger(kLogger), "Loaded motor_map '%s' (%zu joint(s)).",
+    motor_map_path_.c_str(), out.size());
+  return out;
+}
+
 bool M1SystemInterface::parse_joints(const hardware_interface::HardwareInfo & info)
 {
   motors_.clear();
+  state_names_.clear();
+  limp_config_ = false;
   const auto & hw = info.hardware_parameters;
+
+  // Source of per-joint config: URDF <param> (highest precedence) > motor_map
+  // YAML > built-in default. Load the YAML once up front (FIX 1).
+  const std::unordered_map<std::string, JointMotor> ymap = load_motor_map();
 
   uint32_t auto_id = 1;  // fallback CAN id allocator if none specified
   for (const auto & joint : info.joints)
   {
-    JointMotor m;
-    m.name = joint.name;
+    // FIX 3: only joints with a `position` COMMAND interface have a physical
+    // motor. The state-only mimic *_finger_joint2 (no command interface) get a
+    // storage slot + STATE interfaces but NO motor / command interface.
+    const bool commanded = std::any_of(
+      joint.command_interfaces.begin(), joint.command_interfaces.end(),
+      [](const hardware_interface::InterfaceInfo & ci) {
+        return ci.name == hardware_interface::HW_IF_POSITION;
+      });
 
-    const auto & jp = joint.parameters;
-    m.can_id = parse_id(lookup(jp, hw, "can_id"), auto_id);
-    // Master/recv id convention from the spec: slave + 0x10 (never 0).
-    m.master_id = parse_id(lookup(jp, hw, "master_id"), m.can_id + 0x10);
+    const size_t state_index = state_names_.size();
+    state_names_.push_back(joint.name);
 
-    bool model_ok = true;
-    const std::string model_str = lookup(jp, hw, "motor_model", "DM4310");
-    m.model = model_from_string(model_str, model_ok);
-    if (!model_ok)
+    if (!commanded)
     {
-      RCLCPP_WARN(
+      RCLCPP_INFO(
         rclcpp::get_logger(kLogger),
-        "Joint '%s': unknown motor_model '%s', defaulting to DM4310", m.name.c_str(),
-        model_str.c_str());
+        "Joint '%s': no position command interface -> state-only (mimic), no motor.",
+        joint.name.c_str());
+      continue;
     }
 
-    // Gains: per-joint <param kp/kd>, else hardware-level kp/kd, else 0.
-    m.kp = parse_double(lookup(jp, hw, "kp"), 0.0);
-    m.kd = parse_double(lookup(jp, hw, "kd"), 0.0);
-    m.direction = parse_double(lookup(jp, hw, "dir"), 1.0);
-    m.offset = parse_double(lookup(jp, hw, "offset"), 0.0);
+    JointMotor m;
+    m.name = joint.name;
+    m.state_index = state_index;
+
+    // Per-joint values: URDF <param> if present, else motor_map YAML, else default.
+    const auto & jp = joint.parameters;
+    auto yit = ymap.find(joint.name);
+    const bool have_yaml = (yit != ymap.end());
+    const JointMotor ym = have_yaml ? yit->second : JointMotor{};
+
+    // Precedence per key: URDF <param> (joint- or hardware-level) > motor_map
+    // YAML > built-in default.
+    auto pick_id = [&](const char * key, uint32_t yaml_val, uint32_t def) {
+      const std::string s = lookup(jp, hw, key);
+      if (!s.empty()) return parse_id(s, def);
+      if (have_yaml) return yaml_val;
+      return def;
+    };
+    auto pick_double = [&](const char * key, double yaml_val, double def) {
+      const std::string s = lookup(jp, hw, key);
+      if (!s.empty()) return parse_double(s, def);
+      if (have_yaml) return yaml_val;
+      return def;
+    };
+
+    m.can_id = pick_id("can_id", ym.can_id, auto_id);
+    // Master/recv id convention from the spec: slave + 0x10 (never 0).
+    m.master_id = pick_id("master_id", ym.master_id, m.can_id + 0x10);
+
+    bool model_ok = true;
+    const std::string model_str = lookup(jp, hw, "motor_model");  // URDF param only
+    if (!model_str.empty())
+    {
+      m.model = model_from_string(model_str, model_ok);
+      if (!model_ok)
+      {
+        RCLCPP_WARN(
+          rclcpp::get_logger(kLogger),
+          "Joint '%s': unknown motor_model '%s', defaulting to DM4310", m.name.c_str(),
+          model_str.c_str());
+      }
+    }
+    else if (have_yaml)
+    {
+      m.model = ym.model;  // already validated in load_motor_map()
+    }
+    // else: built-in default DM4310 (JointMotor default).
+
+    m.kp = pick_double("kp", ym.kp, 0.0);
+    m.kd = pick_double("kd", ym.kd, 0.0);
+    m.direction = pick_double("dir", ym.direction, 1.0);
+    m.offset = pick_double("offset", ym.offset, 0.0);
 
     motors_.push_back(m);
     auto_id = m.can_id + 1;
 
+    if (m.kp == 0.0)
+    {
+      limp_config_ = true;
+    }
+
     RCLCPP_INFO(
       rclcpp::get_logger(kLogger),
-      "Joint[%zu] '%s': model=%s can_id=0x%02X master_id=0x%02X kp=%.3f kd=%.3f dir=%+.0f",
-      motors_.size() - 1, m.name.c_str(), model_str.c_str(), m.can_id, m.master_id, m.kp, m.kd,
-      m.direction);
+      "Motor[%zu] '%s': model=%s can_id=0x%02X master_id=0x%02X kp=%.3f kd=%.3f dir=%+.0f "
+      "offset=%.4f (motor_map=%s)",
+      motors_.size() - 1, m.name.c_str(),
+      model_string_of(m.model).c_str(), m.can_id, m.master_id, m.kp, m.kd, m.direction, m.offset,
+      have_yaml ? "yes" : "no");
   }
 
-  if (motors_.empty())
+  if (state_names_.empty())
   {
     RCLCPP_ERROR(rclcpp::get_logger(kLogger), "No joints found in HardwareInfo");
     return false;
+  }
+  if (motors_.empty())
+  {
+    RCLCPP_ERROR(rclcpp::get_logger(kLogger), "No COMMANDED joints found in HardwareInfo");
+    return false;
+  }
+
+  RCLCPP_INFO(
+    rclcpp::get_logger(kLogger), "Parsed %zu joints (%zu commanded motors, %zu state-only).",
+    state_names_.size(), motors_.size(), state_names_.size() - motors_.size());
+
+  // FIX 1 safety guard: a COMMANDED motor with kp==0 is limp/unsafe. Warn here;
+  // the bus is refused in try_open_bus() so the live arms can never silently go
+  // limp. A no-bus mock load still succeeds (for offline I/O).
+  if (limp_config_)
+  {
+    RCLCPP_ERROR(
+      rclcpp::get_logger(kLogger),
+      "UNSAFE CONFIG: at least one commanded joint has kp==0 (limp / mis-scaled motor). "
+      "The CAN bus will be REFUSED (motors not enabled). Provide kp via the motor_map YAML "
+      "or URDF <param name=\"kp\">. (Mock/no-bus load still proceeds.)");
   }
   return true;
 }
@@ -214,6 +413,24 @@ void M1SystemInterface::try_open_bus()
 {
   bus_ok_ = false;
   openarm_.reset();
+  for (auto & m : motors_)
+  {
+    m.device_index = -1;
+  }
+
+  // FIX 1 safety guard: refuse to drive a live bus with a limp (kp==0) commanded
+  // motor. Stay LOADED in no-bus/mock mode (read() echoes commands) so offline
+  // validation still works -- we just never enable real motors.
+  if (limp_config_)
+  {
+    RCLCPP_ERROR(
+      rclcpp::get_logger(kLogger),
+      "Refusing to open CAN bus '%s': a commanded joint has kp==0 (would drive limp/mis-scaled "
+      "motors). Running with NO BUS / mock I/O. Fix the motor_map kp before live control.",
+      can_interface_.c_str());
+    return;
+  }
+
   try
   {
     openarm_ = std::make_unique<openarm::can::socket::OpenArm>(can_interface_, can_fd_);
@@ -234,6 +451,22 @@ void M1SystemInterface::try_open_bus()
     // fingers are ordinary DM motors here, generalized away from OpenArm's
     // dedicated gripper component).
     openarm_->init_arm_motors(models, send_ids, recv_ids);
+
+    // FIX 2: the device collection is a std::map keyed by recv_can_id (master_id),
+    // so get_motors()[i] / mit_control_one(i) iterate in ASCENDING-master_id order,
+    // NOT URDF/motors_ order. Resolve each motor's device index by matching its
+    // master_id to the device's recv_can_id, so we command/read each motor on ITS
+    // own device regardless of map order.
+    const auto motors_by_dev = openarm_->get_arm().get_motors();  // map (ascending) order
+    if (!resolve_device_indices(motors_by_dev))
+    {
+      // Configured master_ids don't match the device set: unsafe to command by a
+      // guessed index. Drop to no-bus so we never cross-wire a live motor.
+      openarm_.reset();
+      bus_ok_ = false;
+      return;
+    }
+
     bus_ok_ = true;
     RCLCPP_INFO(
       rclcpp::get_logger(kLogger), "CAN bus '%s' open; %zu motors initialised",
@@ -251,6 +484,57 @@ void M1SystemInterface::try_open_bus()
       "Live motor I/O will be validated on hardware.",
       can_interface_.c_str(), e.what());
   }
+}
+
+bool M1SystemInterface::resolve_device_indices(
+  const std::vector<openarm::damiao_motor::Motor> & devices)
+{
+  // Build recv_can_id (master_id) -> device-collection index. The collection is
+  // returned in std::map(recv_can_id) ascending order; this map lets each
+  // URDF-ordered motors_[k] find ITS device by master_id (FIX 2).
+  std::unordered_map<uint32_t, int> by_master;
+  by_master.reserve(devices.size());
+  for (size_t i = 0; i < devices.size(); ++i)
+  {
+    by_master[devices[i].get_recv_can_id()] = static_cast<int>(i);
+  }
+
+  bool all_ok = true;
+  for (auto & m : motors_)
+  {
+    auto it = by_master.find(m.master_id);
+    if (it == by_master.end())
+    {
+      RCLCPP_ERROR(
+        rclcpp::get_logger(kLogger),
+        "Device set mismatch: no CAN device with master_id=0x%02X for joint '%s'.",
+        m.master_id, m.name.c_str());
+      all_ok = false;
+      continue;
+    }
+    m.device_index = it->second;
+  }
+
+  if (devices.size() != motors_.size())
+  {
+    RCLCPP_ERROR(
+      rclcpp::get_logger(kLogger),
+      "Device count (%zu) != configured motor count (%zu).", devices.size(), motors_.size());
+    all_ok = false;
+  }
+  if (!all_ok)
+  {
+    RCLCPP_ERROR(
+      rclcpp::get_logger(kLogger),
+      "Configured master_ids do not match the CAN device set -- refusing to drive (no bus).");
+  }
+  else
+  {
+    RCLCPP_INFO(
+      rclcpp::get_logger(kLogger),
+      "Matched %zu motors to CAN devices by master_id (order-independent).", motors_.size());
+  }
+  return all_ok;
 }
 
 hardware_interface::CallbackReturn M1SystemInterface::on_init(
@@ -271,14 +555,17 @@ hardware_interface::CallbackReturn M1SystemInterface::on_init(
     return hardware_interface::CallbackReturn::ERROR;
   }
 
-  const size_t n = motors_.size();
+  // One storage slot per JOINT (incl. state-only mimics) so /joint_states is
+  // complete; commands are written per-motor by state_index.
+  const size_t n = state_names_.size();
   pos_states_.assign(n, 0.0);
   vel_states_.assign(n, 0.0);
   tau_states_.assign(n, 0.0);
   pos_commands_.assign(n, 0.0);
 
   RCLCPP_INFO(
-    rclcpp::get_logger(kLogger), "M1SystemInterface initialised with %zu joints", n);
+    rclcpp::get_logger(kLogger),
+    "M1SystemInterface initialised with %zu joints (%zu commanded motors)", n, motors_.size());
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
@@ -290,12 +577,14 @@ M1SystemInterface::on_export_state_interfaces()
   vel_state_ifaces_.clear();
   tau_state_ifaces_.clear();
 
-  for (size_t i = 0; i < motors_.size(); ++i)
+  // STATE interfaces for EVERY joint, including the state-only mimic
+  // finger_joint2 (FIX 3: they have no motor but DO appear in /joint_states).
+  for (size_t i = 0; i < state_names_.size(); ++i)
   {
     auto make = [&](const std::string & iface, double * ptr) {
       hardware_interface::InterfaceInfo ii;
       ii.name = iface;
-      hardware_interface::InterfaceDescription desc(motors_[i].name, ii);
+      hardware_interface::InterfaceDescription desc(state_names_[i], ii);
       auto si = std::make_shared<hardware_interface::StateInterface>(desc);
       // Seed the handle from our owned storage; read() updates it each cycle.
       std::ignore = si->set_value(*ptr);
@@ -320,13 +609,17 @@ M1SystemInterface::on_export_command_interfaces()
   std::vector<hardware_interface::CommandInterface::SharedPtr> out;
   pos_cmd_ifaces_.clear();
 
-  for (size_t i = 0; i < motors_.size(); ++i)
+  // COMMAND interfaces only for commanded motors (FIX 3: no command interface for
+  // the state-only mimic joints -- ros2_control forbids it on a mimic and there
+  // is no physical motor). pos_cmd_ifaces_[k] is parallel to motors_[k].
+  for (size_t k = 0; k < motors_.size(); ++k)
   {
+    const size_t si = motors_[k].state_index;
     hardware_interface::InterfaceInfo ii;
     ii.name = hardware_interface::HW_IF_POSITION;
-    hardware_interface::InterfaceDescription desc(motors_[i].name, ii);
+    hardware_interface::InterfaceDescription desc(motors_[k].name, ii);
     auto ci = std::make_shared<hardware_interface::CommandInterface>(desc);
-    std::ignore = ci->set_value(pos_commands_[i]);
+    std::ignore = ci->set_value(pos_commands_[si]);
     pos_cmd_ifaces_.push_back(ci);
     out.push_back(ci);
   }
@@ -386,12 +679,15 @@ hardware_interface::CallbackReturn M1SystemInterface::on_activate(
   }
 
   // Seed command interfaces from current state so we hold position on activate.
-  for (size_t i = 0; i < motors_.size(); ++i)
+  // pos_commands_/pos_states_ are indexed by state_index; pos_cmd_ifaces_[k] is
+  // parallel to motors_[k] (commanded joints only).
+  for (size_t k = 0; k < motors_.size(); ++k)
   {
-    pos_commands_[i] = pos_states_[i];
-    if (i < pos_cmd_ifaces_.size())
+    const size_t si = motors_[k].state_index;
+    pos_commands_[si] = pos_states_[si];
+    if (k < pos_cmd_ifaces_.size())
     {
-      std::ignore = pos_cmd_ifaces_[i]->set_value(pos_commands_[i]);
+      std::ignore = pos_cmd_ifaces_[k]->set_value(pos_commands_[si]);
     }
   }
   RCLCPP_INFO(rclcpp::get_logger(kLogger), "M1SystemInterface activated.");
@@ -451,14 +747,19 @@ hardware_interface::return_type M1SystemInterface::read(
     {
       openarm_->refresh_all();
       openarm_->recv_all();
-      const auto & arm_motors = openarm_->get_arm().get_motors();
-      for (size_t i = 0; i < motors_.size() && i < arm_motors.size(); ++i)
+      // FIX 2: fetch each motor's feedback by ITS device index (master_id-matched),
+      // not by map iteration order. get_motor(i) indexes get_dm_devices()[i].
+      auto & arm = openarm_->get_arm();
+      for (const auto & m : motors_)
       {
-        const double dir = motors_[i].direction;
-        const double off = motors_[i].offset;
-        pos_states_[i] = dir * arm_motors[i].get_position() + off;
-        vel_states_[i] = dir * arm_motors[i].get_velocity();
-        tau_states_[i] = dir * arm_motors[i].get_torque();
+        if (m.device_index < 0)
+        {
+          continue;
+        }
+        const auto motor = arm.get_motor(m.device_index);
+        pos_states_[m.state_index] = m.direction * motor.get_position() + m.offset;
+        vel_states_[m.state_index] = m.direction * motor.get_velocity();
+        tau_states_[m.state_index] = m.direction * motor.get_torque();
       }
     }
     catch (const std::exception & e)
@@ -472,7 +773,8 @@ hardware_interface::return_type M1SystemInterface::read(
   else
   {
     // Mock I/O: reflect the commanded position so the loop / RViz stays sane.
-    for (size_t i = 0; i < motors_.size(); ++i)
+    // Over ALL joints (incl. state-only mimics, whose command stays at its seed).
+    for (size_t i = 0; i < state_names_.size(); ++i)
     {
       pos_states_[i] = pos_commands_[i];
       vel_states_[i] = 0.0;
@@ -480,8 +782,8 @@ hardware_interface::return_type M1SystemInterface::read(
     }
   }
 
-  // Publish into the exported state handles.
-  for (size_t i = 0; i < motors_.size(); ++i)
+  // Publish into the exported state handles (one per joint, all joints).
+  for (size_t i = 0; i < state_names_.size(); ++i)
   {
     if (i < pos_state_ifaces_.size())
     {
@@ -496,15 +798,16 @@ hardware_interface::return_type M1SystemInterface::read(
 hardware_interface::return_type M1SystemInterface::write(
   const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
 {
-  // Pull the latest position commands from the exported handles.
-  for (size_t i = 0; i < motors_.size(); ++i)
+  // Pull the latest position commands from the exported handles into each
+  // motor's storage slot (state_index). pos_cmd_ifaces_[k] is parallel to motors_.
+  for (size_t k = 0; k < motors_.size(); ++k)
   {
-    if (i < pos_cmd_ifaces_.size())
+    if (k < pos_cmd_ifaces_.size())
     {
-      const auto v = pos_cmd_ifaces_[i]->get_optional();
+      const auto v = pos_cmd_ifaces_[k]->get_optional();
       if (v.has_value())
       {
-        pos_commands_[i] = v.value();
+        pos_commands_[motors_[k].state_index] = v.value();
       }
     }
   }
@@ -513,18 +816,24 @@ hardware_interface::return_type M1SystemInterface::write(
   {
     try
     {
-      std::vector<openarm::damiao_motor::MITParam> params;
-      params.reserve(motors_.size());
-      for (size_t i = 0; i < motors_.size(); ++i)
+      // FIX 2: command each motor on ITS device index (master_id-matched), via
+      // mit_control_one, so a non-monotonic URDF<->master_id mapping never
+      // cross-wires commands. (mit_control_all would re-impose map order.)
+      auto & arm = openarm_->get_arm();
+      for (const auto & m : motors_)
       {
-        const double dir = motors_[i].direction;
-        const double off = motors_[i].offset;
+        if (m.device_index < 0)
+        {
+          continue;
+        }
+        const double dir = m.direction;
+        const double off = m.offset;
         // joint = dir*motor + off  =>  motor = (joint - off)/dir
-        const double motor_q = (pos_commands_[i] - off) / (dir == 0.0 ? 1.0 : dir);
+        const double motor_q = (pos_commands_[m.state_index] - off) / (dir == 0.0 ? 1.0 : dir);
         // MIT: kp, kd from gains; position setpoint; vel=0; tau=0.
-        params.push_back({motors_[i].kp, motors_[i].kd, motor_q, 0.0, 0.0});
+        const openarm::damiao_motor::MITParam param{m.kp, m.kd, motor_q, 0.0, 0.0};
+        arm.mit_control_one(m.device_index, param);
       }
-      openarm_->get_arm().mit_control_all(params);
       openarm_->recv_all(100);
     }
     catch (const std::exception & e)
