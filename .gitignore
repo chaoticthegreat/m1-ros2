@@ -13,3 +13,8 @@ ros2_ws/log/
 
 # throwaway venv for the offline mesh converter (tools/convert_meshes.py)
 .meshconv_venv/
+
+# Python bytecode (never commit build artifacts)
+__pycache__/
+*.pyc
+*.pyo

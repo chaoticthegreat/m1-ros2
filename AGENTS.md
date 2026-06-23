@@ -40,77 +40,116 @@ real driver; everything in `ros2_ws/` is unchanged.
   joint_command sub → IsaacArticulationController). Sets drive gains (stiff arms,
   velocity wheels). Logs to `isaac/last_ros_sim_report.txt`.
 - `ros2_ws/src/m1_control/m1_control/kinematics.py` — dependency-free URDF FK +
-  geometric Jacobian + damped-least-squares (DLS) Cartesian reach. Jacobian
-  verified against finite differences. **The reach is POSITION-ONLY**: a target
-  is a 3D point (or a dict carrying `"pos"`; any `"quat"`/`"R"` is ignored) and
-  the gripper fingertip is driven to it — orientation is not part of the task.
-  (FK/quaternion utilities `pose_jacobian`/`gripper_pose`/`_so3_log`/`mat_to_quat`
-  remain for the viz + tests to *report* gripper rotation, but the solve never
-  constrains it.) The reach is a full iterated Gauss-Newton IK: each call iterates
-  the model to the optimal joint configuration for the target(s) with adaptive
-  (singularity-aware) damping, then leads the measured pose toward it by a bounded
-  step. Reachable targets converge sub-mm;
-  unreachable ones settle at the closest the joints allow. `solve_step`
-  distinguishes three regimes so it is smooth for teleop AND globally optimal for
-  cold targets (this split fixed the Quest "arm snaps to a random pose / moving
-  one arm wrecks the other / sometimes slow" bugs):
-  * **Tracking** (same arms active, target moved < `_IK_TRACK_JUMP`≈6 cm, i.e. a
-    bridge nudging the goal each tick): warm-start from the cached goal, refine a
-    few in-branch iterations, **no global restart**. The whole config (lift
-    included) is gently regularized toward the previous goal, so the redundant
-    DOFs can't drift between elbow/base branches. The in-branch refine uses a
-    **backtracking line search** (`_solve_from(line_search=True)`): every step is
-    shrunk until the task cost strictly decreases, so it can't overshoot into a
-    worse configuration — that is what lets it **ride a wrist singularity through**
-    instead of "getting stuck and not tracking" (the operator-reported failure).
-    Result: no random snaps, the held arm stays put when the other moves, ~1 ms/tick.
-  * **Re-acquire** (tracking refined but an arm's *solved* residual stays large for
-    `_IK_REACQUIRE_TICKS` — a needed branch/elbow flip or recovering from a
-    boundary saturation, which a small per-tick move never trips the cold path for):
-    launch the same amortized multi-seed restart the cold path uses, but free *only*
-    the stuck arm(s) (the healthy arm stays pinned), so it re-acquires the target
-    instead of staying stuck forever. Gated on a *sustained* position residual
-    (`_IK_REACQUIRE_POS` for `_IK_REACQUIRE_TICKS` ticks), so a brief singularity
-    crossing recovers in-branch and never triggers a spurious branch jump.
-  * **Cold** (first solve / arm-set change / big jump): full multi-seed restart
-    search, but (a) the primary solve regularizes arm joints to mid-range while
-    the **lift stays free** so very high/low targets still solve, while the
-    **restart probes run pure-task** on the re-searched DOFs (the mid-range pull
-    drags an extreme near-boundary target short, so the probes drop it and reach
-    sub-mm), (b) any arm whose target barely moved is *pinned* to its cached
-    branch (and the shared lift is anchored toward its cached height) so a big
-    move on one arm doesn't drag the held one, and (c) candidates are chosen by
-    residual with a proximity tie-break. The cold/probe solves use the **fixed-step**
-    `_solve_from(line_search=False)` (NOT the line search): a seed must be free to
-    step *over* a saddle — e.g. the shared-lift compromise of a partly-unreachable
-    dual target, where one arm swings the lift the "wrong" way briefly so the held
-    arm can recompense — which a strict line search would refuse, leaving the held
-    arm short. Diverse seeds + posture pinning supply robustness here instead of
-    monotonicity. The cold search is **amortized across ticks**: each tick spends a
-    bounded iteration budget (`_IK_COLD_BUDGET`) and carries the unfinished
-    primary/probe state in the cache (`job`, resumable via `_pump_restart`), so the
-    worst-case `solve_step` stays ~7 ms (was ~120 ms when the whole search ran in
-    one tick) while the *total* search is more thorough.
-  Every tick also applies a small capped per-arm Cartesian **hold correction** to
-  the command (each arm's own joints, shared lift fixed) so the arms are
-  decoupled through the lift. The solved goal is cached while the target holds.
-  Benchmarks (`_solver_test.py`, the full suite — 15/15 gates): **100% of
-  reachable single-arm targets <1 mm from cold** (was 22 mm worst), dual-arm
-  <1.2 mm, **worst-case `solve_step` ~6.7 ms / 0% over the 60 Hz budget** (was
-  ~122 ms), held-arm far-jump disturbance 25 mm → ~10 mm; `_teleop_stress.py`
-  continuous tracking still 0.17 mm at ~1 ms. **`_solver_test_positions.py`** (new,
-  19/19) simulates MANY positions: 300 single-arm + 200 dual reachable points, a
-  7³ workspace grid sweep, and a guard that supplying an orientation has **zero**
-  effect on the joint solution (bit-identical to the bare point — proves the
-  rotation component is gone). **`_solver_test_tracking.py`** (20/20) is the hard
-  position-tracking suite: large continuous Cartesian sweeps that cross internal
-  singularities (typical p95 sub-mm; an aggressive sweep rides a singularity
-  through with a bounded, recovering transient — never stuck), boundary excursion
-  + re-acquire (stuck-forever → settles home sub-mm), cold-hard and dual-arm. This
-  is the suite that reproduces and guards the "gets stuck and can't keep tracking"
-  report. (Removing orientation dropped the incidental redundancy regularization
-  it provided, so an aggressive sweep can briefly lag at an internal singularity;
-  it recovers — mean/p95 stay sub-mm.)
+  geometric Jacobian, plus a **Drake-backed** Cartesian reach controller. The FK
+  utilities (`UrdfModel`, `ArmChain`, `mat_to_quat`/`quat_to_mat`/`_so3_log`,
+  `pose_jacobian`/`gripper_pose`) stay pure-numpy / dependency-free (the viz nodes
+  use them for FK and to *report* gripper rotation). **The reach is POSITION-ONLY**:
+  a target is a 3D point (or a dict carrying `"pos"`; any `"quat"`/`"R"` is ignored)
+  and the gripper fingertip is driven to it — orientation is not constrained.
+
+  **The inverse kinematics is solved by Drake** (`pydrake`). `ReachController`
+  builds a `MultibodyPlant` from the URDF (visual/collision stripped so no meshes
+  need resolving; **gripper finger joints+links and their `mimic` stripped** — see
+  below; `base_link` welded to the world since targets are base-relative; a
+  fingertip frame added per arm at `GRIPPER_TIP_OFFSET` — Drake FK verified equal
+  to the custom FK to machine precision) and runs a position-**cost** least-squares
+  IK (`InverseKinematics.AddPositionCost`; SNOPT with a major-iteration cap, IPOPT
+  fallback) inside an **amortized multi-start**. This replaced a ~600-line bespoke
+  multi-seed DLS / Gauss-Newton / refine / re-acquire solver that stalled in local
+  minima (the operator-reported "stops solving early / doesn't reach the optimal
+  solution"); the Drake NLP + multi-start drives reachable targets to **microns**
+  and settles an unreachable one at the closest config the joints allow. The plant
+  is built ONCE per URDF (cached process-wide in `_DIK_CACHE`, eagerly in
+  `__init__`) so its ~70 ms build is never charged to a `solve_step` tick; `pydrake`
+  is imported lazily, so FK-only users without Drake still work.
+
+  `solve_step(q_meas, targets)` keeps the same public contract: a joint-name→command
+  dict plus `"_dist"`; the **held sentinel** is a dict with no joint keys; the
+  command *leads* the measured pose toward the solved goal by a bounded `IK_MAX_DQ`
+  step, then a per-arm capped Cartesian **hold/polish** (`_IK_HOLD_ITERS`, total
+  displacement capped at `_IK_ARM_HOLD_CAP`, using the retained `_stack`/`_dls`)
+  lands each gripper ON its target. Two regimes:
+  * **Tracking** (cache hit, target moved < `_IK_TRACK_JUMP`): one warm Drake solve
+    seeded from the cached solution and regularized toward it — stays in-branch (no
+    elbow/base snaps), ~1–3 ms.
+  * **Cold** (first solve / arm-set change / big jump): an amortized multi-start
+    (`_IK_SEEDS_PER_TICK` Drake seeds per tick, best-so-far carried in the cache
+    while the command already leads toward it, so no tick blows the 60 Hz budget).
+    Seed 0 is the measured/cached config (nearest branch, minimal slew); the search
+    **early-stops** once a seed converges (`_IK_CONVERGED`), so an easy target
+    finishes in one tick, while the diverse seeds (lift sweep + random postures,
+    regularized toward mid-range for a stable posture) escape a local minimum for a
+    hard target. Any arm whose target barely moved is **pinned** to its cached
+    branch and the shared lift is **hard-pinned** to its cached height, so a big
+    move on one arm never drags a held one. If the current pose ALREADY reaches
+    every target, `solve_step` simply **holds** (no re-solve) — so re-tracking a
+    planned path from a settled config never null-space-shifts and slews the tip.
+  A tracking solve whose residual stays large for `_IK_REACQUIRE_TICKS` escalates
+  to a cold multi-start that frees only the stuck arm(s). When both arms reach at
+  once they share one stacked program, so the single lift is the least-squares
+  compromise that best serves both grippers.
+
+  **Validation (all gated suites green):** `_solver_test.py` 14/14
+  (single/dual reach 100% sub-mm; worst-case `solve_step` ~21 ms, 0.5% over the
+  60 Hz budget, median ~2 ms), `_accuracy_bench.py` 10/10 (M1 singularity max
+  1.13 mm / p95 ~0; M2 smooth 0.0 mm; M3 dual max 0.19 mm / p99 0.14; M4 near-
+  boundary max 0.13 mm, 100% <1 mm; LAT max ~20 ms, 0.1% over budget),
+  `_solver_test_positions.py` 21/21 (300 single + 200 dual reachable points 100%
+  sub-mm; rotation has zero effect on the solution — bit-identical to the bare
+  point), `_solver_test_tracking.py` 21/21 (smooth/wide/full singularity sweeps
+  sub-mm; boundary excursion saturates and re-acquires home sub-mm),
+  `_solver_test_pathing.py` 23/23 (plan-and-track lands on B at ~0.16 mm, max tip
+  step 16.7 mm; unreachable target gives up and drops back under budget).
+  **Drake is now a runtime dependency** of `m1_control` — install it for the ROS
+  interpreter with `/usr/bin/python3 -m pip install --user --break-system-packages drake`.
+
+  **NB — two LIVE-only bugs the offline suites can't catch (they use perfect
+  feedback + zeroed fingers), found driving the real sim+Quest loop:** (1) the
+  gripper fingers are URDF `mimic`-coupled, and live the controller drives them,
+  so the MEASURED finger pair violates the mimic relation; pinning those joints in
+  the IK made the whole Drake program INFEASIBLE → SNOPT returned garbage → arms
+  100+ mm off ("all targets red"). Hence the finger/mimic strip above — the IK
+  plant has no fingers. (2) A stuck DUAL solve must re-acquire BOTH arms with the
+  lift FREE; the lift-pin is only for the cold far-jump case. **Always validate the
+  live closed loop** (compare the controller's command-fingertip, which should be
+  ~0 mm, against the sim state). The sim arm gain `ARM_KP` in `isaac/ros_sim.py`
+  was also raised 9000→30000 so the simulated arm actually holds a correct command
+  at near-max reach (was sagging ~3-4 cm under gravity → amber); sim-fidelity only.
+- `.../collision.py` — **dependency-free capsule self-collision model** (new).
+  Approximates each link as a capsule (its FK centerline + a radius) and reports
+  the signed clearance between checked pairs via segment-to-segment distance —
+  pure numpy, no meshes/FCL. Scope is **self-collision only**: each arm's MOVING
+  links (joint1→fingertip) vs the OTHER arm's links + its static riser, and vs the
+  shared body column. The rigid mount risers and the two arms' shared lower chain
+  are body, not arm, so they never read as a constant collision; intra-arm and
+  shared-mount pairs are excluded. Radii are conservative (arm 5 cm, gripper 6 cm,
+  column 11 cm, base 19 cm) — calibrated so ~99 % of random reachable dual poses
+  read clear while genuine cross-overs collide. Also exposes a finite-difference
+  clearance gradient and a witness-point separating direction (`clearance_detail`)
+  the planner uses to avoid/route around collisions. Self-test (gated 9/9):
+  `PYTHONPATH=ros2_ws/src/m1_control /usr/bin/python3 -m m1_control.collision`.
+- `.../trajectory.py` — **collision-free Cartesian path planner** (new, *test +
+  viz only*; the live controller stays reactive). `TrajectoryPlanner.plan(start_q,
+  {arm: goal_point})` interpolates a straight task-space line A→B, solves each
+  waypoint with the SAME DLS core the live solver uses (`ReachController._stack` /
+  `_dls`) warm-started for branch continuity, and keeps it collision-free in two
+  stages: (1) **null-space avoidance** — push joints up the clearance gradient
+  *inside the fingertip task null space*, so the redundant DOFs open a gap without
+  moving the tip (re-converging the task after each nudge, TASK PRIORITY — it never
+  trades the goal away); (2) **path detour** — for an intermediate waypoint whose
+  *target point itself* is task-coupled-colliding (a tip pinned near the body),
+  bow the fingertip path off the line along the separating direction (endpoints
+  A/B are never moved). Returns a `Trajectory` of waypoints (q, residual,
+  clearance, colliding) + summaries (`collision_free`, `reached`, `min_clearance`)
+  the tests gate on and the Quest viz draws. NB: in this robot's workspace self-
+  collisions are rare and usually a tip pinned near static structure (null-space
+  can't open those — honestly flagged `colliding`, drawn red). Smoke (4/4):
+  `… /usr/bin/python3 -m m1_control.trajectory`. **NB (collision review fix):** when
+  only one arm is planned (the Quest preview plans each arm separately), the
+  collision FK is seeded with the OTHER arm's **measured** joints (`plan`'s
+  `background`, passed into `CollisionModel.clearance_of_vec/_gradient/_detail`),
+  so a path is checked against the other arm where it ACTUALLY is — not a phantom
+  straight-out (q=0) arm that would let a path through the real arm read green.
 - `.../swerve.py` — swerve base kinematics. `module_states` is the pure inverse
   map (vx, vy, yaw → per-module heading+speed); `SwerveSolver.solve` adds heading
   low-pass smoothing, the ≤90° flip-and-reverse optimisation, and **wheel-speed
@@ -139,35 +178,29 @@ real driver; everything in `ros2_ws/` is unchanged.
  Keeps a per-arm Cartesian target seeded from `/joint_states` FK so the arm
  doesn't jump on connect.
 - `.../quest_node.py` — `ros2 run m1_control m1_quest`: Meta Quest WebXR teleop.
- NOTE: the quest node still *computes and streams* a target orientation (for its
- own in-headset triad viz), but the controller's reach is now **position-only**, so
- that orientation no longer moves the gripper — only the target *point* does. The
- rotation-lock / absolute-orientation machinery below is therefore inert on the
- arm (kept so the node + `_quest_orientation_test.py` are unchanged); if you want a
- purely-positional Quest UX, strip the orientation streaming/lock/triad here too.
+ **Position-only** (orientation fully removed): hands drive the target POINT, the
+ gripper rotation is not controlled, and the in-headset overlay shows a **REACH
+ ERROR HUD** instead of orientation triads.
  Serves ONE self-contained WebXR page over **HTTPS** (self-signed cert auto-made
  with openssl into `~/.cache/m1_quest/`; WebXR needs a secure context over LAN
  IP). The Quest browser opens it, enters immersive-ar (passthrough) and POSTs
- both controllers' grip-space poses (position **and orientation**) + buttons to
- `/api/xr`. The node maps each hand to the same-side arm with **clutched relative
- translation** but **ABSOLUTE orientation** (hold Grip to translate; the gripper's
- rotation mirrors the controller's *actual* orientation —
- `R_target = C·hand_R·Cᵀ·ori_align` — so controller-up-90° → gripper-up-90°, it
- does NOT add 90° each grab like the old relative-twist did; `ori_align` is zeroed
- to the live pose on first grab / A-X so nothing snaps, see `_calibrate_ori`).
- **Thumbstick click toggles a per-arm rotation LOCK** (`ori_locked`) that freezes
- the gripper orientation so the wrist can be re-oriented / the hand translated
- without rotating the gripper; unlocking re-zeros `ori_align` so it resumes without
- a jump. Trigger→gripper, A/X→re-seed (target + rotation).
- Validated headless by `_quest_orientation_test.py` (8/8: absolute + no
- accumulation + lock, driving the real `on_xr_frame`).
+ both controllers' grip-space **positions** + buttons to `/api/xr` (orientation is
+ no longer sent). The node maps each hand to the same-side arm with **clutched
+ relative translation** (hold Grip to translate; release to reposition your hand).
+ **Thumbstick click toggles a per-arm PRECISION mode** (`fine`, edge-triggered):
+ while on, hand motion is scaled by `PRECISION_SCALE` (0.25) for fine sub-cm target
+ placement — the old rotation-lock repurposed now that there's no rotation to lock.
+ Trigger→gripper, A/X→re-seed the target to the live fingertip ("home to here").
+ Validated headless by `_quest_position_test.py` (10/10: clutch, precision toggle
+ + edge-trigger, A/X reseed, base drive, and the error-window data path, driving
+ the real `on_xr_frame`/`_viz_locked`/`snapshot`).
  **Base drive (thumbstick push):** LEFT stick fwd/back→drive fwd/back (vx),
  left/right→strafe (vy); RIGHT stick left/right→turn (yaw); smooth rescaled
  deadzone; cmd_vel is set every frame so centring the stick stops at once
  (BASE_HOLD now only guards a lost connection). The headset **robot model
  actually drives through the room**: `SwerveOdometry` dead-reckons the commanded
  cmd_vel into a base pose streamed as `viz["base"]`, and the page hangs all link
- meshes/markers (and the orientation triads) off a `robotBase` group (inside the
+ meshes/markers off a `robotBase` group (inside the
  room-anchored `robotRoot`) carrying that pose, so the body translates/rotates
  while the wheels steer/spin from `/joint_states`. B/Y recenters and zeroes the
  odom (the `place` flag is sticky so a recenter is never dropped on an in-flight
@@ -180,8 +213,9 @@ real driver; everything in `ros2_ws/` is unchanged.
  device), posing each link every frame from per-link FK transforms streamed in
  the `/api/xr` response (`UrdfModel.link_transforms` + `mat_to_quat`). A target
  sphere per arm turns green→amber→red by fingertip distance (so impossible goals
- are obvious), with an **RGB orientation triad** at the target (commanded gripper
- rotation) plus a smaller faint triad on the live gripper so alignment is visible;
+ are obvious), plus a floating **REACH ERROR HUD** (a canvas-textured panel that
+ billboards to face the operator, showing each arm's target↔fingertip error in mm,
+ color-coded) anchored above the robot;
  B/Y recenters the model, which is anchored ~1.1 m in front on the floor. Mesh
  loading is hardened (parallel fetch with retry, explicit per-link failure
  reporting, per-arm wireframe fallback, frustum-culling off) so a dropped mesh
@@ -196,6 +230,24 @@ real driver; everything in `ros2_ws/` is unchanged.
  `/manifest.json`, `/vendor/*`, `/meshes/*` as static files. Falls back to a
  wireframe (from `arms.points`) if the manifest is missing. three.js is the only
  third-party dep and it's vendored, so it stays a self-contained web app.
+ **Performance pass (the viz had become laggy):** the per-`/api/xr` work is no
+ longer done under `_lock` — `on_xr_frame` takes a cheap snapshot under the lock
+ then builds the viz (the ~36-link FK + serialization) OUTSIDE it, so the heavy
+ work no longer serializes against the 60 Hz `_tick` and the `/joint_states`
+ callback. The full-robot `links` + per-arm skeleton FK are **memoized on a
+ joint-version counter** (bumped only when `q_meas` actually changes), so the many
+ POSTs that land between two joint frames reuse the FK instead of recomputing it;
+ only the cheap hand-dependent bits (target sphere, error line, base pose) are
+ rebuilt each frame. (This rides on the kinematics FK caching above.) Client-side,
+ the REACH-ERROR HUD canvas is redrawn/re-uploaded only when its numbers change,
+ and the wireframe/trajectory buffers are preallocated and filled in place instead
+ of reallocated every frame. **Trajectory preview:** a throttled (~3.5 Hz)
+ background thread plans a collision-free path (`trajectory.py`) from each arm's
+ live fingertip to its current target and streams it as `viz["traj"]`; the page
+ draws it as a per-arm polyline + waypoint dots, green where clear and **red where
+ a waypoint self-collides**, so the operator sees the planned motion (and any
+ collision) before committing. Planning is off the request path (snapshot under
+ lock, plan outside, store under lock) so it never stalls a frame.
 - `.../web_node.py` — `ros2 run m1_control m1_web`: browser control panel on
  http://localhost:8080. Same `/m1/*`-only bridge (sim + real). Stdlib HTTP
  server + embedded HTML/JS (no extra deps); base drive pad, per-arm Cartesian
@@ -249,33 +301,52 @@ is not running — the web panel's status dot makes this obvious.
   strafe, turn-in-place, arc vs analytic, full-circle closure). The arm-solver
   suite (`_solver_test.py` 15/15) and `_teleop_stress.py` are unaffected by the
   swerve refactor.
-- **Full solver suite `_solver_test.py` (no ROS): 15/15 gates pass.** Covers
+- **Solver is now Drake-backed** (see the `kinematics.py` key-file note). The
+  numbers below are with the Drake `InverseKinematics` + amortized multi-start
+  solver; they are equal-or-better than the bespoke DLS solver it replaced.
+- **Full solver suite `_solver_test.py` (no ROS): 14/14 gates pass.** Covers
   reachability (single+dual), continuous tracking, hold-under-disturbance,
   latency distribution, and stress. Key results: **100% of reachable single-arm
-  targets <1 mm *from a cold start*** (mean 0.21 mm), dual-arm 100% <5 mm (max
-  1.2 mm), **worst-case `solve_step` ~6.7 ms with 0% over the 60 Hz budget**,
-  held-arm far-jump disturbance ~10 mm. `_solver_bench.py` agrees (single/dual
-  100%). Steady-state `solve_step` ~0.6–1 ms; the cold iterate-and-restart search
-  is amortized across ticks so no tick blows the budget.
-- **Many-positions suite `_solver_test_positions.py` (no ROS): 19/19 gates.**
+  targets <1 mm *from a cold start*** (mean ~0.01 mm), dual-arm 100% <5 mm (max
+  ~0.08 mm), **worst-case `solve_step` ~21 ms (median ~2 ms, 0.5% over the 60 Hz
+  budget — a goal, not a cutoff)**, held-arm far-jump disturbance 0 mm.
+  Steady-state `solve_step` ~1 ms; the cold multi-start search is amortized across
+  ticks (one or two Drake seeds per tick) so no tick blows the budget.
+- **Many-positions suite `_solver_test_positions.py` (no ROS): 21/21 gates** (the
+  two hard latency gates became one worst-case-bounded gate under the 60 Hz-is-a-
+  goal policy; this suite is ~100% cold solves so its median is not representative).
   Simulates a large position set: 300 single-arm + 200 dual reachable points and a
-  7³ workspace grid. Large-sample distribution: single ~99% <2 mm / 100% <5 mm
+  7³ workspace grid (reachable single/dual 100% <1 mm, grid reached 100% <2 mm).
+  Large-sample distribution: single ~99% <2 mm / 100% <5 mm
   (a few near-workspace-boundary FK-of-full-limit configs settle ~2 mm short),
   dual ~98% <5 mm with a rare shared-lift compromise to ~19 mm. Confirms the
   rotation component has **zero** effect on the solution.
-- **Hard position-tracking suite `_solver_test_tracking.py` (no ROS): 20/20 gates.**
+- **Hard position-tracking suite `_solver_test_tracking.py` (no ROS): 21/21 gates.**
   Reproduces the operator's "gets stuck and can't keep tracking" report with large
   *continuous* Cartesian sweeps that cross internal singularities, a boundary
   excursion + re-acquire, cold-hard convergence, and dual-arm tracking. Typical
   tracking is p95 sub-mm; an aggressive full-amplitude sweep rides a singularity
   through with a bounded, recovering transient (mean sub-mm) — it never gets stuck.
   Boundary re-acquire takes the stuck-at-150-mm-forever case to settling home sub-mm.
-- **Quest absolute-orientation + lock `_quest_orientation_test.py` (ROS import,
-  no DDS): 8/8 gates.** Unchanged: drives the real `on_xr_frame` and verifies the
-  quest node's orientation mapping (90° controller → 90° gripper *target*, no
-  accumulation, lock freeze/resume, position clutch). NB the controller now ignores
-  this streamed orientation (position-only reach), so it affects only the headset
-  triad viz, not the arm.
+  (Still 20/20 with the persistent-refinement change — the refine is steady-gated
+  so it never perturbs a tracking sweep.)
+- **Point-to-point trajectory suite `_solver_test_pathing.py` (no ROS): 23/23
+  gates**. Tests "going BETWEEN two points and landing accurately", not just
+  cold solves: (A) plan a collision-free Cartesian path A→B and drive the
+  controller along it — lands on B at ~0.2 mm, follows the path p95 <0.2 mm, no
+  fingertip jump; (B) **warm solve** — settle AT A, then command B and converge
+  (100% <1 mm), the warm/in-motion case; (C) given collision-free endpoints the
+  planner keeps the whole path self-collision-free (24/24) and honestly flags any
+  it cannot; (D) avoidance never breaks a reach nor lowers clearance (20/20); (E)
+  **persistence** — hard held dual targets driven sub-mm, and a genuinely
+  unreachable target settles at the closest config with every tick under the 60 Hz
+  budget (the refine gives up cleanly). Run: `/usr/bin/python3 _solver_test_pathing.py`.
+- **Quest position teleop `_quest_position_test.py` (ROS import, no DDS): 10/10
+  gates.** Drives the real `on_xr_frame`/`_viz_locked`/`snapshot`: position clutch,
+  PRECISION mode (thumbstick-click, edge-triggered, scales motion by
+  `PRECISION_SCALE`), A/X reseed to the live fingertip, thumbstick base drive, and
+  the REACH-ERROR data path the in-VR HUD + 2D page render. (Replaces the old
+  `_quest_orientation_test.py`, retired with the orientation removal.)
 - **Teleop tracking verified** (`_teleop_stress.py`, no ROS): streams a smoothly
   moving target like the Quest does. Continuous single-arm tracking holds <1 mm
   with goal jumps <0.03 rad (was: tens-to-hundreds of mm with ~5 rad branch
@@ -321,26 +392,37 @@ is not running — the web panel's status dot makes this obvious.
   discards any `"quat"`/`"R"`. If you want orientation control back, you'd re-add
   the weighted orientation-error rows (`_so3_log(R_target @ R_tip.T)` under the
   position rows, using `pose_jacobian`'s angular rows) and the per-arm ori gating.
-  Validation: `_solver_test.py` (15/15) + `_solver_test_positions.py` (19/19,
-  many positions + zero-orientation-effect guard) + `_solver_test_tracking.py`
-  (20/20, hard position sweeps / singularity crossings / boundary re-acquire).
-  NB the Quest node still computes/streams an orientation for its headset triad,
-  but the controller ignores it — see the `quest_node.py` note above.
-- No collision avoidance / planning — it's a reactive Jacobian controller solved
-  to convergence each tick. MoveIt is installed if you want planned motion (would
-  need SRDF + kinematics config + a controller bridge).
+  Validation: `_solver_test.py` (15/15) + `_solver_test_positions.py` (22/22,
+  many positions + workspace coverage + zero-orientation-effect guard) +
+  `_solver_test_tracking.py` (20/20, hard position sweeps / singularity crossings
+  / boundary re-acquire) + `_accuracy_bench.py` (10/10 accuracy regression gates).
+  The Quest node is also fully position-only now (orientation removed; thumbstick-
+  click is a precision toggle) — see the `quest_node.py` note above.
+- The LIVE controller has no collision avoidance / planning — it's a reactive
+  Jacobian controller solved to convergence each tick. Collision-free *planning*
+  now exists offline (`collision.py` + `trajectory.py`, used by the trajectory
+  tests and the Quest path preview) but is intentionally NOT wired into the live
+  control loop. The capsule model is **self-collision only** (arm↔arm, arm↔body)
+  and a conservative approximation (capsules, no environment/world model); the
+  planner reaches the goal first and avoids collisions best-effort (null-space +
+  path detour), honestly flagging the rare task-coupled pose it cannot open. To
+  make execution collision-aware you'd either gate the live command on
+  `CollisionModel.clearance` or drive the controller along a pre-planned
+  `Trajectory`; full planned motion is still MoveIt's job (SRDF + kinematics
+  config + a controller bridge).
 - Shared-lift tradeoff: the lift is one prismatic joint feeding both arms, so
  when both arms have targets the stacked solve picks the single lift height that
  minimises the combined (equal-weight) fingertip error. Two arms with targets at
  very different heights therefore share the lift as a compromise; clear one
  arm's target if you want the lift to commit entirely to the other.
-- Worst-case `solve_step` latency is now bounded ~7 ms: the cold iterate-and-
-  restart search is **amortized across ticks** (`_IK_COLD_BUDGET` + a resumable
-  `job` in the cache), so no single tick runs the whole multi-seed search.
-  Continuous tracking / steady ticks remain ~1 ms. The trade-off is that a hard
-  cold target now *converges over a handful of ticks* (~100–200 ms wall) instead
-  of one slow tick — the command leads toward the best-so-far meanwhile, so the
-  arm starts moving immediately and the goal only sharpens.
+- Worst-case `solve_step` latency is ~20 ms (median ~1–2 ms, ≤0.5% over the
+  16.7 ms 60 Hz budget — a goal, not a hard cutoff): the cold Drake multi-start is
+  **amortized across ticks** (`_IK_SEEDS_PER_TICK` Drake solves + a resumable `job`
+  in the cache), so no single tick runs the whole search. A single Drake solve is
+  ~2–10 ms; the ~70 ms plant build is one-time (in `__init__`, cached), never on a
+  tick. Continuous tracking / steady ticks are ~1 ms. The trade-off is that a hard
+  cold target *converges over a handful of ticks* — the command leads toward the
+  best-so-far meanwhile, so the arm starts moving immediately and the goal sharpens.
 - A big *discontinuous* target jump on one arm (e.g. typing a far XYZ in the web
   panel, or `send_pose`) re-solves the coupled two-arm system; the held arm is
   pinned, the shared lift is anchored toward its cached height, and a per-arm

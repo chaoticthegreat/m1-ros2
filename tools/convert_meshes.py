@@ -152,6 +152,18 @@ def _load_colored(path: str) -> trimesh.Trimesh | None:
     gets a uniform vertex colour from its material, then all solids are
     concatenated -- so the merged mesh keeps the multi-colour appearance of the
     real part.
+
+    Each solid's scene **node transform is applied** (``Scene.graph``) before
+    concatenating. A COLLADA/glTF file places its solids via node matrices that
+    also carry the file's up-axis convention -- e.g. every OpenArm visual DAE is
+    authored ``Y_UP`` with a +90deg-about-X node matrix that lifts it into the ROS
+    ``Z_UP`` link frame. Iterating ``Scene.geometry`` alone takes each solid's raw
+    geometry in its *local* frame and silently drops that matrix, which baked every
+    such mesh rotated -90deg about X: in the headset the in-between arm links
+    (link1..link6, the arm base) pointed the wrong way, while RViz -- which honours
+    the node transform through assimp -- looked correct. Walking the graph lands
+    each solid in the link frame exactly as RViz renders it; meshes whose graph is
+    identity (or plain STLs with no scene) are unaffected.
     """
     try:
         loaded = trimesh.load(path, process=False)
@@ -159,20 +171,25 @@ def _load_colored(path: str) -> trimesh.Trimesh | None:
         print(f"    ! load failed: {exc}")
         return None
 
+    # (solid geometry, its world transform in the file's scene). For a bare STL
+    # (no scene graph) the transform is identity.
+    placed = []
     if isinstance(loaded, trimesh.Scene):
-        items = [g for g in loaded.geometry.values()
-                 if isinstance(g, trimesh.Trimesh) and g.faces.shape[0]]
-    elif isinstance(loaded, trimesh.Trimesh):
-        items = [loaded] if loaded.faces.shape[0] else []
-    else:
-        items = []
-    if not items:
+        for node in loaded.graph.nodes_geometry:
+            world, gname = loaded.graph[node]
+            g = loaded.geometry.get(gname)
+            if isinstance(g, trimesh.Trimesh) and g.faces.shape[0]:
+                placed.append((g, np.asarray(world, dtype=np.float64)))
+    elif isinstance(loaded, trimesh.Trimesh) and loaded.faces.shape[0]:
+        placed.append((loaded, np.eye(4)))
+    if not placed:
         return None
 
     colored = []
-    for g in items:
-        col = _material_color(g)
+    for g, world in placed:
+        col = _material_color(g)        # material read in the solid's own frame
         g = g.copy()
+        g.apply_transform(world)        # place it in the link frame (up-axis baked)
         g.visual = trimesh.visual.ColorVisuals(
             mesh=g, vertex_colors=np.tile(col, (len(g.vertices), 1)))
         colored.append(g)
@@ -314,7 +331,15 @@ def main() -> int:
                 out_name = f"{h}.glb"
                 out_path = os.path.join(MESH_OUT, out_name)
                 mesh.export(out_path, file_type="glb")
-                url = f"/meshes/{out_name}"
+                # Cache-bust on CONTENT: the .glb filename hashes the URDF key
+                # (file/scale/origin), so re-baking the same link keeps the same
+                # name -- a Quest browser that cached the old bytes would keep
+                # serving them. Append a short content hash as a query param (the
+                # node strips the query when serving the file), so a changed mesh
+                # gets a fresh URL and reloads, while unchanged meshes stay cached.
+                with open(out_path, "rb") as fh:
+                    content_hash = hashlib.sha1(fh.read()).hexdigest()[:8]
+                url = f"/meshes/{out_name}?v={content_hash}"
                 cache[key] = url
                 converted += 1
                 total_in += os.path.getsize(src)

@@ -13,32 +13,30 @@ and the real hardware:
     out  /m1/cmd_vel             geometry_msgs/Twist         (swerve base)
     in   /joint_states           sensor_msgs/JointState      (feedback + seeding)
 
+The reach is POSITION-ONLY: each hand drives its arm's target POINT; gripper
+orientation is not controlled (the controller's orientation is not used). An
+in-headset "REACH ERROR" HUD shows each arm's target-to-fingertip distance.
+
 Controls (per hand):
     * Grip (squeeze) ......... CLUTCH. Hold to "grab" that arm; while held the
-                               gripper target follows your hand's MOTION (relative)
-                               and its ORIENTATION mirrors your controller
-                               ABSOLUTELY (full 6-DOF). Release to freeze the arm
-                               and reposition your hand (like lifting a mouse off
-                               the desk).
+                               gripper target follows your hand's MOTION (relative).
+                               Release to freeze the arm and reposition your hand
+                               (like lifting a mouse off the desk).
     * Trigger ................ that arm's gripper, analog 0 (open) .. 1 (closed).
-    * Thumbstick CLICK ....... lock / unlock that gripper's ROTATION -- while
-                               locked, hand twist no longer rotates the gripper, so
-                               you can re-orient your wrist (or translate) freely.
+    * Thumbstick CLICK ....... toggle PRECISION mode for that arm -- hand motion is
+                               scaled down (PRECISION_SCALE) for fine, sub-cm target
+                               placement; click again to return to 1:1.
     * Thumbstick (push) ...... LEFT hand drives the base: forward/back to drive
                                forward/back, left/right to strafe (crab). RIGHT
                                hand left/right turns (yaw). The robot model in the
                                headset drives through the room to match.
-    * A / X button ........... re-seed that arm's target to its live fingertip AND
-                               re-zero its rotation reference -- "home to here".
+    * A / X button ........... re-seed that arm's target to its live fingertip --
+                               "home to here".
 
-Why relative position but ABSOLUTE orientation? Relative + clutched *position*
-lets you move a small real distance, release, recenter, and continue (standard VR
-teleop) without matching the robot's whole reach with your shoulders. *Orientation*
-is instead absolute: the gripper mirrors the controller's actual orientation, so
-pointing the controller "up 90 deg" puts the gripper up 90 deg -- it does NOT add
-90 deg to wherever it already was each grab. The reference is zeroed to the live
-pose on first grab / A-X (no snap), and the thumbstick-click LOCK freezes it when
-you want to re-orient your wrist without the gripper following.
+Why relative (clutched) position? It lets you move a small real distance, release,
+recenter, and continue (standard VR teleop) without matching the robot's whole
+reach with your shoulders. Precision mode then scales that motion down so you can
+nudge the target onto a point with sub-cm accuracy.
 
 WebXR requires a SECURE CONTEXT. ``http://<ip>`` is not secure, so this server
 speaks HTTPS with a self-signed certificate (auto-generated on first run via
@@ -77,7 +75,6 @@ from m1_control.kinematics import (
     ReachController,
     UrdfModel,
     mat_to_quat,
-    quat_to_mat,
 )
 from m1_control.swerve import SwerveOdometry
 
@@ -103,6 +100,8 @@ BASE_HOLD = 0.5          # s without a base refresh before the base zeros out
 STICK_DEADZONE = 0.15    # ignore tiny thumbstick noise
 PUBLISH_RATE = 60.0      # Hz the joint command / targets are streamed at
 MOTION_SCALE = 1.0       # hand metres -> target metres while clutched (1:1)
+PRECISION_SCALE = 0.25   # hand->target scale while an arm is in precision mode
+                         # (thumbstick-click), for fine sub-cm target placement
 
 # Soft workspace clamp on the target point (base_link frame, m). Height (z) is
 # intentionally unbounded; the controller's IK reaches as close as the joint
@@ -157,24 +156,6 @@ def _heading_basis(head_fwd) -> tuple[np.ndarray, np.ndarray]:
     # {F, L, up} frame is right-handed like the robot's {x_fwd, y_left, z_up}.
     L = np.array([F[2], 0.0, -F[0]])
     return F, L
-
-
-def _webxr_to_robot_basis(F: np.ndarray, L: np.ndarray) -> np.ndarray:
-    """3x3 matrix C mapping a WebXR-space vector to robot base_link coordinates.
-
-    It is exactly the rotation behind the position map ``robot = [-(d.L), d.F,
-    d_up]`` (rows ``-L``, ``F``, ``up``), so a WebXR-space *rotation* ``R`` is
-    expressed in the robot frame by the similarity transform ``C @ R @ C.T``.
-    With ``F``/``L`` horizontal-orthonormal and ``F x L = up`` this C is a proper
-    rotation (det +1), so the operator's hand twist maps to the gripper with the
-    same handedness (no mirror-inverted feel).
-    """
-    return np.array(
-        [[-L[0], -L[1], -L[2]],
-         [F[0], F[1], F[2]],
-         [0.0, 1.0, 0.0]],
-        dtype=np.float64,
-    )
 
 
 def _ensure_cert(node: "M1QuestNode") -> tuple[str, str]:
@@ -239,11 +220,9 @@ class M1QuestNode(Node):
         self._lock = threading.Lock()
         self.q_meas: dict = {}
         self.target = {a: list(DEFAULT_TARGET[a]) for a in ("left", "right")}
-        # Per-arm target gripper orientation (base frame) as a quaternion
-        # [x,y,z,w]. Seeded to the live gripper orientation so the arm holds its
-        # pose on connect; an identity quaternion (the un-seeded default) reads
-        # as position-only at the controller, so nothing rotates until seeded.
-        self.target_quat = {a: [0.0, 0.0, 0.0, 1.0] for a in ("left", "right")}
+        # Per-arm reach error (m): target point - live fingertip. Computed in
+        # _viz_locked each frame and surfaced to the headset HUD + the 2D page.
+        self.err = {"left": None, "right": None}
         self.seeded = {"left": False, "right": False}
         self.grip = {"left": 0.0, "right": 0.0}
         self.cmd_vel = {"vx": 0.0, "vy": 0.0, "yaw": 0.0}
@@ -252,23 +231,12 @@ class M1QuestNode(Node):
         self.clutch = {"left": False, "right": False}
         self.clutch_hand0 = {"left": None, "right": None}
         self.clutch_target0 = {"left": None, "right": None}
-        # ABSOLUTE gripper orientation. The target orientation is a fixed function
-        # of the controller's CURRENT orientation, not a twist accumulated each
-        # grab: ``R_target = C @ hand_R @ C.T @ ori_align``. The heading basis ``C``
-        # and the alignment ``ori_align`` are captured once per arm (preserving the
-        # live gripper orientation, so nothing snaps) and re-zeroed only on an
-        # explicit recenter (A/X) or when the rotation lock is released. So holding
-        # the controller a given way always commands the same gripper orientation
-        # -- controller up 90 deg -> gripper up 90 deg -- instead of adding 90 deg
-        # to wherever it already was.
-        self.ori_C = {"left": None, "right": None}
-        self.ori_align = {"left": None, "right": None}
-        # Rotation lock (thumbstick click, per arm): while set, hand twist no longer
-        # moves the gripper orientation, so the wrist can be re-oriented / the hand
-        # translated without rotating the gripper. Releasing it re-zeros ori_align
-        # to the held orientation so tracking resumes from there without a jump.
-        self.ori_locked = {"left": False, "right": False}
-        self.last_lock = {"left": False, "right": False}  # lock-toggle edge detect
+        # Precision mode (thumbstick click, per arm): while set, the clutch maps
+        # hand motion to target motion at PRECISION_SCALE for fine sub-cm placement.
+        # The reach is position-only, so the thumbstick-click no longer locks any
+        # gripper rotation -- it is repurposed here for accuracy of placement.
+        self.fine = {"left": False, "right": False}
+        self.last_precision = {"left": False, "right": False}  # toggle edge detect
         # Heading-relative basis (WebXR-space F/L vectors) captured at the
         # instant the clutch is squeezed, so the position mapping stays fixed for
         # the duration of that grab even if the operator turns their head.
@@ -284,6 +252,35 @@ class M1QuestNode(Node):
         self.odom = SwerveOdometry()
         self._last_tick = 0.0
 
+        # --- viz FK memoization --------------------------------------------
+        # The full-robot link poses + per-arm skeleton points depend ONLY on the
+        # measured joints, but a headset renders ~72-90 Hz and POSTs each frame --
+        # far faster than /joint_states arrives. Recomputing the ~36-link FK +
+        # serialization every POST is the bulk of the old per-frame cost, so we
+        # memoize that q-only payload and reuse it for every POST that lands
+        # between two joint updates. _q_ver is bumped whenever q_meas changes
+        # (in _on_joint_states); _viz_fk_cache holds the (already-rounded) links
+        # + per-arm points/tip computed at that version. The cheap, per-frame,
+        # hand-dependent bits (target sphere, dist, base pose, error line) are
+        # always rebuilt fresh on top of the cached FK.
+        self._q_ver = 0
+        self._viz_fk_cache = None        # (q_ver, {"links":..., "arms":{...}})
+
+        # --- trajectory preview (planned in a background thread) ------------
+        # The Cartesian path preview is moderately expensive (tens of ms, more
+        # when it must avoid a collision), so it MUST NOT run on the request /
+        # _tick path. A daemon worker replans on a throttle (only when a target
+        # has actually moved) and stashes the latest result here under the lock;
+        # _viz_locked just reads + serializes it. The planner is built lazily
+        # (it needs self.reach) on the worker's first pass.
+        self._traj = {"left": None, "right": None}   # arm -> latest Trajectory
+        self._traj_planner = None
+        self._traj_stop = threading.Event()
+        # Last target each arm was planned FROM, so the worker can skip replanning
+        # while the operator isn't moving the goal (saves the IK every tick).
+        self._traj_last_goal = {"left": None, "right": None}
+        self._traj_thread = None
+
         # --- ROS interface --------------------------------------------------
         self.pose_pub = {
             a: self.create_publisher(PoseStamped, f"/m1/{a}_arm/target_pose", 10)
@@ -297,14 +294,30 @@ class M1QuestNode(Node):
         self.create_subscription(JointState, "/joint_states", self._on_joint_states, 10)
         self.create_timer(1.0 / PUBLISH_RATE, self._tick)
 
+        # Path-preview worker: only useful with FK, but starting it always (it
+        # idles cheaply until joints + the planner are available) keeps the
+        # lifecycle simple. Daemon so it dies with the process.
+        if self.reach is not None:
+            self._traj_thread = threading.Thread(
+                target=self._traj_worker, name="m1_quest_traj", daemon=True)
+            self._traj_thread.start()
+
     # --- feedback ----------------------------------------------------------
     def _now(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
 
     def _on_joint_states(self, msg: JointState):
         with self._lock:
+            changed = False
             for name, pos in zip(msg.name, msg.position):
-                self.q_meas[name] = float(pos)
+                v = float(pos)
+                if self.q_meas.get(name) != v:
+                    changed = True
+                self.q_meas[name] = v
+            # Invalidate the memoized FK payload only when the joints actually
+            # moved, so back-to-back POSTs at the same q reuse the cache.
+            if changed:
+                self._q_ver += 1
             if self.reach is None:
                 return
             for arm in ("left", "right"):
@@ -314,9 +327,8 @@ class M1QuestNode(Node):
                     continue
                 if all(j in self.q_meas for j in ARM_JOINTS[arm] + [LIFT_JOINT]):
                     try:
-                        tip, R = self.reach.gripper_pose(arm, self.q_meas)
+                        tip = self.reach.fingertip(arm, self.q_meas)
                         self.target[arm] = [float(tip[0]), float(tip[1]), float(tip[2])]
-                        self.target_quat[arm] = [float(c) for c in mat_to_quat(R)]
                         self.seeded[arm] = True
                     except Exception:  # noqa: BLE001
                         pass
@@ -326,33 +338,11 @@ class M1QuestNode(Node):
             return
         if all(j in self.q_meas for j in ARM_JOINTS[arm] + [LIFT_JOINT]):
             try:
-                tip, R = self.reach.gripper_pose(arm, self.q_meas)
+                tip = self.reach.fingertip(arm, self.q_meas)
                 self.target[arm] = [float(tip[0]), float(tip[1]), float(tip[2])]
-                self.target_quat[arm] = [float(c) for c in mat_to_quat(R)]
                 self.seeded[arm] = True
             except Exception:  # noqa: BLE001
                 pass
-
-    def _calibrate_ori(self, arm: str, hand_R, head_fwd):
-        """Zero the absolute-orientation map for ``arm`` to the current pose.
-
-        Captures the heading basis ``C`` and an alignment so that, right now, the
-        controller's orientation maps to the gripper target's CURRENT orientation
-        -- nothing jumps at calibration. Afterwards the target orientation is the
-        fixed function ``C @ hand_R @ C.T @ ori_align`` of the live controller
-        orientation, so a given controller pose always commands the same gripper
-        orientation (absolute, not accumulated). Re-called only on an explicit
-        recenter (A/X) or when the rotation lock is released, so it never drifts
-        grab-to-grab. ``ori_align = C @ hand_R^T @ C^T @ G`` inverts the map at the
-        current controller pose so it yields the current target orientation ``G``.
-        """
-        if hand_R is None:
-            return
-        F, L = _heading_basis(head_fwd)
-        C = _webxr_to_robot_basis(F, L)
-        G = quat_to_mat(self.target_quat[arm])
-        self.ori_C[arm] = C
-        self.ori_align[arm] = C @ hand_R.T @ C.T @ G
 
     # --- WebXR frame ingest (called from the HTTP handler thread) -----------
     def on_xr_frame(self, data: dict):
@@ -379,37 +369,29 @@ class M1QuestNode(Node):
                     continue
 
                 hand = np.array(c.get("pos", [0.0, 0.0, 0.0]), dtype=np.float64)
-                hand_quat = c.get("quat")
-                hand_R = quat_to_mat(hand_quat) if hand_quat else None
                 squeeze = bool(c.get("squeeze"))
                 trigger = _clamp(float(c.get("trigger", 0.0)), 0.0, 1.0)
                 button = bool(c.get("button"))
-                lock = bool(c.get("lock"))
+                precision = bool(c.get("lock"))  # thumbstick click (gamepad btn 3)
 
-                # A/X edge: re-seed this arm's target to the live fingertip AND
-                # re-zero the absolute-orientation map there ("recenter rotation").
+                # A/X edge: re-seed this arm's target to the live fingertip
+                # ("home to here") and drop the clutch.
                 if button and not self.last_btn[arm]:
                     self._reseed(arm)
-                    self._calibrate_ori(arm, hand_R, head_fwd)
                     self.clutch[arm] = False
                 self.last_btn[arm] = button
 
-                # Rotation-lock toggle (thumbstick click): freeze / unfreeze this
-                # gripper's target orientation so the wrist can be re-oriented (or
-                # the hand translated) without rotating the gripper. On UNLOCK,
-                # re-zero the map so hand twist resumes from the held orientation
-                # without a jump.
-                if lock and not self.last_lock[arm]:
-                    self.ori_locked[arm] = not self.ori_locked[arm]
-                    if not self.ori_locked[arm]:
-                        self._calibrate_ori(arm, hand_R, head_fwd)
-                self.last_lock[arm] = lock
+                # Thumbstick-click edge: toggle this arm's PRECISION mode (fine
+                # placement). Position-only reach, so there is no rotation to lock;
+                # the click now scales hand motion down for sub-cm accuracy.
+                if precision and not self.last_precision[arm]:
+                    self.fine[arm] = not self.fine[arm]
+                self.last_precision[arm] = precision
 
                 # Clutch logic: target follows hand delta only while squeezed. The
                 # delta (raw WebXR metres) is projected into the operator's heading
                 # frame captured at the squeeze, so "forward/left/up relative to
-                # where you're looking" map to robot x/y/z. Orientation is separate
-                # and ABSOLUTE (below), not a per-grab delta.
+                # where you're looking" map to robot x/y/z.
                 if squeeze and not self.clutch[arm]:
                     self.clutch[arm] = True
                     self.clutch_hand0[arm] = hand
@@ -417,12 +399,9 @@ class M1QuestNode(Node):
                     F, L = _heading_basis(head_fwd)
                     self.clutch_F[arm], self.clutch_L[arm] = F, L
                     self.seeded[arm] = True
-                    # First grab for this arm: zero the absolute-orientation map to
-                    # the live pose so the gripper doesn't snap when tracking begins.
-                    if self.ori_align[arm] is None:
-                        self._calibrate_ori(arm, hand_R, head_fwd)
                 elif squeeze and self.clutch[arm]:
-                    d = (hand - self.clutch_hand0[arm]) * self.motion_scale
+                    scale = self.motion_scale * (PRECISION_SCALE if self.fine[arm] else 1.0)
+                    d = (hand - self.clutch_hand0[arm]) * scale
                     F, L = self.clutch_F[arm], self.clutch_L[arm]
                     robot_delta = np.array([
                         float(-(d @ L)),  # right    -> +x  (x/y swapped, x reversed)
@@ -430,15 +409,6 @@ class M1QuestNode(Node):
                         float(d[1]),      # up       -> +z
                     ])
                     self._set_target(arm, self.clutch_target0[arm] + robot_delta)
-                    # ABSOLUTE orientation: the gripper target orientation is a
-                    # fixed function of the controller's CURRENT orientation (see
-                    # _calibrate_ori), so it mirrors the controller rather than
-                    # accumulating a twist each grab. The lock freezes it.
-                    if (hand_R is not None and self.ori_C[arm] is not None
-                            and not self.ori_locked[arm]):
-                        C = self.ori_C[arm]
-                        R_tgt = C @ hand_R @ C.T @ self.ori_align[arm]
-                        self.target_quat[arm] = [float(v) for v in mat_to_quat(R_tgt)]
                 elif not squeeze:
                     self.clutch[arm] = False
 
@@ -462,11 +432,96 @@ class M1QuestNode(Node):
                     "yaw": _clamp(-rx * MAX_YAW, -MAX_YAW, MAX_YAW),
                 }
                 self._last_base_cmd = self._now()
-            viz = self._viz_locked()
+            # Take a cheap SNAPSHOT (copies) of everything the viz needs while we
+            # still hold the lock, then release it BEFORE the multi-millisecond
+            # FK / serialization runs -- so the heavy work no longer serializes
+            # against the 60 Hz _tick publish and the /joint_states callback.
+            snap = self._viz_snapshot_locked()
+        # Heavy FK + serialization happen OUTSIDE the lock, from the snapshot.
+        viz = self._build_viz(snap)
         return {"ok": True, "viz": viz}
 
+    def _viz_snapshot_locked(self) -> dict:
+        """Cheap copy of the viz inputs (assumes ``_lock`` held).
+
+        Copies only the small, hand/odom-dependent state -- the expensive FK is
+        done afterwards, off the lock, by :meth:`_build_viz`. Also snapshots the
+        latest planned trajectory (read here so the background planner's writes
+        are seen atomically with the rest of the state).
+        """
+        x, y, _ = self.odom.pose
+        return {
+            "q_meas": dict(self.q_meas),
+            "q_ver": getattr(self, "_q_ver", 0),
+            "target": {a: list(self.target[a]) for a in ("left", "right")},
+            "fine": {a: self.fine[a] for a in ("left", "right")},
+            "base": {
+                "p": [round(x, 4), round(y, 4), 0.0],
+                "q": [round(c, 5) for c in self.odom.quaternion()],
+            },
+            "traj": {a: getattr(self, "_traj", {}).get(a)
+                     for a in ("left", "right")},
+        }
+
     def _viz_locked(self) -> dict:
-        """Geometry for the headset's 3D overlay (assumes ``_lock`` held).
+        """Backwards-compatible viz build (snapshot + build in one call).
+
+        Kept for the position test, which calls this directly. In the live path
+        :meth:`on_xr_frame` snapshots under the lock and builds outside it; here
+        we just do both back-to-back (the caller is single-threaded).
+        """
+        snap = self._viz_snapshot_locked()
+        return self._build_viz(snap)
+
+    def _fk_payload(self, q_meas: dict, q_ver: int) -> dict:
+        """The q-only viz payload: full-robot ``links`` + per-arm skeleton
+        ``points``/``tip``, all already rounded for JSON.
+
+        Memoized on ``q_ver`` (bumped in _on_joint_states): a headset POSTs far
+        faster than joints update, so every POST that lands between two joint
+        frames reuses this instead of re-running the ~36-link FK + per-arm
+        ``link_points`` + ``mat_to_quat`` + rounding. This is the bulk of the
+        old per-frame cost. The hand-dependent bits (target/dist/base) are NOT
+        cached -- they are rebuilt fresh by :meth:`_build_viz` every call.
+        """
+        cache = getattr(self, "_viz_fk_cache", None)
+        if cache is not None and cache[0] == q_ver:
+            return cache[1]
+
+        payload = {"links": {}, "arms": {}}
+        have_js = bool(q_meas)
+        if self.reach is not None and have_js:
+            # Full-robot link poses (base_link frame) so the page can drive each
+            # mesh; cheap matrix walk over the (origin-cached) URDF tree.
+            try:
+                Ts = self.reach.model.link_transforms(q_meas)
+                for name, T in Ts.items():
+                    payload["links"][name] = {
+                        "p": [round(float(T[i, 3]), 4) for i in range(3)],
+                        "q": [round(float(c), 5) for c in mat_to_quat(T[:3, :3])],
+                    }
+            except Exception:  # noqa: BLE001
+                pass
+            for arm in ("left", "right"):
+                if not all(j in q_meas for j in ARM_JOINTS[arm] + [LIFT_JOINT]):
+                    continue
+                try:
+                    pts = self.reach.chains[arm].link_points(q_meas)
+                    tip = pts[-1]
+                    payload["arms"][arm] = {
+                        "points": [[round(float(c), 4) for c in p] for p in pts],
+                        "tip": [round(float(c), 4) for c in tip],
+                        # raw fingertip kept (unrounded) so the per-frame dist is
+                        # exact; not serialized.
+                        "_tip": np.asarray(tip, dtype=np.float64),
+                    }
+                except Exception:  # noqa: BLE001
+                    pass
+        self._viz_fk_cache = (q_ver, payload)
+        return payload
+
+    def _build_viz(self, snap: dict) -> dict:
+        """Assemble the headset overlay from a snapshot (NO lock held).
 
         For each arm we send the target point, the live fingertip, the
         base->tip skeleton points (FK of the *measured* joints), and the
@@ -475,60 +530,135 @@ class M1QuestNode(Node):
         points are in the robot ``base_link`` frame; the page anchors that
         frame to a fixed spot in the room, then offsets it by ``base`` (the
         dead-reckoned swerve pose) so the model drives around as commanded.
+
+        The heavy, q-only part (links + skeleton) comes from the memoized
+        :meth:`_fk_payload`; only the cheap, per-frame target/dist/base/traj are
+        built here. ``self.err`` is updated under a short lock so the 2D
+        snapshot readout stays thread-safe.
         """
-        x, y, theta = self.odom.pose
+        fk = self._fk_payload(snap["q_meas"], snap["q_ver"])
         viz = {
-            "frame": "base_link", "arms": {}, "links": {},
+            "frame": "base_link",
+            # links is q-only and already serialized -> reuse the cached dict.
+            "links": fk["links"],
+            "arms": {},
             # base_link pose in the odom frame (x fwd, y left, +yaw = CCW about
             # +z). The page applies this to the robot group so the whole model
             # translates/turns through the room as the base drives.
-            "base": {
-                "p": [round(x, 4), round(y, 4), 0.0],
-                "q": [round(c, 5) for c in self.odom.quaternion()],
-            },
+            "base": snap["base"],
         }
-        have_js = bool(self.q_meas)
-        if self.reach is not None and have_js:
-            # Full-robot link poses (base_link frame) so the page can drive each
-            # mesh; cheap matrix walk over the URDF tree.
-            try:
-                Ts = self.reach.model.link_transforms(self.q_meas)
-                for name, T in Ts.items():
-                    viz["links"][name] = {
-                        "p": [round(float(T[i, 3]), 4) for i in range(3)],
-                        "q": [round(float(c), 5) for c in mat_to_quat(T[:3, :3])],
-                    }
-            except Exception:  # noqa: BLE001
-                pass
+        err = {"left": None, "right": None}
         for arm in ("left", "right"):
+            target = snap["target"][arm]
             a = {
-                "target": [round(float(v), 4) for v in self.target[arm]],
-                # Target gripper orientation (quaternion x,y,z,w) so the page can
-                # draw the target's rotation, not just its point.
-                "target_quat": [round(float(v), 5) for v in self.target_quat[arm]],
+                "target": [round(float(v), 4) for v in target],
+                "fine": snap["fine"][arm],
             }
-            if (
-                self.reach is not None
-                and have_js
-                and all(j in self.q_meas for j in ARM_JOINTS[arm] + [LIFT_JOINT])
-            ):
-                try:
-                    pts = self.reach.chains[arm].link_points(self.q_meas)
-                    tip = pts[-1]
-                    _, R_tip = self.reach.gripper_pose(arm, self.q_meas)
-                    a["points"] = [[round(float(c), 4) for c in p] for p in pts]
-                    a["tip"] = [round(float(c), 4) for c in tip]
-                    # Live gripper orientation -> a second (current-pose) triad,
-                    # so the operator can see how close the gripper is to the
-                    # commanded orientation.
-                    a["tip_quat"] = [round(float(c), 5) for c in mat_to_quat(R_tip)]
-                    a["dist"] = round(
-                        float(np.linalg.norm(np.asarray(self.target[arm]) - tip)), 4
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
+            fa = fk["arms"].get(arm)
+            if fa is not None:
+                # Skeleton + fingertip are q-only (cached); copy the serialized
+                # forms straight through.
+                a["points"] = fa["points"]
+                a["tip"] = fa["tip"]
+                # Reach error (target point - fingertip), in metres. Cheap: one
+                # norm. Recomputed every frame so a target move updates the
+                # colour/HUD immediately even though the FK is memoized.
+                dist = float(np.linalg.norm(np.asarray(target) - fa["_tip"]))
+                a["dist"] = round(dist, 4)
+                err[arm] = dist
             viz["arms"][arm] = a
+        # Trajectory preview (planned off-thread). Per-arm polyline + per-waypoint
+        # colliding flags, in base_link frame like ``arms[..]["points"]``.
+        traj = self._traj_payload(snap.get("traj", {}))
+        if traj:
+            viz["traj"] = traj
+        # Surface the reach error to the 2D /api/state readout. Short lock so it
+        # never races _on_joint_states / snapshot.
+        with self._lock:
+            self.err = err
         return viz
+
+    @staticmethod
+    def _traj_payload(traj: dict) -> dict:
+        """Serialize each arm's latest Trajectory into the viz form:
+        ``{arm: {"points": [[x,y,z]...], "colliding": [bool...], "free": bool}}``.
+
+        Points are the fingertip polyline (base_link frame), rounded to 4 dp like
+        the rest of the viz. Returns ``{}`` when nothing is planned yet so the
+        page simply hides the path.
+        """
+        out = {}
+        for arm in ("left", "right"):
+            tr = traj.get(arm)
+            if tr is None:
+                continue
+            try:
+                pts = tr.points_for(arm)
+                if not pts:
+                    continue
+                out[arm] = {
+                    "points": [[round(float(c), 4) for c in p] for p in pts],
+                    "colliding": [bool(wp.colliding) for wp in tr.waypoints],
+                    "free": bool(tr.collision_free),
+                }
+            except Exception:  # noqa: BLE001
+                continue
+        return out
+
+    # --- background trajectory planner -------------------------------------
+    def _traj_worker(self):
+        """Replan the per-arm Cartesian preview off the request/_tick path.
+
+        Throttled to ~3-4 Hz and only when a target has actually moved (> ~1 cm)
+        since its last plan, so the (tens-of-ms) IK never piles up. Snapshots the
+        inputs under the lock, plans OUTSIDE it, then stores the result under the
+        lock. The whole loop is guarded so a planner hiccup can't kill the thread.
+        """
+        # Threshold (m) a goal must move before we bother replanning. Smaller than
+        # the operator could meaningfully see in the preview.
+        REPLAN_EPS = 0.01
+        while not self._traj_stop.is_set():
+            try:
+                # Lazy planner construction (needs self.reach).
+                if self._traj_planner is None:
+                    from m1_control.trajectory import TrajectoryPlanner
+                    self._traj_planner = TrajectoryPlanner(self.reach)
+
+                with self._lock:
+                    q_meas = dict(self.q_meas)
+                    targets = {a: list(self.target[a]) for a in ("left", "right")}
+                    seeded = dict(self.seeded)
+                    last_goal = dict(self._traj_last_goal)
+                # Only plan for arms whose joints are live AND whose target moved
+                # enough since the last plan -- otherwise reuse the stored result.
+                goals = {}
+                for arm in ("left", "right"):
+                    if not seeded.get(arm):
+                        continue
+                    if not all(j in q_meas for j in ARM_JOINTS[arm] + [LIFT_JOINT]):
+                        continue
+                    g = np.asarray(targets[arm], dtype=np.float64)
+                    lg = last_goal.get(arm)
+                    if lg is None or float(np.linalg.norm(g - np.asarray(lg))) > REPLAN_EPS:
+                        goals[arm] = g
+                if goals:
+                    new_traj = {}
+                    for arm, g in goals.items():
+                        # Plan each active arm on its own so one arm's goal move
+                        # doesn't disturb the other's preview.
+                        tr = self._traj_planner.plan(
+                            q_meas, {"left": g if arm == "left" else None,
+                                     "right": g if arm == "right" else None})
+                        new_traj[arm] = (tr, [float(c) for c in g])
+                    with self._lock:
+                        for arm, (tr, g) in new_traj.items():
+                            self._traj[arm] = tr
+                            self._traj_last_goal[arm] = g
+            except Exception:  # noqa: BLE001
+                # Never let a planner hiccup kill the worker; just retry next pass.
+                pass
+            # ~3-4 Hz. interruptible so shutdown is immediate.
+            self._traj_stop.wait(0.28)
 
     @staticmethod
     def _deadzone(v: float) -> float:
@@ -570,7 +700,6 @@ class M1QuestNode(Node):
             self.odom.update(cmd["vx"], cmd["vy"], cmd["yaw"],
                              min(max(dt, 0.0), 0.05))
             targets = {a: list(self.target[a]) for a in ("left", "right")}
-            quats = {a: list(self.target_quat[a]) for a in ("left", "right")}
             grip = dict(self.grip)
 
         tw = Twist()
@@ -587,11 +716,9 @@ class M1QuestNode(Node):
             ps.pose.position.x = targets[arm][0]
             ps.pose.position.y = targets[arm][1]
             ps.pose.position.z = targets[arm][2]
-            q = quats[arm]
-            ps.pose.orientation.x = q[0]
-            ps.pose.orientation.y = q[1]
-            ps.pose.orientation.z = q[2]
-            ps.pose.orientation.w = q[3]
+            # Position-only reach: orientation is ignored by the controller, so
+            # publish a valid identity quaternion.
+            ps.pose.orientation.w = 1.0
             self.pose_pub[arm].publish(ps)
 
             g = Float64()
@@ -610,7 +737,10 @@ class M1QuestNode(Node):
                     "target": [round(v, 3) for v in self.target[arm]],
                     "grip": round(self.grip[arm], 3),
                     "clutch": self.clutch[arm],
-                    "rot_locked": self.ori_locked[arm],
+                    "fine": self.fine[arm],
+                    # Reach error (mm) for the 2D readout; None until joints stream.
+                    "err_mm": (round(self.err[arm] * 1e3, 1)
+                               if self.err[arm] is not None else None),
                 }
             return out
 
@@ -759,6 +889,7 @@ def main(args=None):
         pass
     finally:
         server.shutdown()
+        node._traj_stop.set()   # ask the path-preview worker to exit (daemon)
         try:
             node.cmd_vel_pub.publish(Twist())  # leave the base stopped
         except Exception:  # noqa: BLE001
@@ -834,36 +965,33 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <span id="jsText">robot feedback: unknown</span>
     </div>
     <table>
-      <tr><td>left target</td><td id="lt">–</td><td id="lg">grip –</td><td id="lc"></td></tr>
-      <tr><td>right target</td><td id="rt">–</td><td id="rg">grip –</td><td id="rc"></td></tr>
+      <tr><td>left target</td><td id="lt">–</td><td id="lg">grip –</td><td id="le">err –</td><td id="lc"></td></tr>
+      <tr><td>right target</td><td id="rt">–</td><td id="rg">grip –</td><td id="re">err –</td><td id="rc"></td></tr>
     </table>
   </div>
 
   <div class="card">
     <h3 style="margin:0 0 8px;font-family:var(--serif)">Controls</h3>
     <p class="muted">
-      <kbd>Grip</kbd> (squeeze) — hold to "grab" that arm; the gripper follows your
-      hand's motion, and its rotation <em>mirrors your controller absolutely</em>
-      (point the controller a way → the gripper points that way). Release to
-      reposition your hand.<br/>
+      <kbd>Grip</kbd> (squeeze) — hold to "grab" that arm; the gripper's target
+      follows your hand's motion. Release to reposition your hand.<br/>
       <kbd>Trigger</kbd> — that arm's gripper (squeeze to close).<br/>
-      <kbd>Stick click</kbd> — lock / unlock that gripper's rotation (twist your
-      wrist freely while locked).<br/>
+      <kbd>Stick click</kbd> — toggle <em>precision mode</em> for that arm (hand
+      motion scaled down for fine, sub-cm placement).<br/>
       <kbd>Left stick</kbd> — drive: forward/back = drive fwd/back, left/right = strafe.<br/>
       <kbd>Right stick</kbd> — left/right = turn (yaw).<br/>
-      <kbd>A</kbd>/<kbd>X</kbd> — re-home that arm's target <em>and</em> rotation to where it is now.<br/>
+      <kbd>A</kbd>/<kbd>X</kbd> — re-home that arm's target to where it is now.<br/>
       <kbd>B</kbd>/<kbd>Y</kbd> — recenter the robot hologram in front of you.
     </p>
     <p class="muted">
       In the headset you'll see a 3D model of the robot (its real meshes) drawn
       over your room in passthrough, posed live from the robot's joints, plus a
-      coloured sphere at each Cartesian target with an <b>RGB orientation triad</b>
-      showing the target gripper rotation (a smaller, fainter triad tracks the
-      live gripper so you can see how well it's aligned). The target turns
-      <span style="color:var(--good)">green</span> when the arm reaches it and
-      <span style="color:var(--bad)">red</span> when the pose is out of reach,
-      so you can see impossible goals immediately. (First load streams ~4 MB of
-      meshes; it's cached afterward.)
+      coloured sphere at each Cartesian target and a floating <b>REACH ERROR</b>
+      panel showing each arm's target↔fingertip distance in mm. The target and the
+      error readout turn <span style="color:var(--good)">green</span> when the arm
+      reaches it and <span style="color:var(--bad)">red</span> when it's out of
+      reach, so you can see impossible goals immediately. (First load streams
+      ~4 MB of meshes; it's cached afterward.)
     </p>
   </div>
   <div id="log"></div>
@@ -883,8 +1011,10 @@ async function poll(){
     const f=(a)=>{ const arm=s.arms[a]; if(!arm) return;
       document.getElementById(a[0]+"t").textContent="["+arm.target.join(", ")+"]";
       document.getElementById(a[0]+"g").textContent="grip "+arm.grip.toFixed(2);
+      document.getElementById(a[0]+"e").textContent=
+        (arm.err_mm==null?"err –":"err "+arm.err_mm.toFixed(1)+"mm");
       document.getElementById(a[0]+"c").textContent=
-        (arm.clutch?"● clutch":"")+(arm.rot_locked?"  🔒 rot":""); };
+        (arm.clutch?"● clutch":"")+(arm.fine?"  ◎ fine":""); };
     f("left"); f("right");
   }catch(e){}
 }
@@ -907,7 +1037,17 @@ let lastViz=null, inFlight=false, meshesLoaded=false;
 let armLinks={left:[], right:[]};
 const armComplete={left:false, right:false};
 const linkNodes={}, targetMesh={}, tipMesh={}, errLine={}, wire={};
-const targetAxes={}, tipAxes={};
+// Per-arm trajectory PREVIEW: a vertex-coloured polyline (green=clear, red where
+// a waypoint self-collides) plus camera-facing dots at the waypoints, both under
+// robotBase so they drive with the robot. Preallocated once in initThree(),
+// updated in place from lastViz.traj (no per-frame allocation).
+const trajLine={}, trajDots={};
+const TRAJ_MAX_PTS=64;   // >> planner's ~25 waypoints; fixed buffer capacity
+let errHud=null, hudCanvas=null, hudCtx=null, hudTex=null;   // in-VR REACH ERROR panel
+// Last distances actually drawn into the HUD canvas (mm, quantized to 0.1). The
+// canvas redraw + GPU texture upload is the costly part of the HUD, so we skip
+// it while the displayed values are unchanged and only re-billboard the panel.
+let hudDrawnL=null, hudDrawnR=null;
 const recenterPrev={left:false, right:false};
 // Sticky "(re)anchor the robot" signal. Set when we place/recenter, sent to the
 // node so it zeroes the dead-reckoned base pose, and cleared only once a POST
@@ -939,6 +1079,48 @@ function reachColor(d){
   if(d<0.02) return new THREE.Color(0x4cd964);   // reaching
   if(d<0.08) return new THREE.Color(0xf2b33a);   // marginal
   return new THREE.Color(0xe64d40);              // out of reach
+}
+
+// CSS colour for the error HUD, matching reachColor's thresholds.
+function errCss(d){
+  if(d==null) return "#8c99b8";
+  if(d<0.02) return "#4cd964";
+  if(d<0.08) return "#f2b33a";
+  return "#e64d40";
+}
+
+/* ---- redraw the REACH ERROR HUD canvas from each arm's distance (m) ----
+   Skips the (expensive) canvas clear+draw+texture upload when both displayed
+   values are unchanged since the last draw, quantized to 0.1 mm -- the panel is
+   still re-billboarded every frame by updateHud(), which is cheap. ---- */
+function drawHud(dl, dr){
+  if(!hudCtx) return;
+  // Quantize to 0.1 mm (null stays null) so sub-tenth jitter doesn't redraw.
+  const ql = dl==null?null:Math.round(dl*1e4);
+  const qr = dr==null?null:Math.round(dr*1e4);
+  if(ql===hudDrawnL && qr===hudDrawnR) return;   // nothing visible changed
+  hudDrawnL=ql; hudDrawnR=qr;
+  const W=hudCanvas.width, H=hudCanvas.height, c=hudCtx;
+  c.clearRect(0,0,W,H);
+  c.fillStyle="rgba(18,18,22,0.72)";
+  c.strokeStyle="rgba(255,255,255,0.18)"; c.lineWidth=4;
+  c.beginPath(); c.roundRect(6,6,W-12,H-12,18); c.fill(); c.stroke();
+  c.textBaseline="middle"; c.textAlign="left";
+  c.fillStyle="#e8e6df";
+  c.font="600 34px system-ui,-apple-system,'Segoe UI',sans-serif";
+  c.fillText("REACH ERROR",36,46);
+  const row=(label,d,y)=>{
+    const col=errCss(d);
+    c.beginPath(); c.arc(54,y,14,0,Math.PI*2); c.fillStyle=col; c.fill();
+    c.fillStyle="#cfccc4"; c.font="500 34px system-ui,sans-serif";
+    c.textAlign="left"; c.fillText(label,84,y);
+    c.fillStyle=col; c.textAlign="right";
+    c.font="600 40px ui-monospace,Menlo,Consolas,monospace";
+    c.fillText(d==null?"– mm":(d*1000).toFixed(1)+" mm",W-40,y);
+  };
+  row("left", dl, 120);
+  row("right", dr, 186);
+  hudTex.needsUpdate=true;
 }
 
 /* ---- three.js scene: robot meshes + target markers, drawn over passthrough ---- */
@@ -979,18 +1161,40 @@ function initThree(){
       [new THREE.Vector3(), new THREE.Vector3()]);
     const ln=new THREE.Line(g, new THREE.LineBasicMaterial({color:0x4cd964}));
     ln.visible=false; robotBase.add(ln); errLine[arm]=ln;
-    // Orientation triads (RGB = gripper X/Y/Z). The larger one is the TARGET
-    // pose's rotation; the smaller one tracks the live gripper, so the operator
-    // can see how close the gripper's rotation is to what was commanded. Drawn
-    // on top (depthTest off) so they read clearly over the robot mesh. On
-    // robotBase so they drive with the robot through the room.
-    const tax=new THREE.AxesHelper(0.15);
-    tax.material.depthTest=false; tax.material.linewidth=2;
-    tax.renderOrder=5; tax.visible=false; robotBase.add(tax); targetAxes[arm]=tax;
-    const pax=new THREE.AxesHelper(0.10);
-    pax.material.transparent=true; pax.material.opacity=0.6;
-    pax.renderOrder=4; pax.visible=false; robotBase.add(pax); tipAxes[arm]=pax;
+
+    // Trajectory preview polyline: fixed-capacity position + per-vertex colour
+    // buffers, drawn via setDrawRange so we never reallocate. vertexColors lets
+    // a colliding stretch turn red while the rest stays green.
+    const pg=new THREE.BufferGeometry();
+    pg.setAttribute("position", new THREE.Float32BufferAttribute(
+      new Float32Array(TRAJ_MAX_PTS*3), 3).setUsage(THREE.DynamicDrawUsage));
+    pg.setAttribute("color", new THREE.Float32BufferAttribute(
+      new Float32Array(TRAJ_MAX_PTS*3), 3).setUsage(THREE.DynamicDrawUsage));
+    const pl=new THREE.Line(pg, new THREE.LineBasicMaterial({vertexColors:true}));
+    pl.visible=false; robotBase.add(pl); trajLine[arm]=pl;
+    // Waypoint dots: camera-facing points sharing the same colour scheme. Its own
+    // buffers (sizeAttenuation off so the dots stay legible at any robot range).
+    const dg=new THREE.BufferGeometry();
+    dg.setAttribute("position", new THREE.Float32BufferAttribute(
+      new Float32Array(TRAJ_MAX_PTS*3), 3).setUsage(THREE.DynamicDrawUsage));
+    dg.setAttribute("color", new THREE.Float32BufferAttribute(
+      new Float32Array(TRAJ_MAX_PTS*3), 3).setUsage(THREE.DynamicDrawUsage));
+    const dots=new THREE.Points(dg, new THREE.PointsMaterial(
+      {size:0.018, vertexColors:true, sizeAttenuation:true, depthTest:true}));
+    dots.visible=false; robotBase.add(dots); trajDots[arm]=dots;
   }
+
+  // In-VR REACH ERROR HUD: a canvas-textured panel that floats above the robot
+  // and billboards to face the operator, showing each arm's target->fingertip
+  // error in mm (green/amber/red). Attached to the scene (not the robot groups)
+  // so billboarding is a plain camera-facing quaternion and it ignores odom drift.
+  hudCanvas=document.createElement("canvas"); hudCanvas.width=512; hudCanvas.height=256;
+  hudCtx=hudCanvas.getContext("2d");
+  hudTex=new THREE.CanvasTexture(hudCanvas);
+  const hudMat=new THREE.MeshBasicMaterial({map:hudTex, transparent:true,
+    depthTest:false, side:THREE.DoubleSide});
+  errHud=new THREE.Mesh(new THREE.PlaneGeometry(0.40,0.20), hudMat);
+  errHud.renderOrder=10; errHud.visible=false; scene.add(errHud);
 }
 
 /* ---- fetch one mesh with a few retries (a single dropped request used to
@@ -1091,48 +1295,114 @@ function updateRobot(){
   for(const arm of ["left","right"]){
     const a=lastViz.arms ? lastViz.arms[arm] : null;
     const tg=targetMesh[arm], tp=tipMesh[arm], ln=errLine[arm];
-    const tax=targetAxes[arm], pax=tipAxes[arm];
     if(!a || !a.target){
-      tg.visible=tp.visible=ln.visible=tax.visible=pax.visible=false; continue; }
+      tg.visible=tp.visible=ln.visible=false; continue; }
     const col=reachColor(a.dist==null?9:a.dist);
     tg.position.set(a.target[0],a.target[1],a.target[2]);
     tg.material.color.copy(col); tg.visible=true;
-    // Target orientation triad at the target point.
-    if(a.target_quat){
-      tax.position.set(a.target[0],a.target[1],a.target[2]);
-      tax.quaternion.set(a.target_quat[0],a.target_quat[1],a.target_quat[2],a.target_quat[3]);
-      tax.visible=true;
-    } else tax.visible=false;
     if(a.tip){
       tp.position.set(a.tip[0],a.tip[1],a.tip[2]); tp.visible=true;
       const pos=ln.geometry.attributes.position;
       pos.setXYZ(0, a.tip[0],a.tip[1],a.tip[2]);
       pos.setXYZ(1, a.target[0],a.target[1],a.target[2]);
       pos.needsUpdate=true; ln.material.color.copy(col); ln.visible=true;
-      // Live gripper orientation triad at the fingertip.
-      if(a.tip_quat){
-        pax.position.set(a.tip[0],a.tip[1],a.tip[2]);
-        pax.quaternion.set(a.tip_quat[0],a.tip_quat[1],a.tip_quat[2],a.tip_quat[3]);
-        pax.visible=true;
-      } else pax.visible=false;
-    } else { tp.visible=false; ln.visible=false; pax.visible=false; }
+    } else { tp.visible=false; ln.visible=false; }
+  }
+  updateTraj();
+  updateHud();
+}
+
+/* ---- per-frame: draw each arm's planned path preview from lastViz.traj ----
+   Fills the preallocated polyline + waypoint-dot buffers in place. A waypoint's
+   colour is green when clear and red when its `colliding` flag is set; a polyline
+   vertex is red if either it or its predecessor collides, so a bad stretch reads
+   red. Hidden whenever there's no trajectory for that arm. Robust to a missing
+   lastViz.traj (older response / nothing planned yet). ---- */
+const TRAJ_GREEN=[0.30,0.85,0.39], TRAJ_RED=[0.90,0.30,0.25];
+function updateTraj(){
+  const traj=lastViz.traj||null;
+  for(const arm of ["left","right"]){
+    const pl=trajLine[arm], dots=trajDots[arm];
+    const t=traj?traj[arm]:null;
+    if(!t || !t.points || t.points.length<1){
+      if(pl) pl.visible=false; if(dots) dots.visible=false; continue;
+    }
+    const pts=t.points, col=t.colliding||[];
+    const n=Math.min(pts.length, TRAJ_MAX_PTS);
+    const lp=pl.geometry.attributes.position.array, lc=pl.geometry.attributes.color.array;
+    const dp=dots.geometry.attributes.position.array, dc=dots.geometry.attributes.color.array;
+    for(let i=0;i<n;i++){
+      const p=pts[i], b=i*3;
+      lp[b]=dp[b]=p[0]; lp[b+1]=dp[b+1]=p[1]; lp[b+2]=dp[b+2]=p[2];
+      // dot: its own waypoint flag; line vertex: red if it or the prior collides
+      // so the offending segment is unambiguously red.
+      const dotC = col[i] ? TRAJ_RED : TRAJ_GREEN;
+      const lnC = (col[i] || (i>0 && col[i-1])) ? TRAJ_RED : TRAJ_GREEN;
+      dc[b]=dotC[0]; dc[b+1]=dotC[1]; dc[b+2]=dotC[2];
+      lc[b]=lnC[0]; lc[b+1]=lnC[1]; lc[b+2]=lnC[2];
+    }
+    pl.geometry.setDrawRange(0, n);
+    dots.geometry.setDrawRange(0, n);
+    pl.geometry.attributes.position.needsUpdate=true;
+    pl.geometry.attributes.color.needsUpdate=true;
+    dots.geometry.attributes.position.needsUpdate=true;
+    dots.geometry.attributes.color.needsUpdate=true;
+    // A single-waypoint path has no segment to draw; show the dot, hide the line.
+    pl.visible = n>=2; dots.visible=true;
   }
 }
 
+/* ---- pose + redraw the REACH ERROR HUD: float it above the robot and face the
+       camera (billboard), refreshing the per-arm error text/colours ---- */
+function updateHud(){
+  if(!errHud) return;
+  const al=lastViz.arms?lastViz.arms.left:null, ar=lastViz.arms?lastViz.arms.right:null;
+  const dl=al&&al.dist!=null?al.dist:null, dr=ar&&ar.dist!=null?ar.dist:null;
+  if(dl==null && dr==null){ errHud.visible=false; return; }
+  drawHud(dl, dr);
+  // Anchor above the robot base (its world position) and billboard to the camera.
+  const base=new THREE.Vector3();
+  (robotBase||robotRoot).getWorldPosition(base);
+  base.y += 1.35;                       // float above the robot
+  errHud.position.copy(base);
+  // Billboard: copy the (XR head) camera's world orientation. A camera looks down
+  // its -z, so the plane's +z (front, unmirrored) face ends up toward the viewer.
+  const cam = (renderer.xr.isPresenting ? renderer.xr.getCamera() : camera);
+  if(cam){ const q=new THREE.Quaternion(); cam.getWorldQuaternion(q); errHud.quaternion.copy(q); }
+  errHud.visible=true;
+}
+
 /* ---- wireframe fallback: drawn for both arms before meshes load, and after
-       load only for an arm whose mesh(es) failed (so a gap is never silent) ---- */
+       load only for an arm whose mesh(es) failed (so a gap is never silent).
+       The position buffer is PREALLOCATED once per arm (ample fixed capacity)
+       and updated in place + drawn via setDrawRange, instead of allocating a new
+       Float32BufferAttribute every frame while loading / for a failed arm. ---- */
+const WIRE_MAX_PTS=32;   // arm skeleton is well under this; segments=(pts-1)
 function updateWire(forceBoth){
   for(const arm of ["left","right"]){
     const a=lastViz.arms ? lastViz.arms[arm] : null;
     const show = forceBoth || !armComplete[arm];
     if(!show || !a || !a.points){ if(wire[arm]) wire[arm].visible=false; continue; }
-    const pts=[];
-    for(let i=0;i<a.points.length-1;i++) pts.push(...a.points[i], ...a.points[i+1]);
     let w=wire[arm];
-    if(!w){ w=new THREE.LineSegments(new THREE.BufferGeometry(),
-        new THREE.LineBasicMaterial({color:0x8c99b8}));
-      robotBase.add(w); wire[arm]=w; }
-    w.geometry.setAttribute("position", new THREE.Float32BufferAttribute(pts,3));
+    if(!w){
+      const geom=new THREE.BufferGeometry();
+      // (WIRE_MAX_PTS-1) segments * 2 endpoints * 3 floats, allocated once.
+      const buf=new THREE.Float32BufferAttribute(
+        new Float32Array((WIRE_MAX_PTS-1)*2*3), 3);
+      buf.setUsage(THREE.DynamicDrawUsage);
+      geom.setAttribute("position", buf);
+      w=new THREE.LineSegments(geom, new THREE.LineBasicMaterial({color:0x8c99b8}));
+      robotBase.add(w); wire[arm]=w;
+    }
+    // Fill the existing array in place (consecutive points -> line segments).
+    const arr=w.geometry.attributes.position.array;
+    const n=Math.min(a.points.length, WIRE_MAX_PTS);
+    let k=0;
+    for(let i=0;i<n-1;i++){
+      arr[k++]=a.points[i][0];   arr[k++]=a.points[i][1];   arr[k++]=a.points[i][2];
+      arr[k++]=a.points[i+1][0]; arr[k++]=a.points[i+1][1]; arr[k++]=a.points[i+1][2];
+    }
+    w.geometry.setDrawRange(0, Math.max(0, (n-1)*2));
     w.geometry.attributes.position.needsUpdate=true; w.visible=true;
   }
 }
@@ -1157,17 +1427,18 @@ function readController(src, frame){
   if(!src || !src.gripSpace || !src.gamepad) return null;
   const pose=frame.getPose(src.gripSpace, refSpace);
   if(!pose) return {valid:false};
-  const p=pose.transform.position; const o=pose.transform.orientation; const gp=src.gamepad;
+  const p=pose.transform.position; const gp=src.gamepad;
   // Quest mapping: buttons[0]=trigger,[1]=grip,[3]=stick click,[4]=A/X,[5]=B/Y; axes[2,3]=stick.
   const trigger=gp.buttons[0]?gp.buttons[0].value:0;
   const squeeze=gp.buttons[1]?gp.buttons[1].pressed:false;
   const button=gp.buttons[4]?gp.buttons[4].pressed:false;
   const recenter=gp.buttons[5]?gp.buttons[5].pressed:false;
-  const lock=gp.buttons[3]?gp.buttons[3].pressed:false;   // thumbstick click -> rotation lock
+  const lock=gp.buttons[3]?gp.buttons[3].pressed:false;   // thumbstick click -> precision toggle
   const ax=gp.axes||[];
   const stick=[ax.length>2?ax[2]:(ax[0]||0), ax.length>3?ax[3]:(ax[1]||0)];
-  // grip-space orientation (quaternion x,y,z,w) drives the gripper's rotation.
-  return {valid:true, pos:[p.x,p.y,p.z], quat:[o.x,o.y,o.z,o.w],
+  // Position-only: grip-space orientation is no longer sent (the gripper rotation
+  // is not controlled). 'lock' carries the thumbstick-click for precision mode.
+  return {valid:true, pos:[p.x,p.y,p.z],
           trigger, squeeze, button, recenter, lock, stick};
 }
 
