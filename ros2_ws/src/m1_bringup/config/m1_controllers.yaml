@@ -24,6 +24,12 @@ controller_manager:
   ros__parameters:
     update_rate: 200  # Hz
 
+    # Safety: clamp every streamed command to the URDF position/velocity/effort
+    # limits between the controllers and the hardware write() (Jazzy clamps a
+    # position setpoint to a velocity/accel-bounded slew -- the framework version
+    # of the brain's IK_MAX_DQ). Read-only: must be set here at launch.
+    enforce_command_limits: true
+
     joint_state_broadcaster:
       type: joint_state_broadcaster/JointStateBroadcaster
 
