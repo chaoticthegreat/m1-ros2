@@ -21,6 +21,15 @@ def test_limits_table_values():
     assert dm.LIMITS["DM4310"] == (12.5, 30.0, 10.0)
     assert dm.LIMITS["DM8009"] == (12.5, 45.0, 54.0)
     assert dm.LIMITS["DM4340"] == (12.5, 8.0, 28.0)
+    # DM3507 must be present and match the openarm_can reference table.
+    assert dm.LIMITS["DM3507"] == (12.5, 50.0, 5.0)
+
+
+def test_refresh_frame():
+    # Non-energizing state poll: [id_lo, id_hi, 0xCC, 0,0,0,0,0] to 0x7FF.
+    assert dm.PARAM_ARB_ID == 0x7FF
+    assert dm.refresh_frame(0x05) == bytes([0x05, 0x00, 0xCC, 0, 0, 0, 0, 0])
+    assert dm.refresh_frame(0x0123) == bytes([0x23, 0x01, 0xCC, 0, 0, 0, 0, 0])
 
 
 def test_quantization_roundtrip():

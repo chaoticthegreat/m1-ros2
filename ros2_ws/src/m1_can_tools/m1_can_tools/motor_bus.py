@@ -105,6 +105,13 @@ class MotorBus:
         clamps to the model range too, but we clamp explicitly so the commanded
         value is observable). A jog is a single frame; the web page's deadman
         decides whether to keep sending it.
+
+        NB (frame convention): ``jog`` commands in the **motor** frame -- the
+        ``dir``/``offset`` calibration is NOT applied here, whereas
+        :meth:`telemetry` reports ``pos`` in the **joint** frame (dir/offset
+        applied). This is deliberate for raw maintenance nudges; an operator near
+        a limit should read the motor-frame setpoint accordingly. (The live
+        ros2_control path applies dir/offset in C++.)
         """
         info = self._info(joint)
         p_max, v_max, t_max = dm.limits(info["model"])
@@ -142,11 +149,13 @@ class MotorBus:
         return None
 
     def scan(self, ids: Iterable[int]) -> List[dict]:
-        """Enable each id in *ids*, then list the motors that responded.
+        """Poll each id in *ids* (non-energizing) and list the motors that replied.
 
-        Used by the config page's inventory: pings the candidate slave ids
-        (enable -> the motor replies with a feedback frame on its master id) and
-        returns one dict per responder ``{id, master_id, model, joint, ...fb}``.
+        Used by the config page's inventory: pings the candidate slave ids with a
+        **state-refresh** frame (opcode ``0xCC`` to ``0x7FF``) -- the motor replies
+        with a feedback frame on its master id WITHOUT being enabled/powered, so an
+        inventory scan never energizes the arm. Returns one dict per responder
+        ``{id, master_id, model, joint, ...fb}``.
         """
         # Index the known map by slave id so a responder can be named.
         by_id = {info["id"]: (joint, info) for joint, info in self.motor_map.items()}
@@ -154,9 +163,9 @@ class MotorBus:
             info.get("master_id", dm.master_id(info["id"])): (joint, info)
             for joint, info in self.motor_map.items()
         }
-        # Poke every candidate id.
+        # Poll every candidate id with the non-energizing refresh request.
         for sid in ids:
-            self.transport.send(dm.arb_id(sid, "mit"), dm.special_frame("enable"))
+            self.transport.send(dm.PARAM_ARB_ID, dm.refresh_frame(sid))
 
         found: List[dict] = []
         frame = self.transport.recv(timeout=0.01)

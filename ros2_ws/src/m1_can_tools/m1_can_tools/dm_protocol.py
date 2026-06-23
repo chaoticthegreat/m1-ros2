@@ -34,6 +34,7 @@ from typing import Dict, Tuple
 # model -> (P_MAX rad, V_MAX rad/s, T_MAX Nm). Verbatim from the design's
 # Global Constraints; these scale every MIT command/feedback quantization.
 LIMITS: Dict[str, Tuple[float, float, float]] = {
+    "DM3507":     (12.5, 50.0, 5.0),
     "DM4310":     (12.5, 30.0, 10.0),
     "DM4310_48V": (12.5, 50.0, 10.0),
     "DM4340":     (12.5, 8.0, 28.0),
@@ -172,6 +173,22 @@ def special_frame(kind: str) -> bytes:
             f"unknown special frame {kind!r}; "
             f"expected one of {sorted(_SPECIAL_OPCODE)}") from exc
     return bytes([0xFF] * 7 + [opcode])
+
+
+# Broadcast id for parameter read/write and the state-refresh poll.
+PARAM_ARB_ID = 0x7FF
+
+
+def refresh_frame(slave_id: int) -> bytes:
+    """Non-energizing state-refresh request (opcode ``0xCC``) for one motor.
+
+    Returns the 8-byte payload to send to :data:`PARAM_ARB_ID` (``0x7FF``); the
+    motor replies with its feedback frame on its master id **without** being
+    enabled/powered. This is the safe way to *poll/inventory* the bus (unlike
+    ``enable``, which energizes the motor). Layout matches the openarm_can
+    reference ``create_refresh_command``: ``[id_lo, id_hi, 0xCC, 0, 0, 0, 0, 0]``.
+    """
+    return bytes([slave_id & 0xFF, (slave_id >> 8) & 0xFF, 0xCC, 0, 0, 0, 0, 0])
 
 
 def arb_id(slave_id: int, mode: str) -> int:

@@ -108,6 +108,18 @@ def test_scan_lists_responders():
     assert ids == [1, 2]
 
 
+def test_scan_is_non_energizing():
+    # A scan must POLL (refresh 0xCC -> 0x7FF), never ENABLE motors.
+    t = FakeTransport()
+    bus = MotorBus(t, MAP)
+    bus.scan(range(1, 4))
+    # Every frame sent is a refresh poll to the broadcast id...
+    assert all(arb == dm.PARAM_ARB_ID for arb, _ in t.sent)
+    assert (dm.PARAM_ARB_ID, dm.refresh_frame(2)) in t.sent
+    # ...and no enable frame was sent.
+    assert all(data != dm.special_frame("enable") for _, data in t.sent)
+
+
 def test_enable_all_disable_all():
     t = FakeTransport()
     bus = MotorBus(t, MAP)
