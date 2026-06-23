@@ -490,8 +490,13 @@ is not running — the web panel's status dot makes this obvious.
   path detour), honestly flagging the rare task-coupled pose it cannot open. To
   make execution collision-aware you'd either gate the live command on
   `CollisionModel.clearance` or drive the controller along a pre-planned
-  `Trajectory`; full planned motion is still MoveIt's job (SRDF + kinematics
-  config + a controller bridge).
+  `Trajectory`. **A MoveIt 2 config now exists** for planned collision-aware moves
+  (`m1_bringup/moveit/`, `m1_moveit.launch.py`, Phase 3) — `left_arm`/`right_arm`
+  KDL groups + a `both_arms_lift` joint-space group (the lift can't go through KDL
+  IK, so it's OMPL joint-space only); validated on mock (all groups plan; per-arm
+  plan+execute lands). It's **additive/optional**, hot-swapped JTC↔forward
+  controller for planned moves; the reactive Drake teleop + shared lift stay on the
+  brain. Open gap: no combined JTC to *execute* a `both_arms_lift` trajectory yet.
 - Shared-lift tradeoff: the lift is one prismatic joint feeding both arms, so
  when both arms have targets the stacked solve picks the single lift height that
  minimises the combined (equal-weight) fingertip error. Two arms with targets at
