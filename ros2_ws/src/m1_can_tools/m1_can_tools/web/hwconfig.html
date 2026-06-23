@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>M1 Hardware Config</title>
+<style>
+  :root {
+    --bg:#f0eee6; --panel:#f6f4ec; --panel2:#ebe8dd; --line:#dcd7c8;
+    --ink:#181613; --txt:#181613; --muted:#73706a; --accent:#c96442;
+    --accent-ink:#b4543a; --good:#4f7a4a; --bad:#b4432f; --warn:#b8862f;
+    --serif:'Tiempos Headline','Iowan Old Style',Georgia,'Times New Roman',serif;
+    --sans:'Styrene B',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:var(--sans); background:var(--bg); color:var(--txt);
+         -webkit-font-smoothing:antialiased; }
+  header { display:flex; align-items:center; gap:14px; padding:18px 28px;
+           border-bottom:1px solid var(--line); background:var(--bg); }
+  .logo { width:26px; height:26px; flex:none; }
+  header h1 { font-family:var(--serif); font-size:21px; margin:0; font-weight:600;
+              letter-spacing:-.01em; color:var(--ink); }
+  .status { display:flex; align-items:center; gap:8px; margin-left:auto;
+            font-size:13px; color:var(--muted); }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--bad); }
+  .dot.on { background:var(--good); }
+  .banner { padding:10px 28px; font-size:13px; border-bottom:1px solid var(--line);
+            background:var(--panel2); color:var(--ink); }
+  .banner.run { background:#f3e2d8; color:var(--accent-ink); }
+  .banner b { font-family:var(--serif); }
+  main { display:grid; grid-template-columns:repeat(auto-fit,minmax(380px,1fr));
+         gap:20px; padding:26px 28px; max-width:1280px; margin:0 auto; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:8px;
+          padding:20px 22px; }
+  .card.span { grid-column:1/-1; }
+  .card h2 { font-family:var(--serif); font-size:19px; margin:0 0 14px; color:var(--ink);
+             font-weight:600; letter-spacing:-.01em; }
+  .row { display:flex; align-items:center; gap:8px; margin:8px 0; flex-wrap:wrap; }
+  .row label { width:96px; color:var(--muted); font-size:13px; }
+  button { background:#fbfaf5; color:var(--ink); border:1px solid var(--line);
+           border-radius:6px; padding:9px 12px; font-size:14px; cursor:pointer;
+           font-family:var(--sans); user-select:none;
+           transition:background .1s,border-color .1s,color .1s; }
+  button:hover { border-color:var(--accent); }
+  button:active, button.held { background:var(--accent); border-color:var(--accent);
+           color:#fff; }
+  button.stop { background:var(--ink); border-color:var(--ink); color:#f0eee6; }
+  button.stop:hover { background:var(--bad); border-color:var(--bad); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  input[type=number], input[type=text], select { background:#fbfaf5; color:var(--ink);
+           border:1px solid var(--line); border-radius:6px; padding:6px;
+           font-family:var(--sans); width:80px; }
+  input[type=range]{ flex:1; accent-color:var(--accent); }
+  table { width:100%; border-collapse:collapse; font-size:13px;
+          font-variant-numeric:tabular-nums; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:500; font-size:11px; text-transform:uppercase;
+       letter-spacing:.05em; }
+  td.err { color:var(--bad); font-weight:600; }
+  .hot { color:var(--bad); } .warm { color:var(--warn); }
+  .muted { color:var(--muted); font-size:12px; }
+  code { background:var(--panel2); border-radius:4px; padding:1px 5px; font-size:.92em; }
+  .val { font-variant-numeric:tabular-nums; color:var(--ink); }
+  .seg button { border-radius:0; }
+  .seg button:first-child { border-radius:6px 0 0 6px; }
+  .seg button:last-child { border-radius:0 6px 6px 0; border-left:none; }
+  footer { text-align:center; color:var(--muted); font-size:12px; padding:14px 0 30px;
+           font-family:var(--serif); font-style:italic; }
+</style>
+</head>
+<body>
+<header>
+  <svg class="logo" viewBox="0 0 100 100" aria-hidden="true">
+    <path fill="#181613" d="M34 18 L8 82 H24 L29 68 H53 L58 82 H74 L48 18 Z M34.5 54 L41 36 L47.5 54 Z"/>
+    <path fill="#c96442" d="M66 18 L92 82 H77 L51 18 Z"/>
+  </svg>
+  <h1>M1 Hardware Config &amp; Test</h1>
+  <div class="status"><span id="dot" class="dot"></span><span id="statusText">connecting…</span></div>
+</header>
+
+<div class="banner" id="banner">bus owner: <b id="ownerText">maintenance</b></div>
+
+<main>
+  <!-- MODE -->
+  <section class="card">
+    <h2>Bus mode</h2>
+    <div class="muted">Write/jog/zero/assign are allowed only in <b>maintenance</b> mode
+      (this page owns the CAN bus). In <b>run</b> mode ros2_control owns it and this page
+      is read-only telemetry.</div>
+    <div class="row seg" style="margin-top:12px">
+      <button id="modeMaint">Maintenance</button>
+      <button id="modeRun">Run (read-only)</button>
+    </div>
+  </section>
+
+  <!-- INVENTORY / SCAN -->
+  <section class="card">
+    <h2>Motor inventory</h2>
+    <div class="row">
+      <label>Scan ids</label>
+      <input type="number" id="scanFrom" value="1" min="1"/>
+      <span class="muted">to</span>
+      <input type="number" id="scanTo" value="16" min="1"/>
+      <button id="scanBtn">Scan bus</button>
+    </div>
+    <div id="scanResult" class="muted">No scan yet.</div>
+  </section>
+
+  <!-- LIMITS EDITOR -->
+  <section class="card">
+    <h2>Per-joint limits</h2>
+    <div class="row"><label>Joint</label>
+      <select id="limJoint"></select></div>
+    <div class="row"><label>Pos lo/hi</label>
+      <input type="number" step="0.01" id="limPosLo"/>
+      <input type="number" step="0.01" id="limPosHi"/></div>
+    <div class="row"><label>Vel max</label>
+      <input type="number" step="0.1" id="limVel"/></div>
+    <div class="row"><label>Effort max</label>
+      <input type="number" step="0.1" id="limEff"/></div>
+    <div class="row"><button id="limSave">Save limits → joint_limits.yaml</button></div>
+    <div id="limMsg" class="muted"></div>
+  </section>
+
+  <!-- JOG / TEST -->
+  <section class="card">
+    <h2>Motor test / jog</h2>
+    <div class="row"><label>Joint</label>
+      <select id="jogJoint"></select>
+      <button id="enBtn">Enable</button>
+      <button id="disBtn">Disable</button>
+      <button id="zeroBtn">Set zero</button></div>
+    <div class="row"><label>Target pos</label>
+      <input type="range" id="jogPos" min="-3.14" max="3.14" step="0.01" value="0"/>
+      <span class="val" id="jogPosV">0.00</span></div>
+    <div class="row"><label>Kp / Kd</label>
+      <input type="number" step="1" id="jogKp" value="10"/>
+      <input type="number" step="0.1" id="jogKd" value="1"/></div>
+    <div class="row">
+      <button class="stop" id="jogHold">⌖ Hold to jog (dead-man)</button></div>
+    <div class="muted">Motion only continues while held. Release (or a network drop)
+      stops the motor after the dead-man window.</div>
+    <div id="jogMsg" class="muted"></div>
+  </section>
+
+  <!-- TELEMETRY -->
+  <section class="card span">
+    <h2>Live telemetry</h2>
+    <table id="telTable">
+      <thead><tr>
+        <th>Joint</th><th>ID</th><th>Model</th><th>Pos</th><th>Vel</th>
+        <th>Torque</th><th>MOS °C</th><th>Rotor °C</th><th>Err</th><th>State</th>
+      </tr></thead>
+      <tbody id="telBody"></tbody>
+    </table>
+  </section>
+</main>
+<footer>M1 hardware config — maintenance-mode CAN tool</footer>
+
+<script>
+let MODE = "maintenance";
+let MAP = {};
+
+async function post(path, obj){
+  try {
+    const r = await fetch(path, {method:"POST",
+      headers:{"Content-Type":"application/json"}, body:JSON.stringify(obj||{})});
+    return {code:r.status, body: await r.json().catch(()=>({}))};
+  } catch(e){ return {code:0, body:{error:String(e)}}; }
+}
+
+/* ---------- mode ---------- */
+document.getElementById("modeMaint").onclick = async ()=>{ await post("/api/mode",{mode:"maintenance"}); poll(); };
+document.getElementById("modeRun").onclick   = async ()=>{ await post("/api/mode",{mode:"run"}); poll(); };
+
+/* ---------- scan ---------- */
+document.getElementById("scanBtn").onclick = async ()=>{
+  const from = +document.getElementById("scanFrom").value;
+  const to   = +document.getElementById("scanTo").value;
+  const r = await post("/api/scan", {from, to});
+  const el = document.getElementById("scanResult");
+  if(r.code !== 200){ el.textContent = "scan refused: "+(r.body.error||r.code); return; }
+  const m = r.body.motors||[];
+  el.innerHTML = m.length ? "Found: " + m.map(x=>
+    `<code>id ${x.id} (${x.model||"?"}${x.joint?" → "+x.joint:""})</code>`).join(" ")
+    : "No motors responded.";
+};
+
+/* ---------- limits ---------- */
+function fillJointSelects(){
+  const names = Object.keys(MAP);
+  for(const id of ["limJoint","jogJoint"]){
+    const sel = document.getElementById(id);
+    const cur = sel.value;
+    sel.innerHTML = names.map(n=>`<option>${n}</option>`).join("");
+    if(names.includes(cur)) sel.value = cur;
+  }
+}
+function syncLimitFields(){
+  const j = document.getElementById("limJoint").value;
+  const sl = (MAP[j]||{}).soft_limits || {};
+  const pos = sl.pos || [0,0];
+  document.getElementById("limPosLo").value = pos[0];
+  document.getElementById("limPosHi").value = pos[1];
+  document.getElementById("limVel").value = sl.vel ?? "";
+  document.getElementById("limEff").value = sl.effort ?? "";
+}
+document.getElementById("limJoint").onchange = syncLimitFields;
+document.getElementById("limSave").onclick = async ()=>{
+  const j = document.getElementById("limJoint").value;
+  const r = await post("/api/limits", {joint:j,
+    pos:[+document.getElementById("limPosLo").value, +document.getElementById("limPosHi").value],
+    vel:+document.getElementById("limVel").value, effort:+document.getElementById("limEff").value});
+  document.getElementById("limMsg").textContent =
+    r.code===200 ? "saved." : ("rejected: "+(r.body.error||r.code));
+};
+
+/* ---------- enable / zero ---------- */
+document.getElementById("enBtn").onclick = async ()=>{
+  const j=document.getElementById("jogJoint").value; await post("/api/enable",{joint:j,on:true}); };
+document.getElementById("disBtn").onclick = async ()=>{
+  const j=document.getElementById("jogJoint").value; await post("/api/enable",{joint:j,on:false}); };
+document.getElementById("zeroBtn").onclick = async ()=>{
+  const j=document.getElementById("jogJoint").value;
+  const r=await post("/api/zero",{joint:j});
+  document.getElementById("jogMsg").textContent = r.code===200?"zeroed.":("refused: "+(r.body.error||r.code));
+};
+
+/* ---------- jog (dead-man: refresh while held) ---------- */
+const jogPos = document.getElementById("jogPos"), jogPosV = document.getElementById("jogPosV");
+jogPos.addEventListener("input", ()=> jogPosV.textContent = (+jogPos.value).toFixed(2));
+let jogging = false;
+async function jogTick(){
+  if(!jogging) return;
+  const j=document.getElementById("jogJoint").value;
+  const r = await post("/api/jog", {joint:j, pos:+jogPos.value, vel:0,
+    kp:+document.getElementById("jogKp").value, kd:+document.getElementById("jogKd").value, hold:true});
+  document.getElementById("jogMsg").textContent =
+    r.code===200 ? "jogging…" : ("refused: "+(r.body.error||r.code));
+}
+setInterval(jogTick, 100);
+const hb = document.getElementById("jogHold");
+const startJog=e=>{ e.preventDefault(); jogging=true; hb.classList.add("held"); jogTick(); };
+const stopJog =e=>{ if(e) e.preventDefault(); jogging=false; hb.classList.remove("held"); };
+hb.addEventListener("mousedown",startJog); hb.addEventListener("mouseup",stopJog);
+hb.addEventListener("mouseleave",stopJog);
+hb.addEventListener("touchstart",startJog,{passive:false}); hb.addEventListener("touchend",stopJog);
+
+/* ---------- live state poll ---------- */
+function applyMode(){
+  const run = MODE==="run";
+  document.getElementById("ownerText").textContent = run ? "run (ros2_control)" : "maintenance";
+  document.getElementById("banner").className = "banner"+(run?" run":"");
+  for(const id of ["scanBtn","limSave","enBtn","disBtn","zeroBtn","jogHold"])
+    document.getElementById(id).disabled = run;
+  if(run) stopJog();
+}
+function tcls(t){ if(t==null) return ""; if(t>=70) return "hot"; if(t>=55) return "warm"; return ""; }
+async function poll(){
+  try{
+    const s = await (await fetch("/api/state")).json();
+    MODE = s.mode; MAP = s.map || {};
+    const dot=document.getElementById("dot"), st=document.getElementById("statusText");
+    if(s.bus_ok){ dot.classList.add("on"); st.textContent = "bus ready"; }
+    else { dot.classList.remove("on"); st.textContent = "no bus"; }
+    applyMode();
+    if(Object.keys(MAP).length && !document.getElementById("limJoint").options.length){
+      fillJointSelects(); syncLimitFields();
+    }
+    const body = document.getElementById("telBody");
+    body.innerHTML = (s.motors||[]).map(m=>{
+      const f = (v,d=3)=> v==null ? "–" : (+v).toFixed(d);
+      return `<tr>
+        <td>${m.joint}</td><td>0x${m.id.toString(16)}</td><td>${m.model}</td>
+        <td>${f(m.pos)}</td><td>${f(m.vel)}</td><td>${f(m.torque,2)}</td>
+        <td class="${tcls(m.t_mos)}">${f(m.t_mos,0)}</td>
+        <td class="${tcls(m.t_rotor)}">${f(m.t_rotor,0)}</td>
+        <td class="${m.err?'err':''}">${m.err??"–"}</td>
+        <td>${m.enabled?"jogging":"idle"}</td></tr>`;
+    }).join("");
+  }catch(e){
+    document.getElementById("dot").classList.remove("on");
+    document.getElementById("statusText").textContent = "panel disconnected";
+  }
+}
+setInterval(poll, 200); poll();
+</script>
+</body>
+</html>

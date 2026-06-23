@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>m1_can_tools</name>
+  <version>0.1.0</version>
+  <description>
+    M1 Damiao CAN bring-up driver and hardware config/test web page: a pure-python
+    DM (MIT/pos-vel/vel) frame codec + per-model limit tables, a pluggable CAN
+    transport (fake/SocketCAN/serial), a maintenance-mode bus owner, and the
+    m1_hwconfig web node (assign/limits/jog/zero/telemetry).
+  </description>
+  <maintainer email="jerry@example.com">jerry</maintainer>
+  <license>Apache-2.0</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <!-- python-can / pyserial are imported lazily only on the real CAN path;
+       they are optional (the codec + offline tests need neither). -->
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
