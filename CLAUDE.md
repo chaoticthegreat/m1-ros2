@@ -43,10 +43,26 @@ even without Drake.
 PYTHONPATH=ros2_ws/src/m1_control /usr/bin/python3 -m m1_control.collision
 PYTHONPATH=ros2_ws/src/m1_control /usr/bin/python3 -m m1_control.trajectory
 
+# Hardware bridge + CAN tool tests (hardware-free):
+PYTHONPATH=ros2_ws/src/m1_control /usr/bin/python3 ros2_ws/src/m1_control/_bridge_test.py
+PYTHONPATH=ros2_ws/src/m1_can_tools /usr/bin/python3 -m pytest ros2_ws/src/m1_can_tools/test -v
+
 # Build the ROS workspace:
 source /opt/ros/jazzy/setup.bash && cd ros2_ws && colcon build --symlink-install
 source install/setup.bash
+
+# Real-hardware / mock ros2_control bring-up (replaces the Isaac sim driver):
+ros2 launch m1_bringup hardware.launch.py use_mock:=true   # offline mock_components
+ros2 launch m1_bringup hardware.launch.py use_mock:=false can_interface:=can0 motor_map:=...  # real Damiao
+ros2 run m1_can_tools m1_hwconfig                            # motor config/test page :8090
 ```
+
+**Real-hardware deployment** lives in **@ros2_ws/HARDWARE.md** (Damiao CAN motors +
+AgileX base; the `m1_hardware` C++ ros2_control plugin, `m1_can_tools` config page,
+and the bridge nodes). Standalone `m1_can_tools` modules need
+`PYTHONPATH=ros2_ws/src/m1_can_tools`. **Cleaning up a launched ros2 stack:** SIGINT
+the `ros2 launch` then sweep leftover PIDs — never `pkill -f <node-name>` (the
+pattern matches your own shell's command line and SIGKILLs your shell).
 
 Use `/run-solver-suite` to run the whole gated suite at once, and `/colcon-build`
 to build. The `kinematics-reviewer` and `solver-suite-runner` subagents exist for

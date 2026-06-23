@@ -287,9 +287,60 @@ real driver; everything in `ros2_ws/` is unchanged.
  (warm cream, serif headings, clay accent). An untouched arm's panel target
  re-syncs to its live fingertip so nudges stay relative to where the arm
  actually is (the lift is a shared compromise when both arms reach).
-- `ros2_ws/src/m1_bringup/launch/bringup.launch.py` — RSP + controller + RViz.
+- `ros2_ws/src/m1_bringup/launch/bringup.launch.py` — RSP + controller + RViz
+  (the **sim** path; consumes Isaac's `/joint_states`).
 - `assets/{ranger_air,openarm}_description` — also ROS 2 packages (symlinked into
   `ros2_ws/src/`); hold URDF + meshes.
+
+## Real-hardware deployment (Damiao CAN motors + AgileX base)
+
+Full guide: **@ros2_ws/HARDWARE.md**. Design + the OpenArm-MoveIt-vs-Drake
+comparison: `docs/superpowers/specs/2026-06-23-real-hardware-deployment-design.md`.
+
+**Decision (hybrid):** reuse OpenArm's Damiao CAN/ros2_control hardware layer; keep
+the Drake position-only IK as the reactive brain; MoveIt is optional/later for
+*planned collision-aware* moves only (it structurally **cannot** express the
+shared-lift-serving-both-arms coupling — KDL is one-chain-one-tip — nor
+position-only reach nor 60 Hz reactive teleop; the Drake brain does all four). The
+arms are customized OpenArm (Damiao DM motors); the base is (likely stock) AgileX
+Ranger Air whose firmware takes only body `Twist` (mode-switched) — `swerve.py`'s
+per-module output can't drive it (memory `agilex-ranger-no-per-module-cmd`).
+
+**The `/m1/*` + `/joint_states` contract is invariant** (27-DOF name order, wheels=
+velocity, rest=position, fingers mimic-coupled), so the brain + all operator nodes
++ all gated suites are UNCHANGED. The real-hardware seam replaces `isaac/ros_sim.py`
+with a `ros2_control` stack + bridges:
+- `m1_hardware/` (NEW, C++) — `M1SystemInterface : hardware_interface::SystemInterface`,
+  forked from `openarm_hardware` + vendored `openarm_can` (Apache-2.0), **ported
+  Humble→Jazzy**, generalized DOF (lift added), per-joint CAN id/model/gains from
+  URDF params. Drives Damiao **MIT mode** over SocketCAN. Loads with NO bus present
+  (logs "no bus / mock I/O"); live motor I/O is the on-hardware checkpoint.
+- `m1_can_tools/` (NEW, Python) — a **hardware-free** byte-exact DM CAN codec
+  (`dm_protocol`), a pluggable `Transport` (fake/socketcan/serial, lazy backends),
+  a maintenance-mode `MotorBus`, and **`m1_hwconfig`** — a web page to scan/assign/
+  zero/limit/jog/test motors (`ros2 run m1_can_tools m1_hwconfig` → :8090). Bus
+  ownership is maintenance (config tool) XOR run (ros2_control) — never both.
+- `m1_control/` adds three pure-function bridge nodes: `m1_joint_bridge`
+  (`/m1/joint_command` → `arm_position_controller`, the 17 commanded upper-body
+  joints; the 2 `finger_joint2` are state-only mimics), `m1_base_bridge`
+  (`/m1/cmd_vel` → AgileX body Twist + motion-mode), `m1_ranger_shim` (AgileX wheel
+  feedback → `/joint_states`).
+- `m1_bringup/` adds `hardware.launch.py` (`use_mock:=true` mock_components default,
+  `use_mock:=false` real plugin, `use_base:=`), `m1.ros2_control.xacro`,
+  `m1_controllers.yaml` (forward_position + JSB + per-arm JTC; `enforce_command_limits`
+  on), `m1_joint_limits.yaml`.
+
+Run: `ros2 launch m1_bringup hardware.launch.py use_mock:=true` (offline) or
+`use_mock:=false can_interface:=can0 motor_map:=…` (real). NB: clean up launches
+with **SIGINT to `ros2 launch`** then a PID sweep — do NOT `pkill -f <node-name>`
+(the pattern matches your own shell's command line and SIGKILLs your shell).
+
+**Validated offline (no hardware):** `m1_can_tools` 34/34; `_bridge_test.py` 15/15;
+mock ros2_control loop (controllers active, brain reach flows brain→bridge→
+controller→mock); real plugin loads + activates with no bus; config page serves;
+**all brain gated suites still green (113/113)**. Deferred to hardware: per-joint
+sign/offset, the live closed loop (command-fingertip ≈ measured), gain tuning, the
+base Twist path. See HARDWARE.md "Deferred live-validation checkpoints".
 
 ## How to run
 
