@@ -1,0 +1,115 @@
+<?xml version="1.0"?>
+<!--
+  M1 ros2_control description for the upper body (lift + dual 7-DOF arms + grippers).
+
+  This xacro emits a single <ros2_control name="m1_arms" type="system"> block for
+  the 19 actuated upper-body joints. The base (steering/wheels) is NOT in this
+  ros2_control system: on real hardware the AgileX firmware owns the swerve base
+  over a Twist interface (see m1_base_bridge / ranger_state_shim), so the base
+  joints are never commanded per-joint here.
+
+  Hardware backend is selected by the `use_mock` xacro arg:
+    * use_mock:=true  (default) -> mock_components/GenericSystem   (offline, no CAN)
+    * use_mock:=false           -> m1_hardware/M1SystemInterface   (real Damiao CAN)
+
+  The 19 joints, IN CANONICAL ORDER (must match controller_node.ALL_JOINTS upper
+  body and config/m1_controllers.yaml arm_position_controller.joints exactly):
+    lift_joint,
+    openarm_left_joint1 .. openarm_left_joint7,
+    openarm_right_joint1 .. openarm_right_joint7,
+    openarm_left_finger_joint1, openarm_left_finger_joint2,
+    openarm_right_finger_joint1, openarm_right_finger_joint2
+
+  17 joints expose a `position` command interface plus position/velocity/effort
+  state; the two finger_joint2 are URDF mimics (state-only — ros2_control forbids
+  command interfaces on mimic joints and auto-propagates them). The Drake brain
+  streams a 60 Hz position setpoint, which the forward_command_controller forwards
+  to the 17 commanded joints.
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- true => mock_components/GenericSystem; false => real m1_hardware plugin -->
+  <xacro:arg name="use_mock" default="true"/>
+
+  <!-- Real-plugin transport params (ignored by the mock backend). Overridable by
+       the launch file when use_mock:=false. The m1_hardware/M1SystemInterface
+       plugin is built by a separate workstream; we only reference it by name and
+       pass placeholder params it will consume. -->
+  <xacro:arg name="can_interface" default="can0"/>
+  <xacro:arg name="can_fd" default="true"/>
+  <xacro:arg name="motor_map" default=""/>
+
+  <!-- Reusable joint macro: position command + pos/vel/effort state. -->
+  <xacro:macro name="m1_joint" params="name">
+    <joint name="${name}">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+  </xacro:macro>
+
+  <!-- State-only macro for URDF mimic joints. ros2_control (Jazzy) forbids a
+       command interface on an activated mimic joint ("Activated mimic joints
+       cannot have command interfaces"); it auto-propagates the leader joint's
+       command/state to the mimic. We still export STATE so the joint is reported
+       in /joint_states (the Drake brain seeds from the full joint set). -->
+  <xacro:macro name="m1_mimic_joint" params="name">
+    <joint name="${name}">
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+  </xacro:macro>
+
+  <ros2_control name="m1_arms" type="system">
+
+    <hardware>
+      <xacro:if value="$(arg use_mock)">
+        <plugin>mock_components/GenericSystem</plugin>
+      </xacro:if>
+      <xacro:unless value="$(arg use_mock)">
+        <!-- Real Damiao CAN backend (built by the m1_hardware workstream). -->
+        <plugin>m1_hardware/M1SystemInterface</plugin>
+        <param name="can_interface">$(arg can_interface)</param>
+        <param name="can_fd">$(arg can_fd)</param>
+        <param name="motor_map">$(arg motor_map)</param>
+      </xacro:unless>
+    </hardware>
+
+    <!-- Shared prismatic lift (serves both arms). -->
+    <xacro:m1_joint name="lift_joint"/>
+
+    <!-- Left arm: joint1 .. joint7. -->
+    <xacro:m1_joint name="openarm_left_joint1"/>
+    <xacro:m1_joint name="openarm_left_joint2"/>
+    <xacro:m1_joint name="openarm_left_joint3"/>
+    <xacro:m1_joint name="openarm_left_joint4"/>
+    <xacro:m1_joint name="openarm_left_joint5"/>
+    <xacro:m1_joint name="openarm_left_joint6"/>
+    <xacro:m1_joint name="openarm_left_joint7"/>
+
+    <!-- Right arm: joint1 .. joint7. -->
+    <xacro:m1_joint name="openarm_right_joint1"/>
+    <xacro:m1_joint name="openarm_right_joint2"/>
+    <xacro:m1_joint name="openarm_right_joint3"/>
+    <xacro:m1_joint name="openarm_right_joint4"/>
+    <xacro:m1_joint name="openarm_right_joint5"/>
+    <xacro:m1_joint name="openarm_right_joint6"/>
+    <xacro:m1_joint name="openarm_right_joint7"/>
+
+    <!-- Grippers. finger_joint2 is URDF mimic-coupled to finger_joint1
+         (multiplier 1, offset 0; right side mirrored in the URDF axis): one
+         physical gripper motor per arm drives the parallel fingers. So
+         finger_joint1 is COMMANDED (the gripper motor) and finger_joint2 is a
+         state-only mimic that ros2_control auto-propagates. The 17 commanded
+         joints below match config/m1_controllers.yaml arm_position_controller.joints
+         and m1_control.joint_command_bridge.UPPER_BODY exactly. -->
+    <xacro:m1_joint name="openarm_left_finger_joint1"/>
+    <xacro:m1_mimic_joint name="openarm_left_finger_joint2"/>
+    <xacro:m1_joint name="openarm_right_finger_joint1"/>
+    <xacro:m1_mimic_joint name="openarm_right_finger_joint2"/>
+
+  </ros2_control>
+
+</robot>

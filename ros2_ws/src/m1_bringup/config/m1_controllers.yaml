@@ -1,0 +1,102 @@
+# M1 ros2_control controller configuration (upper body: lift + arms + grippers).
+#
+# Loaded by the controller_manager (ros2_control_node). Pairs with
+# urdf/m1_hardware.urdf.xacro (the m1_arms <ros2_control> system, 19 joints).
+#
+# Controllers:
+#   joint_state_broadcaster  - publishes /joint_states for the 19 system joints.
+#   arm_position_controller  - forward_command_controller streaming the Drake
+#                              brain's 60 Hz position setpoint to the 17 COMMANDED
+#                              joints (lift + 14 arm + 2 gripper finger_joint1).
+#                              The two finger_joint2 are URDF mimics (state-only,
+#                              auto-propagated by ros2_control). This is the
+#                              reactive control path (NOT a JTC: no
+#                              time-parameterized splining of a streamed setpoint).
+#   left_arm_jtc / right_arm_jtc - joint_trajectory_controllers over each arm's 7
+#                              joints, for LATER planned/collision-aware moves
+#                              (MoveIt, Phase 3). Loaded but hot-swapped in only
+#                              when planning; not on the reactive path.
+#
+# The arm_position_controller joint list is the canonical 19-joint upper-body
+# order and MUST match urdf/m1.ros2_control.xacro and the brain's contract.
+
+controller_manager:
+  ros__parameters:
+    update_rate: 200  # Hz
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    arm_position_controller:
+      type: forward_command_controller/ForwardCommandController
+
+    left_arm_jtc:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+    right_arm_jtc:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+# ---------------------------------------------------------------------------
+# Reactive position forwarding controller (Drake brain -> hardware).
+# 17 COMMANDED joints, canonical order. The two finger_joint2 are URDF mimics
+# (state-only) and are NOT commanded here -- ros2_control auto-propagates them
+# from finger_joint1. This list MUST match m1.ros2_control.xacro's commanded
+# joints and m1_control.joint_command_bridge.UPPER_BODY exactly.
+# ---------------------------------------------------------------------------
+arm_position_controller:
+  ros__parameters:
+    interface_name: position
+    joints:
+      - lift_joint
+      - openarm_left_joint1
+      - openarm_left_joint2
+      - openarm_left_joint3
+      - openarm_left_joint4
+      - openarm_left_joint5
+      - openarm_left_joint6
+      - openarm_left_joint7
+      - openarm_right_joint1
+      - openarm_right_joint2
+      - openarm_right_joint3
+      - openarm_right_joint4
+      - openarm_right_joint5
+      - openarm_right_joint6
+      - openarm_right_joint7
+      - openarm_left_finger_joint1
+      - openarm_right_finger_joint1
+
+# ---------------------------------------------------------------------------
+# Per-arm trajectory controllers for planned moves (inactive on the reactive
+# path; hot-swapped in for MoveIt/JTC point-to-point motion in Phase 3).
+# ---------------------------------------------------------------------------
+left_arm_jtc:
+  ros__parameters:
+    joints:
+      - openarm_left_joint1
+      - openarm_left_joint2
+      - openarm_left_joint3
+      - openarm_left_joint4
+      - openarm_left_joint5
+      - openarm_left_joint6
+      - openarm_left_joint7
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+
+right_arm_jtc:
+  ros__parameters:
+    joints:
+      - openarm_right_joint1
+      - openarm_right_joint2
+      - openarm_right_joint3
+      - openarm_right_joint4
+      - openarm_right_joint5
+      - openarm_right_joint6
+      - openarm_right_joint7
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity

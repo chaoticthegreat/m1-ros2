@@ -1,0 +1,37 @@
+<?xml version="1.0"?>
+<!--
+  Top-level M1 hardware robot_description.
+
+  Combines:
+    1. the existing flat ranger_air_description URDF (full 27-DOF kinematics +
+       meshes: swerve base, lift, dual OpenArm arms, grippers), and
+    2. the m1.ros2_control.xacro <ros2_control> block for the 19 upper-body joints.
+
+  The ranger_air URDF is a plain .urdf (valid XML); xacro:include merges its links
+  and joints into this document. Its <robot name="..."> attribute is ignored — the
+  name of THIS top-level robot ("m1") is used.
+
+  The include resolves ranger_air_description via the ament index ($(find ...)) so
+  it works in the installed/sourced workspace (the package installs to its own
+  prefix, so a path relative to share/m1_bringup would not reach it).
+
+  Hardware backend selected by the `use_mock` arg (default true => mock_components),
+  forwarded to m1.ros2_control.xacro:
+    xacro m1_hardware.urdf.xacro use_mock:=true    # offline / mock
+    xacro m1_hardware.urdf.xacro use_mock:=false   # real Damiao CAN plugin
+-->
+<robot name="m1" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- Backend + real-plugin transport args, forwarded to the ros2_control xacro. -->
+  <xacro:arg name="use_mock" default="true"/>
+  <xacro:arg name="can_interface" default="can0"/>
+  <xacro:arg name="can_fd" default="true"/>
+  <xacro:arg name="motor_map" default=""/>
+
+  <!-- 1. Full robot kinematics + meshes (flat .urdf, merged by xacro). -->
+  <xacro:include filename="$(find ranger_air_description)/urdf/ranger_air_description.urdf"/>
+
+  <!-- 2. ros2_control system for the 19 upper-body joints. -->
+  <xacro:include filename="$(find m1_bringup)/urdf/m1.ros2_control.xacro"/>
+
+</robot>

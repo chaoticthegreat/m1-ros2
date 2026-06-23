@@ -43,6 +43,9 @@ setup(
             "m1_teleop = m1_control.teleop_node:main",
             "m1_web = m1_control.web_node:main",
             "m1_quest = m1_control.quest_node:main",
+            "m1_joint_bridge = m1_control.joint_command_bridge:main",
+            "m1_base_bridge = m1_control.base_bridge:main",
+            "m1_ranger_shim = m1_control.ranger_state_shim:main",
         ],
     },
 )
