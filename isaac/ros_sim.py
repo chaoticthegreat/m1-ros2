@@ -43,7 +43,13 @@ JOINT_COMMAND_TOPIC = "m1/joint_command"
 WHEEL_KP, WHEEL_KD = 0.0, 2500.0       # velocity drive (kp must stay 0)
 STEER_KP, STEER_KD = 700.0, 180.0
 LIFT_KP, LIFT_KD = 30000.0, 3000.0
-ARM_KP, ARM_KD = 9000.0, 900.0
+# Arm position-drive stiffness. Raised 9000->30000 (KD scaled with it): at 9000
+# the simulated arm sagged ~3-4 cm under gravity at a near-max-reach (nearly fully
+# extended) posture, so even a perfectly-correct joint command read amber/red in
+# the reach viz. The controller command is right; this just lets the SIM arm
+# actually hold it (the real robot's stiff drives track far better). The lift
+# already uses 30000 and is stable at 120 Hz.
+ARM_KP, ARM_KD = 30000.0, 2000.0
 GRIP_KP, GRIP_KD = 400.0, 40.0
 PHYSICS_HZ = 120.0
 

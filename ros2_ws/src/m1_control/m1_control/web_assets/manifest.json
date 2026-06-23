@@ -3,147 +3,147 @@
  "links": [
   {
    "link": "base_link",
-   "mesh": "/meshes/9829cd6fad.glb"
+   "mesh": "/meshes/9829cd6fad.glb?v=9ed27917"
   },
   {
    "link": "imu_link",
-   "mesh": "/meshes/116dc20fcb.glb"
+   "mesh": "/meshes/116dc20fcb.glb?v=e0b64d46"
   },
   {
    "link": "front_lidar_link",
-   "mesh": "/meshes/4e6ecf1819.glb"
+   "mesh": "/meshes/4e6ecf1819.glb?v=a3c25e80"
   },
   {
    "link": "back_lidar_link",
-   "mesh": "/meshes/359e389e7e.glb"
+   "mesh": "/meshes/359e389e7e.glb?v=d7d297fc"
   },
   {
    "link": "camera_link",
-   "mesh": "/meshes/d910ac203c.glb"
+   "mesh": "/meshes/d910ac203c.glb?v=7107c30b"
   },
   {
    "link": "fl_steering_link",
-   "mesh": "/meshes/dcb4ea42c6.glb"
+   "mesh": "/meshes/dcb4ea42c6.glb?v=2b6b2902"
   },
   {
    "link": "fl_wheel_link",
-   "mesh": "/meshes/76ce0cda02.glb"
+   "mesh": "/meshes/76ce0cda02.glb?v=3ea54473"
   },
   {
    "link": "fr_steering_link",
-   "mesh": "/meshes/7232b420cd.glb"
+   "mesh": "/meshes/7232b420cd.glb?v=2dd77f56"
   },
   {
    "link": "fr_wheel_link",
-   "mesh": "/meshes/221b87946c.glb"
+   "mesh": "/meshes/221b87946c.glb?v=5fb915fd"
   },
   {
    "link": "rr_steering_link",
-   "mesh": "/meshes/78f85391ba.glb"
+   "mesh": "/meshes/78f85391ba.glb?v=e22a4a99"
   },
   {
    "link": "rr_wheel_link",
-   "mesh": "/meshes/54ae45e73e.glb"
+   "mesh": "/meshes/54ae45e73e.glb?v=e3c8a533"
   },
   {
    "link": "rl_steering_link",
-   "mesh": "/meshes/e6dfb5f91b.glb"
+   "mesh": "/meshes/e6dfb5f91b.glb?v=d4722896"
   },
   {
    "link": "rl_wheel_link",
-   "mesh": "/meshes/316df2e68d.glb"
+   "mesh": "/meshes/316df2e68d.glb?v=d55eb450"
   },
   {
    "link": "lift_base_link",
-   "mesh": "/meshes/3fba1bc6a0.glb"
+   "mesh": "/meshes/3fba1bc6a0.glb?v=51441084"
   },
   {
    "link": "lift_link",
-   "mesh": "/meshes/b65fd926d3.glb"
+   "mesh": "/meshes/b65fd926d3.glb?v=d096cab0"
   },
   {
    "link": "openarm_body_link0",
-   "mesh": "/meshes/b6a19a0437.glb"
+   "mesh": "/meshes/b6a19a0437.glb?v=e6dc336b"
   },
   {
    "link": "openarm_left_base_link",
-   "mesh": "/meshes/514d760237.glb"
+   "mesh": "/meshes/514d760237.glb?v=e693f92a"
   },
   {
    "link": "openarm_left_link1",
-   "mesh": "/meshes/d498603198.glb"
+   "mesh": "/meshes/d498603198.glb?v=ed0d49ac"
   },
   {
    "link": "openarm_left_link2",
-   "mesh": "/meshes/365fd9fefa.glb"
+   "mesh": "/meshes/365fd9fefa.glb?v=774fdf7c"
   },
   {
    "link": "openarm_left_link3",
-   "mesh": "/meshes/3dd77c62aa.glb"
+   "mesh": "/meshes/3dd77c62aa.glb?v=51ebb0a0"
   },
   {
    "link": "openarm_left_link4",
-   "mesh": "/meshes/88bb767263.glb"
+   "mesh": "/meshes/88bb767263.glb?v=5debf8a8"
   },
   {
    "link": "openarm_left_link5",
-   "mesh": "/meshes/c9ca6b262f.glb"
+   "mesh": "/meshes/c9ca6b262f.glb?v=3e71422c"
   },
   {
    "link": "openarm_left_link6",
-   "mesh": "/meshes/ed2e33bab8.glb"
+   "mesh": "/meshes/ed2e33bab8.glb?v=3ae3ee9c"
   },
   {
    "link": "openarm_left_ee_base_link",
-   "mesh": "/meshes/7231cfe347.glb"
+   "mesh": "/meshes/7231cfe347.glb?v=8f7f3722"
   },
   {
    "link": "openarm_left_ee_link1",
-   "mesh": "/meshes/caa8ee3386.glb"
+   "mesh": "/meshes/caa8ee3386.glb?v=5412fab5"
   },
   {
    "link": "openarm_left_ee_link2",
-   "mesh": "/meshes/41dd34a6a4.glb"
+   "mesh": "/meshes/41dd34a6a4.glb?v=4dfcf1df"
   },
   {
    "link": "openarm_right_base_link",
-   "mesh": "/meshes/df568cb0e1.glb"
+   "mesh": "/meshes/df568cb0e1.glb?v=6499769e"
   },
   {
    "link": "openarm_right_link1",
-   "mesh": "/meshes/0a1aae2dd8.glb"
+   "mesh": "/meshes/0a1aae2dd8.glb?v=b1d6e977"
   },
   {
    "link": "openarm_right_link2",
-   "mesh": "/meshes/a4964de0ed.glb"
+   "mesh": "/meshes/a4964de0ed.glb?v=da773b9f"
   },
   {
    "link": "openarm_right_link3",
-   "mesh": "/meshes/3dd77c62aa.glb"
+   "mesh": "/meshes/3dd77c62aa.glb?v=51ebb0a0"
   },
   {
    "link": "openarm_right_link4",
-   "mesh": "/meshes/88bb767263.glb"
+   "mesh": "/meshes/88bb767263.glb?v=5debf8a8"
   },
   {
    "link": "openarm_right_link5",
-   "mesh": "/meshes/1ec7ab88b4.glb"
+   "mesh": "/meshes/1ec7ab88b4.glb?v=8e4238e8"
   },
   {
    "link": "openarm_right_link6",
-   "mesh": "/meshes/9cdf2151c9.glb"
+   "mesh": "/meshes/9cdf2151c9.glb?v=4def1be1"
   },
   {
    "link": "openarm_right_ee_base_link",
-   "mesh": "/meshes/20297bff60.glb"
+   "mesh": "/meshes/20297bff60.glb?v=0c05fd2e"
   },
   {
    "link": "openarm_right_ee_link1",
-   "mesh": "/meshes/efc3b77208.glb"
+   "mesh": "/meshes/efc3b77208.glb?v=36ad5bec"
   },
   {
    "link": "openarm_right_ee_link2",
-   "mesh": "/meshes/84b0277ccd.glb"
+   "mesh": "/meshes/84b0277ccd.glb?v=461a1345"
   }
  ]
 }
