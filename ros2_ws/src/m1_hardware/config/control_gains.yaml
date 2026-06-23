@@ -1,0 +1,40 @@
+# M1 Damiao MIT-mode per-joint control gains.
+#
+# These are the kp/kd impedance gains written in every MIT command frame
+# (write() sends {kp, kd, pos_cmd, vel=0, tau=0}). Ranges: kp in [0, 500],
+# kd in [0, 5] (the Damiao MIT field quantization range). Values below are
+# reasonable DM defaults adapted from OpenArm's V10 arm gains plus a stiff
+# lift; tune on hardware against sag / overshoot before trusting them.
+#
+# The hardware plugin reads gains from the URDF <ros2_control> <joint> <param>s
+# (kp/kd). This file is the source those params are generated from / kept in
+# sync with, and a human-readable reference for the bring-up web page.
+#
+# motor_model is informational here (the URDF param drives the [P,V,T]MAX
+# scaling); listed so the gain choice is traceable to the motor.
+
+m1_gains:
+  # --- shared prismatic lift (one DM motor feeding both arms) ---------------
+  lift_joint:        { motor_model: DM8009, kp: 120.0, kd: 3.0 }   # heavy, stiff hold
+
+  # --- left arm (proximal -> distal): big joints stiff, wrist soft ---------
+  openarm_left_joint1:  { motor_model: DM8009, kp: 70.0, kd: 2.75 }
+  openarm_left_joint2:  { motor_model: DM8009, kp: 70.0, kd: 2.5 }
+  openarm_left_joint3:  { motor_model: DM4340, kp: 70.0, kd: 2.0 }
+  openarm_left_joint4:  { motor_model: DM4340, kp: 60.0, kd: 2.0 }
+  openarm_left_joint5:  { motor_model: DM4310, kp: 10.0, kd: 0.7 }
+  openarm_left_joint6:  { motor_model: DM4310, kp: 10.0, kd: 0.6 }
+  openarm_left_joint7:  { motor_model: DM4310, kp: 10.0, kd: 0.5 }
+
+  # --- right arm (mirror of left) ------------------------------------------
+  openarm_right_joint1: { motor_model: DM8009, kp: 70.0, kd: 2.75 }
+  openarm_right_joint2: { motor_model: DM8009, kp: 70.0, kd: 2.5 }
+  openarm_right_joint3: { motor_model: DM4340, kp: 70.0, kd: 2.0 }
+  openarm_right_joint4: { motor_model: DM4340, kp: 60.0, kd: 2.0 }
+  openarm_right_joint5: { motor_model: DM4310, kp: 10.0, kd: 0.7 }
+  openarm_right_joint6: { motor_model: DM4310, kp: 10.0, kd: 0.6 }
+  openarm_right_joint7: { motor_model: DM4310, kp: 10.0, kd: 0.5 }
+
+  # --- grippers (light, soft) ----------------------------------------------
+  openarm_left_finger_joint1:  { motor_model: DM4310, kp: 5.0, kd: 0.1 }
+  openarm_right_finger_joint1: { motor_model: DM4310, kp: 5.0, kd: 0.1 }

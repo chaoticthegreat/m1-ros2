@@ -1,0 +1,12 @@
+<library path="m1_hardware">
+  <class name="m1_hardware/M1SystemInterface"
+         type="m1_hardware::M1SystemInterface"
+         base_class_type="hardware_interface::SystemInterface">
+    <description>
+      ros2_control SystemInterface for the M1 robot's Damiao (DM) CAN motors
+      (dual OpenArm arms + shared prismatic lift). MIT-mode SocketCAN control;
+      per-joint CAN id / master id / motor model / gains read from the URDF
+      ros2_control parameters. Loads without a CAN bus present (mock I/O).
+    </description>
+  </class>
+</library>

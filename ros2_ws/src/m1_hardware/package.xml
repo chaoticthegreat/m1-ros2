@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>m1_hardware</name>
+  <version>0.1.0</version>
+  <description>
+    ros2_control SystemInterface for the M1 robot's Damiao (DM) CAN motors
+    (dual 7-DOF OpenArm arms + shared prismatic lift). MIT-mode SocketCAN
+    driver, forked from OpenArm's openarm_hardware and ported to ROS 2 Jazzy;
+    the Damiao CAN codec (openarm_can, Apache-2.0) is vendored under vendor/.
+    Joint set, CAN ids, motor models and gains are read from the URDF
+    ros2_control parameters (no hardcoded DOF), so an arbitrary joint set
+    including the lift is supported.
+  </description>
+  <maintainer email="dev@example.com">M1 Team</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>rclcpp_lifecycle</depend>
+  <depend>hardware_interface</depend>
+  <depend>pluginlib</depend>
+
+  <test_depend>ament_cmake_gtest</test_depend>
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
