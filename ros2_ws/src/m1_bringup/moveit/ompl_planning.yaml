@@ -1,0 +1,113 @@
+# M1 OMPL planning config.
+#
+# MoveItConfigsBuilder merges this with moveit_configs_utils' default OMPL config
+# (planning_plugins, request/response adapters, and the planner_configs catalog
+# from ompl_defaults.yaml). Here we only set the per-group planner selection +
+# projection, the standard MoveIt setup-assistant output.
+#
+# All three planning groups use the standard geometric planner set. RRTConnect is
+# the default planner (fast, reliable for these low-DOF / joint-space problems).
+# both_arms_lift is a JOINT-SPACE group (15 DOF incl. the shared lift); OMPL plans
+# it directly in joint space (no IK), which is exactly why it has no kinematics
+# solver -- see m1.srdf / kinematics.yaml.
+
+planning_plugins:
+  - ompl_interface/OMPLPlanner
+
+request_adapters:
+  - default_planning_request_adapters/ResolveConstraintFrames
+  - default_planning_request_adapters/ValidateWorkspaceBounds
+  - default_planning_request_adapters/CheckStartStateBounds
+  - default_planning_request_adapters/CheckStartStateCollision
+
+response_adapters:
+  - default_planning_response_adapters/AddTimeOptimalParameterization
+  - default_planning_response_adapters/ValidateSolution
+  - default_planning_response_adapters/DisplayMotionPath
+
+left_arm:
+  planner_configs:
+    - AnytimePathShortening
+    - SBL
+    - EST
+    - LBKPIECE
+    - BKPIECE
+    - KPIECE
+    - RRT
+    - RRTConnect
+    - RRTstar
+    - TRRT
+    - PRM
+    - PRMstar
+    - FMT
+    - BFMT
+    - PDST
+    - STRIDE
+    - BiTRRT
+    - LBTRRT
+    - BiEST
+    - ProjEST
+    - LazyPRM
+    - LazyPRMstar
+    - SPARS
+    - SPARStwo
+  projection_evaluator: joints(openarm_left_joint1,openarm_left_joint2)
+  longest_valid_segment_fraction: 0.005
+
+right_arm:
+  planner_configs:
+    - AnytimePathShortening
+    - SBL
+    - EST
+    - LBKPIECE
+    - BKPIECE
+    - KPIECE
+    - RRT
+    - RRTConnect
+    - RRTstar
+    - TRRT
+    - PRM
+    - PRMstar
+    - FMT
+    - BFMT
+    - PDST
+    - STRIDE
+    - BiTRRT
+    - LBTRRT
+    - BiEST
+    - ProjEST
+    - LazyPRM
+    - LazyPRMstar
+    - SPARS
+    - SPARStwo
+  projection_evaluator: joints(openarm_right_joint1,openarm_right_joint2)
+  longest_valid_segment_fraction: 0.005
+
+both_arms_lift:
+  planner_configs:
+    - AnytimePathShortening
+    - SBL
+    - EST
+    - LBKPIECE
+    - BKPIECE
+    - KPIECE
+    - RRT
+    - RRTConnect
+    - RRTstar
+    - TRRT
+    - PRM
+    - PRMstar
+    - FMT
+    - BFMT
+    - PDST
+    - STRIDE
+    - BiTRRT
+    - LBTRRT
+    - BiEST
+    - ProjEST
+    - LazyPRM
+    - LazyPRMstar
+    - SPARS
+    - SPARStwo
+  projection_evaluator: joints(lift_joint,openarm_left_joint1)
+  longest_valid_segment_fraction: 0.005

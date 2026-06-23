@@ -1,0 +1,113 @@
+# M1 MoveIt joint_limits.yaml.
+#
+# MoveIt's time-parameterization (the AddTimeOptimalParameterization response
+# adapter) reads these to time-scale a planned trajectory. The per-joint
+# position/velocity/effort/acceleration values are IDENTICAL to
+# config/m1_joint_limits.yaml (which ros2_control's enforce_command_limits uses)
+# -- both ultimately come from the URDF <limit> tags
+# (assets/ranger_air_description/urdf/ranger_air_description.urdf), the single
+# source of truth. Keep the two in sync.
+#
+# default_*_scaling_factor downscales planned motion for safety (raise toward 1.0
+# for full speed); these are the MoveIt-conventional conservative defaults.
+
+default_velocity_scaling_factor: 0.1
+default_acceleration_scaling_factor: 0.1
+
+joint_limits:
+
+  # Shared prismatic lift (metres / m/s / m/s^2).
+  lift_joint:
+    has_position_limits: true
+    min_position: 0.0
+    max_position: 0.85
+    has_velocity_limits: true
+    max_velocity: 0.25
+    has_acceleration_limits: true
+    max_acceleration: 1.0
+
+  # ----- Left arm (radians / rad/s / rad/s^2) -----
+  openarm_left_joint1:
+    has_velocity_limits: true
+    max_velocity: 16.755
+    has_acceleration_limits: true
+    max_acceleration: 20.0
+  openarm_left_joint2:
+    has_velocity_limits: true
+    max_velocity: 16.755
+    has_acceleration_limits: true
+    max_acceleration: 20.0
+  openarm_left_joint3:
+    has_velocity_limits: true
+    max_velocity: 5.4454
+    has_acceleration_limits: true
+    max_acceleration: 20.0
+  openarm_left_joint4:
+    has_velocity_limits: true
+    max_velocity: 5.4454
+    has_acceleration_limits: true
+    max_acceleration: 20.0
+  openarm_left_joint5:
+    has_velocity_limits: true
+    max_velocity: 20.944
+    has_acceleration_limits: true
+    max_acceleration: 20.0
+  openarm_left_joint6:
+    has_velocity_limits: true
+    max_velocity: 20.944
+    has_acceleration_limits: true
+    max_acceleration: 20.0
+  openarm_left_joint7:
+    has_velocity_limits: true
+    max_velocity: 20.944
+    has_acceleration_limits: true
+    max_acceleration: 20.0
+
+  # ----- Right arm (radians / rad/s / rad/s^2) -----
+  openarm_right_joint1:
+    has_velocity_limits: true
+    max_velocity: 16.755
+    has_acceleration_limits: true
+    max_acceleration: 20.0
+  openarm_right_joint2:
+    has_velocity_limits: true
+    max_velocity: 16.755
+    has_acceleration_limits: true
+    max_acceleration: 20.0
+  openarm_right_joint3:
+    has_velocity_limits: true
+    max_velocity: 5.4454
+    has_acceleration_limits: true
+    max_acceleration: 20.0
+  openarm_right_joint4:
+    has_velocity_limits: true
+    max_velocity: 5.4454
+    has_acceleration_limits: true
+    max_acceleration: 20.0
+  openarm_right_joint5:
+    has_velocity_limits: true
+    max_velocity: 20.944
+    has_acceleration_limits: true
+    max_acceleration: 20.0
+  openarm_right_joint6:
+    has_velocity_limits: true
+    max_velocity: 20.944
+    has_acceleration_limits: true
+    max_acceleration: 20.0
+  openarm_right_joint7:
+    has_velocity_limits: true
+    max_velocity: 20.944
+    has_acceleration_limits: true
+    max_acceleration: 20.0
+
+  # ----- Grippers (radians / rad/s / rad/s^2). finger_joint2 mimics joint1. -----
+  openarm_left_finger_joint1:
+    has_velocity_limits: true
+    max_velocity: 5.0
+    has_acceleration_limits: true
+    max_acceleration: 10.0
+  openarm_right_finger_joint1:
+    has_velocity_limits: true
+    max_velocity: 5.0
+    has_acceleration_limits: true
+    max_acceleration: 10.0

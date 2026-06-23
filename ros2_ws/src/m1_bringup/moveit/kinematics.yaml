@@ -1,0 +1,22 @@
+# M1 MoveIt kinematics solver config.
+#
+# KDL inverse kinematics for the two PER-ARM serial chains. Each is one chain ->
+# one tip (openarm_*_base_link -> openarm_*_ee_base_link), which is what KDL needs.
+#
+# NB: there is intentionally NO entry for `both_arms_lift`. That group is a
+# joint-space planning group (lift + 14 arm joints) whose tree BRANCHES into two
+# fingertips; KDL cannot invert a branching multi-tip group (design spec sec.2).
+# Planned moves for that group are joint-space goals only -- no IK is needed or
+# possible. See m1.srdf's both_arms_lift comment.
+#
+# resolution / timeout match the OpenArm reference config (0.005 each).
+
+left_arm:
+  kinematics_solver: kdl_kinematics_plugin/KDLKinematicsPlugin
+  kinematics_solver_search_resolution: 0.005
+  kinematics_solver_timeout: 0.005
+
+right_arm:
+  kinematics_solver: kdl_kinematics_plugin/KDLKinematicsPlugin
+  kinematics_solver_search_resolution: 0.005
+  kinematics_solver_timeout: 0.005

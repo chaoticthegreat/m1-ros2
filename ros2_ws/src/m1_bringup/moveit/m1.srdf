@@ -1,0 +1,240 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  M1 MoveIt 2 semantic robot description (SRDF).
+
+  SCOPE: PLANNED, COLLISION-AWARE point-to-point moves ONLY. This is NOT the
+  reactive teleop path (that stays on the Drake position-only IK brain
+  m1_control/kinematics.py) and is untouched by MoveIt. MoveIt here is the
+  optional, additive Phase-3 planner: per-arm KDL IK for Cartesian goals, plus a
+  joint-space group for planned moves where the shared lift participates.
+
+  Adapted from openarm_bimanual_moveit_config (Apache-2.0, Enactic Inc.) for the
+  M1 robot (dual OpenArm arms on a shared prismatic lift + AgileX swerve base).
+  Link/joint names verified against
+  assets/ranger_air_description/urdf/ranger_air_description.urdf.
+
+  Planning groups:
+    * left_arm  / right_arm  : 7-DOF serial chains, ONE chain to ONE tip, so KDL
+      can invert them (see kinematics.yaml). These solve Cartesian pose goals.
+    * both_arms_lift : a JOINT-SPACE group (lift_joint + all 14 arm joints) with
+      NO kinematics solver. See the inline note on that group for WHY it has no IK
+      and what it is for.
+-->
+<robot name="m1">
+
+    <!-- ===================================================================
+         left_arm: serial chain, openarm_left_base_link -> left fingertip base.
+         This is one chain with a single tip, so KDLKinematicsPlugin can solve
+         its inverse kinematics (kinematics.yaml). The 7 left arm joints are the
+         only active joints in the chain (the mount joints above link1 are fixed).
+         ================================================================== -->
+    <group name="left_arm">
+        <chain base_link="openarm_left_base_link" tip_link="openarm_left_ee_base_link"/>
+    </group>
+
+    <!-- ===================================================================
+         right_arm: serial chain, openarm_right_base_link -> right fingertip base.
+         Symmetric to left_arm; KDL-invertible.
+         ================================================================== -->
+    <group name="right_arm">
+        <chain base_link="openarm_right_base_link" tip_link="openarm_right_ee_base_link"/>
+    </group>
+
+    <!-- ===================================================================
+         both_arms_lift: JOINT-SPACE planning group (NO kinematics solver).
+
+         Members: lift_joint + the 14 arm joints (7 left + 7 right).
+
+         WHY NO IK SOLVER (see design spec sec.2 "Why not pure-MoveIt" / plan
+         Part 3): the shared lift is ONE physical prismatic joint that feeds BOTH
+         arms, so the kinematic tree below the lift BRANCHES into two tips
+         (left fingertip and right fingertip). MoveIt's per-chain IK
+         (KDLKinematicsPlugin, and every solver MoveIt ships) requires exactly
+         ONE serial chain -> ONE tip per group; a branching multi-tip group is not
+         a serial chain and KDL rejects it outright. There is also no concept in
+         MoveIt of a single DOF (the lift) resolved as the least-squares
+         compromise that best serves two independent single-tip IK groups; that
+         coupled solve is exactly what the Drake brain does and MoveIt cannot.
+
+         Therefore this group is for OMPL JOINT-SPACE planning ONLY: you give it a
+         joint configuration goal (all 15 joint values, lift included) and OMPL
+         plans a collision-free path in joint space. You do NOT give it a Cartesian
+         pose goal (no IK to invert one). Cartesian goals go to left_arm/right_arm,
+         which keep the lift fixed.
+         ================================================================== -->
+    <group name="both_arms_lift">
+        <joint name="lift_joint"/>
+        <joint name="openarm_left_joint1"/>
+        <joint name="openarm_left_joint2"/>
+        <joint name="openarm_left_joint3"/>
+        <joint name="openarm_left_joint4"/>
+        <joint name="openarm_left_joint5"/>
+        <joint name="openarm_left_joint6"/>
+        <joint name="openarm_left_joint7"/>
+        <joint name="openarm_right_joint1"/>
+        <joint name="openarm_right_joint2"/>
+        <joint name="openarm_right_joint3"/>
+        <joint name="openarm_right_joint4"/>
+        <joint name="openarm_right_joint5"/>
+        <joint name="openarm_right_joint6"/>
+        <joint name="openarm_right_joint7"/>
+    </group>
+
+    <!-- ===================================================================
+         Gripper groups (one commanded finger joint each; finger_joint2 is a URDF
+         mimic and is declared passive below).
+         ================================================================== -->
+    <group name="left_gripper">
+        <joint name="openarm_left_finger_joint1"/>
+    </group>
+    <group name="right_gripper">
+        <joint name="openarm_right_finger_joint1"/>
+    </group>
+
+    <!-- ===================================================================
+         Named states (home = all zeros).
+         ================================================================== -->
+    <group_state name="home" group="left_arm">
+        <joint name="openarm_left_joint1" value="0"/>
+        <joint name="openarm_left_joint2" value="0"/>
+        <joint name="openarm_left_joint3" value="0"/>
+        <joint name="openarm_left_joint4" value="0"/>
+        <joint name="openarm_left_joint5" value="0"/>
+        <joint name="openarm_left_joint6" value="0"/>
+        <joint name="openarm_left_joint7" value="0"/>
+    </group_state>
+    <group_state name="home" group="right_arm">
+        <joint name="openarm_right_joint1" value="0"/>
+        <joint name="openarm_right_joint2" value="0"/>
+        <joint name="openarm_right_joint3" value="0"/>
+        <joint name="openarm_right_joint4" value="0"/>
+        <joint name="openarm_right_joint5" value="0"/>
+        <joint name="openarm_right_joint6" value="0"/>
+        <joint name="openarm_right_joint7" value="0"/>
+    </group_state>
+    <group_state name="home" group="both_arms_lift">
+        <joint name="lift_joint" value="0"/>
+        <joint name="openarm_left_joint1" value="0"/>
+        <joint name="openarm_left_joint2" value="0"/>
+        <joint name="openarm_left_joint3" value="0"/>
+        <joint name="openarm_left_joint4" value="0"/>
+        <joint name="openarm_left_joint5" value="0"/>
+        <joint name="openarm_left_joint6" value="0"/>
+        <joint name="openarm_left_joint7" value="0"/>
+        <joint name="openarm_right_joint1" value="0"/>
+        <joint name="openarm_right_joint2" value="0"/>
+        <joint name="openarm_right_joint3" value="0"/>
+        <joint name="openarm_right_joint4" value="0"/>
+        <joint name="openarm_right_joint5" value="0"/>
+        <joint name="openarm_right_joint6" value="0"/>
+        <joint name="openarm_right_joint7" value="0"/>
+    </group_state>
+
+    <!-- ===================================================================
+         End effectors.
+         ================================================================== -->
+    <end_effector name="left_ee" parent_link="openarm_left_ee_base_link" group="left_gripper"/>
+    <end_effector name="right_ee" parent_link="openarm_right_ee_base_link" group="right_gripper"/>
+
+    <!-- ===================================================================
+         Passive joints (URDF mimics; not directly commandable / planned).
+         ================================================================== -->
+    <passive_joint name="openarm_left_finger_joint2"/>
+    <passive_joint name="openarm_right_finger_joint2"/>
+
+    <!-- ===================================================================
+         Disable-collision matrix.
+
+         (A) Within each arm chain: adjacent links (copied from OpenArm). These
+             are always touching by construction, so never collision-check them.
+         (B) Arm <-> shared mount/lift adjacency: link1 of each arm is bolted to
+             its base_link which is bolted to openarm_body_link0 (the shared mount
+             carried by the lift). openarm_body_link0 sits right between the two
+             arm bases, so it is "adjacent" to both link1s; disable those pairs
+             so the static mount never reads as a constant collision against the
+             arms' first links. The lift_link/lift_base_link carry the mount and
+             never move relative to it within a plan, so disable them vs the body
+             and the two arm bases too.
+         (C) Cross-arm bases: the two arm bases (and the body mount between them)
+             are rigidly co-located, so disable base<->base and base<->body. The
+             MOVING arm links across arms are intentionally LEFT ENABLED so a
+             genuine cross-arm collision during a planned move is caught.
+         ================================================================== -->
+
+    <!-- (A) Left arm adjacent -->
+    <disable_collisions link1="openarm_left_base_link" link2="openarm_left_link1" reason="Adjacent"/>
+    <disable_collisions link1="openarm_left_link1" link2="openarm_left_link2" reason="Adjacent"/>
+    <disable_collisions link1="openarm_left_link2" link2="openarm_left_link3" reason="Adjacent"/>
+    <disable_collisions link1="openarm_left_link3" link2="openarm_left_link4" reason="Adjacent"/>
+    <disable_collisions link1="openarm_left_link4" link2="openarm_left_link5" reason="Adjacent"/>
+    <disable_collisions link1="openarm_left_link5" link2="openarm_left_link6" reason="Adjacent"/>
+    <disable_collisions link1="openarm_left_link6" link2="openarm_left_ee_base_link" reason="Adjacent"/>
+    <disable_collisions link1="openarm_left_ee_base_link" link2="openarm_left_ee_link1" reason="Adjacent"/>
+    <disable_collisions link1="openarm_left_ee_base_link" link2="openarm_left_ee_link2" reason="Adjacent"/>
+    <disable_collisions link1="openarm_left_ee_link1" link2="openarm_left_ee_link2" reason="Adjacent"/>
+
+    <!-- (A) Right arm adjacent -->
+    <disable_collisions link1="openarm_right_base_link" link2="openarm_right_link1" reason="Adjacent"/>
+    <disable_collisions link1="openarm_right_link1" link2="openarm_right_link2" reason="Adjacent"/>
+    <disable_collisions link1="openarm_right_link2" link2="openarm_right_link3" reason="Adjacent"/>
+    <disable_collisions link1="openarm_right_link3" link2="openarm_right_link4" reason="Adjacent"/>
+    <disable_collisions link1="openarm_right_link4" link2="openarm_right_link5" reason="Adjacent"/>
+    <disable_collisions link1="openarm_right_link5" link2="openarm_right_link6" reason="Adjacent"/>
+    <disable_collisions link1="openarm_right_link6" link2="openarm_right_ee_base_link" reason="Adjacent"/>
+    <disable_collisions link1="openarm_right_ee_base_link" link2="openarm_right_ee_link1" reason="Adjacent"/>
+    <disable_collisions link1="openarm_right_ee_base_link" link2="openarm_right_ee_link2" reason="Adjacent"/>
+    <disable_collisions link1="openarm_right_ee_link1" link2="openarm_right_ee_link2" reason="Adjacent"/>
+
+    <!-- (B) Shared body mount <-> each arm's first link / base -->
+    <disable_collisions link1="openarm_body_link0" link2="openarm_left_base_link" reason="Adjacent"/>
+    <disable_collisions link1="openarm_body_link0" link2="openarm_right_base_link" reason="Adjacent"/>
+    <disable_collisions link1="openarm_body_link0" link2="openarm_left_link1" reason="Adjacent"/>
+    <disable_collisions link1="openarm_body_link0" link2="openarm_right_link1" reason="Adjacent"/>
+
+    <!-- (B) Lift carrying the mount -> mount + arm bases never collide with it -->
+    <disable_collisions link1="lift_link" link2="openarm_body_link0" reason="Adjacent"/>
+    <disable_collisions link1="lift_link" link2="openarm_left_base_link" reason="Adjacent"/>
+    <disable_collisions link1="lift_link" link2="openarm_right_base_link" reason="Adjacent"/>
+    <disable_collisions link1="lift_base_link" link2="lift_link" reason="Adjacent"/>
+
+    <!-- (C) Cross-arm rigidly co-located bases (moving links stay ENABLED) -->
+    <disable_collisions link1="openarm_left_base_link" link2="openarm_right_base_link" reason="Adjacent"/>
+
+    <!-- ===================================================================
+         (D) STATIC BASE / SENSOR / WHEEL self-collisions.
+
+         The base, lidars, camera, IMU, steering knuckles, wheels and the lift
+         base are NOT in any planning group, but MoveIt still collision-checks the
+         WHOLE robot's START STATE before every plan (the CheckStartStateCollision
+         request adapter). These adjacent base parts overlap geometrically at the
+         home pose (sensors mounted flush on base_link; each steering knuckle
+         overlaps its wheel; the lift base meets the body mount), so without these
+         disables the adapter ABORTS every plan with "contact(s) detected" (it
+         did exactly that for a both_arms_lift plan until these were added).
+
+         Each pair below is URDF-adjacent (fixed/continuous/prismatic joint) or a
+         verified observed start-state contact, so disabling it is the same thing
+         the MoveIt Setup Assistant would mark "Adjacent" / "Always" in collision.
+         No MOVING arm pair is disabled here, so genuine arm collisions are still
+         caught.
+         ================================================================== -->
+    <!-- base_link <-> flush-mounted sensors -->
+    <disable_collisions link1="base_link" link2="imu_link" reason="Adjacent"/>
+    <disable_collisions link1="base_link" link2="front_lidar_link" reason="Adjacent"/>
+    <disable_collisions link1="base_link" link2="back_lidar_link" reason="Adjacent"/>
+    <disable_collisions link1="base_link" link2="camera_link" reason="Adjacent"/>
+    <!-- base_link <-> the four steering knuckles -->
+    <disable_collisions link1="base_link" link2="fl_steering_link" reason="Adjacent"/>
+    <disable_collisions link1="base_link" link2="fr_steering_link" reason="Adjacent"/>
+    <disable_collisions link1="base_link" link2="rr_steering_link" reason="Adjacent"/>
+    <disable_collisions link1="base_link" link2="rl_steering_link" reason="Adjacent"/>
+    <!-- each steering knuckle <-> its wheel -->
+    <disable_collisions link1="fl_steering_link" link2="fl_wheel_link" reason="Adjacent"/>
+    <disable_collisions link1="fr_steering_link" link2="fr_wheel_link" reason="Adjacent"/>
+    <disable_collisions link1="rr_steering_link" link2="rr_wheel_link" reason="Adjacent"/>
+    <disable_collisions link1="rl_steering_link" link2="rl_wheel_link" reason="Adjacent"/>
+    <!-- base_link <-> lift base, and lift base <-> the body mount it carries -->
+    <disable_collisions link1="base_link" link2="lift_base_link" reason="Adjacent"/>
+    <disable_collisions link1="lift_base_link" link2="openarm_body_link0" reason="Adjacent"/>
+
+</robot>

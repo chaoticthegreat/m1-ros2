@@ -1,0 +1,60 @@
+# M1 MoveIt controller manager config (the EXECUTION side of a planned move).
+#
+# MoveIt plans (OMPL) then hands the resulting JointTrajectory to a ros2_control
+# JointTrajectoryController via a FollowJointTrajectory action. These two JTCs
+# (left_arm_jtc / right_arm_jtc) already exist in config/m1_controllers.yaml,
+# loaded INACTIVE on the reactive path and hot-swapped active for a planned move
+# (the reactive Drake path uses arm_position_controller instead).
+#
+# left_arm  -> left_arm_jtc   (7 left joints)
+# right_arm -> right_arm_jtc  (7 right joints)
+#
+# both_arms_lift CONTROLLER GAP (documented, intentionally NOT wired):
+#   A planned both_arms_lift trajectory spans lift_joint + all 14 arm joints, but
+#   there is NO single JointTrajectoryController spanning lift+both-arms today.
+#   left_arm_jtc and right_arm_jtc cover only the 14 arm joints (7+7) and nothing
+#   commands lift_joint via a JTC -- the lift is driven by the reactive
+#   arm_position_controller (forward_command_controller). To EXECUTE a planned
+#   both_arms_lift move you would need either:
+#     (a) one combined JTC over {lift_joint + 14 arm joints}, or
+#     (b) MoveIt split-execution across left_arm_jtc + right_arm_jtc + a new
+#         lift_jtc (a JTC over just lift_joint),
+#   plus a controller entry here listing that controller's joints. Wiring that
+#   combined/lift controller is OUT OF SCOPE for this config (it would change
+#   config/m1_controllers.yaml and the bus-ownership story). So below we configure
+#   ONLY the per-arm path that works today (left_arm / right_arm). PLANNING for
+#   both_arms_lift still works (it loads and OMPL can plan it); only EXECUTION of
+#   that group needs the controller above.
+
+moveit_controller_manager: moveit_simple_controller_manager/MoveItSimpleControllerManager
+
+moveit_simple_controller_manager:
+  controller_names:
+    - left_arm_jtc
+    - right_arm_jtc
+
+  left_arm_jtc:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    default: true
+    joints:
+      - openarm_left_joint1
+      - openarm_left_joint2
+      - openarm_left_joint3
+      - openarm_left_joint4
+      - openarm_left_joint5
+      - openarm_left_joint6
+      - openarm_left_joint7
+
+  right_arm_jtc:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    default: true
+    joints:
+      - openarm_right_joint1
+      - openarm_right_joint2
+      - openarm_right_joint3
+      - openarm_right_joint4
+      - openarm_right_joint5
+      - openarm_right_joint6
+      - openarm_right_joint7

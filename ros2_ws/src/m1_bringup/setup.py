@@ -17,6 +17,10 @@ setup(
         (os.path.join("share", package_name, "rviz"), glob("rviz/*.rviz")),
         (os.path.join("share", package_name, "urdf"), glob("urdf/*")),
         (os.path.join("share", package_name, "config"), glob("config/*.yaml")),
+        # MoveIt config (Phase 3): SRDF + kinematics/OMPL/controllers yaml for
+        # planned, collision-aware moves (m1_moveit.launch.py reads these).
+        (os.path.join("share", package_name, "moveit"),
+            glob("moveit/*.srdf") + glob("moveit/*.srdf.xacro") + glob("moveit/*.yaml")),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
