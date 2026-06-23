@@ -750,18 +750,40 @@ def _make_handler(node: M1QuestNode):
         # Keep-alive so the headset's high-rate POSTs reuse one TLS connection
         # instead of a fresh handshake every XR frame.
         protocol_version = "HTTP/1.1"
+        # Disable Nagle's algorithm (TCP_NODELAY). The headset POSTs a tiny body
+        # then BLOCKS on the response; with Nagle on, the server's reply (written
+        # as separate header+body segments) hits the classic Nagle/delayed-ACK
+        # interaction and stalls ~40 ms per request on a real network -- which
+        # capped the in-headset robot-pose refresh near ~25 Hz and made the model
+        # stutter. (Loopback doesn't reproduce it, so the offline tests never
+        # caught it.) We also coalesce the reply into ONE write below, so the
+        # response leaves as a single segment regardless.
+        disable_nagle_algorithm = True
+
+        _REASON = {200: "OK", 400: "Bad Request", 403: "Forbidden",
+                   404: "Not Found"}
 
         def log_message(self, *args):  # silence per-request logging
             pass
 
         def _send(self, code, body, ctype="application/json"):
             data = body if isinstance(body, bytes) else body.encode("utf-8")
-            self.send_response(code)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
+            # Build the entire response (status line + headers + body) and write
+            # it in a SINGLE wfile.write -> one TCP segment. Combined with
+            # TCP_NODELAY this removes the per-request Nagle stall. We keep
+            # HTTP/1.1 keep-alive (Content-Length set, no Connection: close) so
+            # the high-rate POST loop reuses the one TLS connection.
+            head = (
+                f"{self.protocol_version} {code} "
+                f"{self._REASON.get(code, '')}\r\n"
+                f"Server: {self.version_string()}\r\n"
+                f"Date: {self.date_time_string()}\r\n"
+                f"Content-Type: {ctype}\r\n"
+                f"Content-Length: {len(data)}\r\n"
+                "\r\n"
+            ).encode("latin-1")
             try:
-                self.wfile.write(data)
+                self.wfile.write(head + data)
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
@@ -1032,6 +1054,56 @@ const hint=document.getElementById("xrhint");
 let renderer=null, scene=null, camera=null, robotRoot=null, robotBase=null;
 let xrSession=null, refSpace=null, refIsFloor=false, robotPlaced=false;
 let lastViz=null, inFlight=false, meshesLoaded=false;
+
+/* ---- snapshot interpolation -------------------------------------------------
+   The robot pose only refreshes when an /api/xr POST round-trips, which over
+   WiFi arrives at ~25-40 Hz with jitter -- far below the headset's 72-90 Hz
+   render rate. Rendering the latest received pose directly makes the model step
+   and stutter. Instead we keep the TWO most recent server frames (with client
+   receive times) and, each render frame, interpolate the robot ~one inter-arrival
+   interval IN THE PAST between them (lerp positions, slerp orientations). That
+   turns a jittery 30 Hz stream into glass-smooth motion at the headset rate. We
+   clamp (never extrapolate) so a dropped/late frame just holds the last pose.
+   Cost: ~one interval (~20-40 ms) of VISUAL latency on the preview only -- arm /
+   base commands publish at 60 Hz server-side, unaffected. */
+let vizPrev=null, vizCur=null;        // {viz, t} (t = performance.now()/1000)
+let intervalEMA=1/30, rttEMA=0, payloadBytes=0;
+const nowSec=()=>performance.now()*1e-3;
+const RENDER_DELAY_MIN=0.015, RENDER_DELAY_MAX=0.080;
+// Reused scratch so per-frame interpolation/billboarding allocates nothing.
+const _vA=new THREE.Vector3(), _vB=new THREE.Vector3();
+const _qA=new THREE.Quaternion(), _qB=new THREE.Quaternion();
+const _hudV=new THREE.Vector3(), _hudQ=new THREE.Quaternion();
+
+// Perf HUD (dev metric) gated by ?perf in the URL: render FPS, data-update Hz,
+// POST RTT, payload size. Zero clutter on the normal URL.
+const SHOW_PERF=new URLSearchParams(location.search).has("perf");
+let perfHud=null, perfCanvas=null, perfCtx=null, perfTex=null, perfDrawn="";
+let fpsCount=0, fpsLastT=0, fpsValue=0;
+
+// Ingest a freshly-received server viz: shift it into the two-frame buffer and
+// update the inter-arrival + RTT EMAs the interpolator/perf HUD read.
+function ingestViz(v, rtt, bytes){
+  const t=nowSec();
+  if(vizCur){ intervalEMA += 0.2*((t-vizCur.t)-intervalEMA); }
+  vizPrev=vizCur; vizCur={viz:v, t:t}; lastViz=v;
+  if(rtt!=null) rttEMA += (rttEMA?0.2:1.0)*(rtt-rttEMA);
+  if(bytes) payloadBytes=bytes;
+}
+
+// Pick the interpolation pair + factor for the current render instant. We render
+// ~one interval behind the newest frame so we interpolate BETWEEN two known
+// frames; s clamps to [0,1] so a stall holds the last pose (no extrapolation).
+function interpState(){
+  if(!vizCur) return null;
+  if(!vizPrev) return {A:vizCur.viz, B:vizCur.viz, s:1};
+  const span=vizCur.t-vizPrev.t;
+  if(span<=1e-6) return {A:vizCur.viz, B:vizCur.viz, s:1};
+  const delay=Math.min(RENDER_DELAY_MAX, Math.max(RENDER_DELAY_MIN, intervalEMA));
+  let s=(nowSec()-delay - vizPrev.t)/span;
+  s=s<0?0:(s>1?1:s);
+  return {A:vizPrev.viz, B:vizCur.viz, s};
+}
 // Per-link bookkeeping so a mesh that fails to load is *visible as a gap* and
 // gets a wireframe fallback for that arm, instead of silently vanishing.
 let armLinks={left:[], right:[]};
@@ -1195,6 +1267,20 @@ function initThree(){
     depthTest:false, side:THREE.DoubleSide});
   errHud=new THREE.Mesh(new THREE.PlaneGeometry(0.40,0.20), hudMat);
   errHud.renderOrder=10; errHud.visible=false; scene.add(errHud);
+
+  // Dev PERF panel (only when opened with ?perf): a second billboarded canvas
+  // showing render FPS / data-update Hz / POST RTT / payload KB, just below the
+  // reach HUD. Hidden entirely on the normal URL.
+  if(SHOW_PERF){
+    perfCanvas=document.createElement("canvas"); perfCanvas.width=384; perfCanvas.height=320;
+    perfCtx=perfCanvas.getContext("2d");
+    perfTex=new THREE.CanvasTexture(perfCanvas);
+    const perfMat=new THREE.MeshBasicMaterial({map:perfTex, transparent:true,
+      depthTest:false, side:THREE.DoubleSide});
+    perfHud=new THREE.Mesh(new THREE.PlaneGeometry(0.30,0.25), perfMat);
+    perfHud.renderOrder=10; perfHud.visible=false; scene.add(perfHud);
+    log("perf overlay enabled (?perf)");
+  }
 }
 
 /* ---- fetch one mesh with a few retries (a single dropped request used to
@@ -1270,41 +1356,70 @@ async function loadRobot(){
       (failed.length ? (" — MISSING "+failed.join(", ")+" (wireframe fallback)") : " (all present)"));
 }
 
-/* ---- per-frame: pose every link mesh + target markers from lastViz ---- */
+/* ---- interpolation helpers (no per-call allocation) ---- */
+const _p3=[0,0,0], _p3b=[0,0,0];
+function lerpArr(out, a, b, s){
+  out[0]=a[0]+(b[0]-a[0])*s; out[1]=a[1]+(b[1]-a[1])*s; out[2]=a[2]+(b[2]-a[2])*s;
+  return out;
+}
+// Interpolate a {p,q} transform from frame A->B by s onto a three node.
+function applyInterp(node, ta, tb, s){
+  _vA.set(ta.p[0],ta.p[1],ta.p[2]); _vB.set(tb.p[0],tb.p[1],tb.p[2]);
+  node.position.lerpVectors(_vA,_vB,s);
+  _qA.set(ta.q[0],ta.q[1],ta.q[2],ta.q[3]); _qB.set(tb.q[0],tb.q[1],tb.q[2],tb.q[3]);
+  node.quaternion.slerpQuaternions(_qA,_qB,s);
+}
+
+/* ---- per-frame: pose every link mesh + target markers, INTERPOLATED between
+       the two most recent server frames so a ~30 Hz data stream renders smoothly
+       at the headset rate. ---- */
 function updateRobot(){
-  if(!lastViz) return;
+  const st=interpState(); if(!st) return;
+  const A=st.A, B=st.B, s=st.s;
   // Offset the whole robot inside the room anchor by the dead-reckoned swerve
   // pose (base_link in the odom frame) so it drives around as commanded. While a
   // place/recenter reset is still in flight the cached base is stale (not yet
   // zeroed), so hold robotBase at the local anchor snap until it lands.
-  if(robotBase && lastViz.base && !pendingPlace){
-    const b=lastViz.base;
-    if(b.p) robotBase.position.set(b.p[0], b.p[1], b.p[2]);
-    if(b.q) robotBase.quaternion.set(b.q[0], b.q[1], b.q[2], b.q[3]);
+  if(robotBase && B.base && !pendingPlace){
+    const ba=A.base||B.base, bb=B.base;
+    if(bb.p && ba.p){ _vA.set(ba.p[0],ba.p[1],ba.p[2]); _vB.set(bb.p[0],bb.p[1],bb.p[2]);
+      robotBase.position.lerpVectors(_vA,_vB,s); }
+    if(bb.q && ba.q){ _qA.set(ba.q[0],ba.q[1],ba.q[2],ba.q[3]);
+      _qB.set(bb.q[0],bb.q[1],bb.q[2],bb.q[3]);
+      robotBase.quaternion.slerpQuaternions(_qA,_qB,s); }
   }
-  if(lastViz.links){
-    for(const name in lastViz.links){
+  // Link meshes: walk the NEWER frame, interpolate against the older frame where
+  // it has the same link, else snap to the newest pose.
+  if(B.links){
+    const al=A.links||{};
+    for(const name in B.links){
       const node=linkNodes[name]; if(!node) continue;
-      const t=lastViz.links[name];
-      node.position.set(t.p[0], t.p[1], t.p[2]);
-      node.quaternion.set(t.q[0], t.q[1], t.q[2], t.q[3]);
+      const tb=B.links[name], ta=al[name]||tb;
+      applyInterp(node, ta, tb, s);
       node.visible=true;   // now it has a real pose -> safe to show
     }
   }
-  updateWire(!meshesLoaded);   // both arms before load; per-arm gap fallback after
+  updateWire(!meshesLoaded, B);   // both arms before load; per-arm gap fallback after
   for(const arm of ["left","right"]){
-    const a=lastViz.arms ? lastViz.arms[arm] : null;
+    const b=B.arms ? B.arms[arm] : null;
+    const a=A.arms ? A.arms[arm] : null;
     const tg=targetMesh[arm], tp=tipMesh[arm], ln=errLine[arm];
-    if(!a || !a.target){
+    if(!b || !b.target){
       tg.visible=tp.visible=ln.visible=false; continue; }
-    const col=reachColor(a.dist==null?9:a.dist);
-    tg.position.set(a.target[0],a.target[1],a.target[2]);
+    const aa=(a && a.target)?a:b;             // prior frame (or newest if absent)
+    lerpArr(_p3, aa.target, b.target, s);     // interpolated target point
+    let dist = b.dist==null?9:b.dist;
+    if(aa.dist!=null && b.dist!=null) dist = aa.dist+(b.dist-aa.dist)*s;
+    const col=reachColor(dist);
+    tg.position.set(_p3[0],_p3[1],_p3[2]);
     tg.material.color.copy(col); tg.visible=true;
-    if(a.tip){
-      tp.position.set(a.tip[0],a.tip[1],a.tip[2]); tp.visible=true;
+    if(b.tip){
+      const at=aa.tip?aa.tip:b.tip;
+      lerpArr(_p3b, at, b.tip, s);            // interpolated fingertip
+      tp.position.set(_p3b[0],_p3b[1],_p3b[2]); tp.visible=true;
       const pos=ln.geometry.attributes.position;
-      pos.setXYZ(0, a.tip[0],a.tip[1],a.tip[2]);
-      pos.setXYZ(1, a.target[0],a.target[1],a.target[2]);
+      pos.setXYZ(0, _p3b[0],_p3b[1],_p3b[2]);
+      pos.setXYZ(1, _p3[0],_p3[1],_p3[2]);
       pos.needsUpdate=true; ln.material.color.copy(col); ln.visible=true;
     } else { tp.visible=false; ln.visible=false; }
   }
@@ -1355,21 +1470,66 @@ function updateTraj(){
 /* ---- pose + redraw the REACH ERROR HUD: float it above the robot and face the
        camera (billboard), refreshing the per-arm error text/colours ---- */
 function updateHud(){
-  if(!errHud) return;
-  const al=lastViz.arms?lastViz.arms.left:null, ar=lastViz.arms?lastViz.arms.right:null;
-  const dl=al&&al.dist!=null?al.dist:null, dr=ar&&ar.dist!=null?ar.dist:null;
-  if(dl==null && dr==null){ errHud.visible=false; return; }
-  drawHud(dl, dr);
-  // Anchor above the robot base (its world position) and billboard to the camera.
-  const base=new THREE.Vector3();
-  (robotBase||robotRoot).getWorldPosition(base);
-  base.y += 1.35;                       // float above the robot
-  errHud.position.copy(base);
-  // Billboard: copy the (XR head) camera's world orientation. A camera looks down
-  // its -z, so the plane's +z (front, unmirrored) face ends up toward the viewer.
+  // Shared billboard quaternion (XR head orientation) + robot anchor world
+  // position, computed once with reused scratch (no per-frame allocation). A
+  // camera looks down its -z, so copying its orientation faces the panel's +z
+  // (front, unmirrored) at the viewer.
   const cam = (renderer.xr.isPresenting ? renderer.xr.getCamera() : camera);
-  if(cam){ const q=new THREE.Quaternion(); cam.getWorldQuaternion(q); errHud.quaternion.copy(q); }
-  errHud.visible=true;
+  if(cam) cam.getWorldQuaternion(_hudQ);
+  (robotBase||robotRoot).getWorldPosition(_hudV);
+
+  if(errHud){
+    const al=lastViz.arms?lastViz.arms.left:null, ar=lastViz.arms?lastViz.arms.right:null;
+    const dl=al&&al.dist!=null?al.dist:null, dr=ar&&ar.dist!=null?ar.dist:null;
+    if(dl==null && dr==null){ errHud.visible=false; }
+    else {
+      drawHud(dl, dr);
+      errHud.position.set(_hudV.x, _hudV.y+1.35, _hudV.z);   // float above the robot
+      if(cam) errHud.quaternion.copy(_hudQ);
+      errHud.visible=true;
+    }
+  }
+  // Dev perf panel (only when the page was opened with ?perf). Sits just below
+  // the reach HUD and billboards the same way.
+  if(SHOW_PERF && perfHud){
+    drawPerf();
+    perfHud.position.set(_hudV.x, _hudV.y+1.05, _hudV.z);
+    if(cam) perfHud.quaternion.copy(_hudQ);
+    perfHud.visible=true;
+  }
+}
+
+/* ---- redraw the dev PERF panel (render FPS / data-update Hz / POST RTT /
+       payload KB). Only when ?perf is set. Redrawn only when a displayed value
+       changes (quantized), like the reach HUD. ---- */
+function drawPerf(){
+  if(!perfCtx) return;
+  const hz  = intervalEMA>1e-6 ? 1/intervalEMA : 0;
+  const rtt = rttEMA*1000;
+  const kb  = payloadBytes/1024;
+  const key = fpsValue.toFixed(0)+"|"+hz.toFixed(0)+"|"+rtt.toFixed(1)+"|"+kb.toFixed(1);
+  if(key===perfDrawn) return;
+  perfDrawn=key;
+  const W=perfCanvas.width, H=perfCanvas.height, c=perfCtx;
+  c.clearRect(0,0,W,H);
+  c.fillStyle="rgba(18,18,22,0.74)";
+  c.strokeStyle="rgba(255,255,255,0.18)"; c.lineWidth=4;
+  c.beginPath(); c.roundRect(6,6,W-12,H-12,18); c.fill(); c.stroke();
+  c.textBaseline="middle";
+  c.fillStyle="#9fe0ff"; c.textAlign="left";
+  c.font="600 32px system-ui,-apple-system,'Segoe UI',sans-serif";
+  c.fillText("PERF",36,44);
+  const line=(label,val,y)=>{
+    c.font="500 32px system-ui,sans-serif"; c.textAlign="left"; c.fillStyle="#cfccc4";
+    c.fillText(label,36,y);
+    c.font="600 34px ui-monospace,Menlo,Consolas,monospace";
+    c.textAlign="right"; c.fillStyle="#e8e6df"; c.fillText(val,W-36,y);
+  };
+  line("fps",        fpsValue.toFixed(0), 104);
+  line("data Hz",    hz.toFixed(0),       156);
+  line("rtt ms",     rtt.toFixed(1),      208);
+  line("payload KB", kb.toFixed(1),       260);
+  perfTex.needsUpdate=true;
 }
 
 /* ---- wireframe fallback: drawn for both arms before meshes load, and after
@@ -1378,9 +1538,9 @@ function updateHud(){
        and updated in place + drawn via setDrawRange, instead of allocating a new
        Float32BufferAttribute every frame while loading / for a failed arm. ---- */
 const WIRE_MAX_PTS=32;   // arm skeleton is well under this; segments=(pts-1)
-function updateWire(forceBoth){
+function updateWire(forceBoth, vz){
   for(const arm of ["left","right"]){
-    const a=lastViz.arms ? lastViz.arms[arm] : null;
+    const a=vz.arms ? vz.arms[arm] : null;
     const show = forceBoth || !armComplete[arm];
     if(!show || !a || !a.points){ if(wire[arm]) wire[arm].visible=false; continue; }
     let w=wire[arm];
@@ -1477,11 +1637,33 @@ function onFrame(t, frame){
       // sits exactly at the (re)anchored spot. Sticky: clear pendingPlace only
       // after the POST that carried it succeeds, so a reset is never dropped.
       const sentPlace=pendingPlace;
+      const tSend=nowSec();
+      let bytes=0;
+      // No `keepalive:true` -- that flag routes the request through the browser's
+      // constrained beacon pool; a plain fetch reuses the HTTP/1.1 keep-alive TLS
+      // connection, which is what this high-rate loop wants. The response feeds
+      // the two-frame interpolation buffer (ingestViz) instead of being shown raw.
       fetch("/api/xr",{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({controllers:out, head:head, place:sentPlace}),keepalive:true})
-        .then(r=>r.json()).then(j=>{ if(j&&j.viz) lastViz=j.viz; if(sentPlace) pendingPlace=false; })
+        body:JSON.stringify({controllers:out, head:head, place:sentPlace})})
+        .then(r=>{ bytes=+(r.headers.get("Content-Length")||0); return r.json(); })
+        .then(j=>{ if(j&&j.viz){
+                     ingestViz(j.viz, nowSec()-tSend, bytes);
+                     // A place/recenter relocates the whole model to the zeroed
+                     // anchor, so this response's base straddles a DISCONTINUITY
+                     // vs the prior (drifted) frame. Drop that prior frame (AFTER
+                     // ingestViz, which would otherwise shift it into vizPrev) so
+                     // interpState snaps to the anchor for one frame instead of
+                     // swooping the robot across the room; smoothing resumes next.
+                     if(sentPlace) vizPrev=null;
+                   }
+                   if(sentPlace) pendingPlace=false; })
         .catch(()=>{}).finally(()=>{inFlight=false;});
     }
+    // Render FPS over a ~0.5 s window (perf HUD).
+    fpsCount++;
+    const tnow=nowSec();
+    if(!fpsLastT){ fpsLastT=tnow; }
+    else if(tnow-fpsLastT>=0.5){ fpsValue=fpsCount/(tnow-fpsLastT); fpsCount=0; fpsLastT=tnow; }
     updateRobot();
   }
   if(renderer) renderer.render(scene, camera);

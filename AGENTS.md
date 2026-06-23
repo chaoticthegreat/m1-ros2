@@ -248,6 +248,37 @@ real driver; everything in `ros2_ws/` is unchanged.
  a waypoint self-collides**, so the operator sees the planned motion (and any
  collision) before committing. Planning is off the request path (snapshot under
  lock, plan outside, store under lock) so it never stalls a frame.
+ **Performance pass 2 — the in-headset model "trailed/stuttered" (smooth
+ passthrough, jerky robot).** Root cause was NOT the GPU or the server (measured
+ `on_xr_frame` is 0.009–0.33 ms/frame, 4.1 KB payload — see `_quest_perf_bench.py`):
+ the robot pose `lastViz` only refreshed when an `/api/xr` POST round-tripped
+ (gated one-in-flight) with **no interpolation**, and **Nagle's algorithm was on**
+ (stdlib `disable_nagle_algorithm` defaults False) so each request ate a ~40 ms
+ delayed-ACK stall on a real network (loopback never reproduces it, so the offline
+ suites couldn't catch it). Fix, three parts: (1) **server transport** — the
+ `Handler` sets `disable_nagle_algorithm = True` (TCP_NODELAY) and `_send` now
+ writes the whole HTTP response (status+headers+body) in ONE `wfile.write` (one
+ segment), keeping HTTP/1.1 keep-alive; (2) **client snapshot interpolation** —
+ the page keeps the **two most recent** server frames (`vizPrev`/`vizCur` via
+ `ingestViz`, with client receive-times + RTT/interval EMAs) and each render frame
+ `interpState`/`updateRobot` **lerp/slerp** link poses + markers + base ~one
+ inter-arrival interval IN THE PAST between them, **clamped** so a stall holds the
+ last pose (no extrapolation) — turning a jittery ~30 Hz stream into smooth motion
+ at the headset's 72–90 Hz, regardless of WiFi jitter; the `keepalive:true` fetch
+ flag (beacon pool) was dropped and all per-frame `new Vector3/Quaternion`
+ allocations hoisted to reused scratch. Cost: ~one interval (~20–40 ms) of VISUAL
+ latency on the **preview only** — arm/base commands publish at 60 Hz server-side,
+ unaffected. **NB (review-found, LIVE-only):** a **B/Y recenter** is a base
+ discontinuity (old drifted pose → zeroed anchor); the fetch `.then` nulls
+ `vizPrev` AFTER `ingestViz` on a `place` so `interpState` SNAPS to the anchor for
+ one frame instead of swooping the model across the room. (3) **`/?perf` dev HUD**
+ — opening the page with `?perf` shows a second billboarded panel (render FPS,
+ data-update Hz, POST RTT, payload KB) for on-device before/after metrics; zero
+ clutter on the normal URL. Server side validated by `_quest_perf_bench.py`
+ (3/3: TCP_NODELAY set, end-to-end viz over real TLS correct, **1291 req/s** on one
+ keep-alive connection); `_quest_position_test.py` stays 10/10 (the data path is
+ unchanged). The interpolation/recenter paths are JS-only — **validate the smooth
+ model + the B/Y snap in the live headset** (the offline suites can't drive the JS).
 - `.../web_node.py` — `ros2 run m1_control m1_web`: browser control panel on
  http://localhost:8080. Same `/m1/*`-only bridge (sim + real). Stdlib HTTP
  server + embedded HTML/JS (no extra deps); base drive pad, per-arm Cartesian
