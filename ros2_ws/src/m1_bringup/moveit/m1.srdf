@@ -92,42 +92,46 @@
     </group>
 
     <!-- ===================================================================
-         Named states (home = all zeros).
+         Named states. "home" is an ARMS-UP READY pose, NOT all-zeros: the arms
+         mount flush+low on the lift carriage, so all-zeros folds them into the
+         drivebase. This pose holds both grippers up/forward, clear of the base
+         (>0.4 m from the base box, self-clearance >24 mm). Keep in sync with
+         HOME_CONFIG in isaac/ros_sim.py.
          ================================================================== -->
     <group_state name="home" group="left_arm">
-        <joint name="openarm_left_joint1" value="0"/>
-        <joint name="openarm_left_joint2" value="0"/>
-        <joint name="openarm_left_joint3" value="0"/>
-        <joint name="openarm_left_joint4" value="0"/>
-        <joint name="openarm_left_joint5" value="0"/>
-        <joint name="openarm_left_joint6" value="0"/>
-        <joint name="openarm_left_joint7" value="0"/>
+        <joint name="openarm_left_joint1" value="0.3925"/>
+        <joint name="openarm_left_joint2" value="-0.8549"/>
+        <joint name="openarm_left_joint3" value="1.2295"/>
+        <joint name="openarm_left_joint4" value="1.4446"/>
+        <joint name="openarm_left_joint5" value="-0.0023"/>
+        <joint name="openarm_left_joint6" value="0.0780"/>
+        <joint name="openarm_left_joint7" value="-0.4366"/>
     </group_state>
     <group_state name="home" group="right_arm">
-        <joint name="openarm_right_joint1" value="0"/>
-        <joint name="openarm_right_joint2" value="0"/>
-        <joint name="openarm_right_joint3" value="0"/>
-        <joint name="openarm_right_joint4" value="0"/>
-        <joint name="openarm_right_joint5" value="0"/>
-        <joint name="openarm_right_joint6" value="0"/>
-        <joint name="openarm_right_joint7" value="0"/>
+        <joint name="openarm_right_joint1" value="-0.3883"/>
+        <joint name="openarm_right_joint2" value="0.7599"/>
+        <joint name="openarm_right_joint3" value="-1.2386"/>
+        <joint name="openarm_right_joint4" value="1.4257"/>
+        <joint name="openarm_right_joint5" value="0.0019"/>
+        <joint name="openarm_right_joint6" value="-0.0691"/>
+        <joint name="openarm_right_joint7" value="0.4254"/>
     </group_state>
     <group_state name="home" group="both_arms_lift">
-        <joint name="lift_joint" value="0"/>
-        <joint name="openarm_left_joint1" value="0"/>
-        <joint name="openarm_left_joint2" value="0"/>
-        <joint name="openarm_left_joint3" value="0"/>
-        <joint name="openarm_left_joint4" value="0"/>
-        <joint name="openarm_left_joint5" value="0"/>
-        <joint name="openarm_left_joint6" value="0"/>
-        <joint name="openarm_left_joint7" value="0"/>
-        <joint name="openarm_right_joint1" value="0"/>
-        <joint name="openarm_right_joint2" value="0"/>
-        <joint name="openarm_right_joint3" value="0"/>
-        <joint name="openarm_right_joint4" value="0"/>
-        <joint name="openarm_right_joint5" value="0"/>
-        <joint name="openarm_right_joint6" value="0"/>
-        <joint name="openarm_right_joint7" value="0"/>
+        <joint name="lift_joint" value="0.4879"/>
+        <joint name="openarm_left_joint1" value="0.3925"/>
+        <joint name="openarm_left_joint2" value="-0.8549"/>
+        <joint name="openarm_left_joint3" value="1.2295"/>
+        <joint name="openarm_left_joint4" value="1.4446"/>
+        <joint name="openarm_left_joint5" value="-0.0023"/>
+        <joint name="openarm_left_joint6" value="0.0780"/>
+        <joint name="openarm_left_joint7" value="-0.4366"/>
+        <joint name="openarm_right_joint1" value="-0.3883"/>
+        <joint name="openarm_right_joint2" value="0.7599"/>
+        <joint name="openarm_right_joint3" value="-1.2386"/>
+        <joint name="openarm_right_joint4" value="1.4257"/>
+        <joint name="openarm_right_joint5" value="0.0019"/>
+        <joint name="openarm_right_joint6" value="-0.0691"/>
+        <joint name="openarm_right_joint7" value="0.4254"/>
     </group_state>
 
     <!-- ===================================================================
@@ -147,18 +151,17 @@
 
          (A) Within each arm chain: adjacent links (copied from OpenArm). These
              are always touching by construction, so never collision-check them.
-         (B) Arm <-> shared mount/lift adjacency: link1 of each arm is bolted to
-             its base_link which is bolted to openarm_body_link0 (the shared mount
-             carried by the lift). openarm_body_link0 sits right between the two
-             arm bases, so it is "adjacent" to both link1s; disable those pairs
-             so the static mount never reads as a constant collision against the
-             arms' first links. The lift_link/lift_base_link carry the mount and
-             never move relative to it within a plan, so disable them vs the body
-             and the two arm bases too.
-         (C) Cross-arm bases: the two arm bases (and the body mount between them)
-             are rigidly co-located, so disable base<->base and base<->body. The
-             MOVING arm links across arms are intentionally LEFT ENABLED so a
-             genuine cross-arm collision during a planned move is caught.
+         (B) Arm <-> lift carriage adjacency: each arm's base_link now bolts
+             FLUSH directly onto the moving lift carriage (lift_link); the old
+             openarm_body_link0 mount extrusion was removed. The carriage is
+             therefore adjacent to / co-located with both arm bases and their
+             link1s, so disable those pairs (plus lift_base_link<->lift_link) so
+             the static carriage never reads as a constant collision against the
+             arms' base + first links.
+         (C) Cross-arm bases: the two arm bases are rigidly co-located on the
+             carriage, so disable base<->base. The MOVING arm links across arms
+             are intentionally LEFT ENABLED so a genuine cross-arm collision
+             during a planned move is caught.
          ================================================================== -->
 
     <!-- (A) Left arm adjacent -->
@@ -185,16 +188,11 @@
     <disable_collisions link1="openarm_right_ee_base_link" link2="openarm_right_ee_link2" reason="Adjacent"/>
     <disable_collisions link1="openarm_right_ee_link1" link2="openarm_right_ee_link2" reason="Adjacent"/>
 
-    <!-- (B) Shared body mount <-> each arm's first link / base -->
-    <disable_collisions link1="openarm_body_link0" link2="openarm_left_base_link" reason="Adjacent"/>
-    <disable_collisions link1="openarm_body_link0" link2="openarm_right_base_link" reason="Adjacent"/>
-    <disable_collisions link1="openarm_body_link0" link2="openarm_left_link1" reason="Adjacent"/>
-    <disable_collisions link1="openarm_body_link0" link2="openarm_right_link1" reason="Adjacent"/>
-
-    <!-- (B) Lift carrying the mount -> mount + arm bases never collide with it -->
-    <disable_collisions link1="lift_link" link2="openarm_body_link0" reason="Adjacent"/>
+    <!-- (B) Lift carriage <-> each arm's base + first link (arms bolt flush on it) -->
     <disable_collisions link1="lift_link" link2="openarm_left_base_link" reason="Adjacent"/>
     <disable_collisions link1="lift_link" link2="openarm_right_base_link" reason="Adjacent"/>
+    <disable_collisions link1="lift_link" link2="openarm_left_link1" reason="Adjacent"/>
+    <disable_collisions link1="lift_link" link2="openarm_right_link1" reason="Adjacent"/>
     <disable_collisions link1="lift_base_link" link2="lift_link" reason="Adjacent"/>
 
     <!-- (C) Cross-arm rigidly co-located bases (moving links stay ENABLED) -->
@@ -233,8 +231,7 @@
     <disable_collisions link1="fr_steering_link" link2="fr_wheel_link" reason="Adjacent"/>
     <disable_collisions link1="rr_steering_link" link2="rr_wheel_link" reason="Adjacent"/>
     <disable_collisions link1="rl_steering_link" link2="rl_wheel_link" reason="Adjacent"/>
-    <!-- base_link <-> lift base, and lift base <-> the body mount it carries -->
+    <!-- base_link <-> lift base -->
     <disable_collisions link1="base_link" link2="lift_base_link" reason="Adjacent"/>
-    <disable_collisions link1="lift_base_link" link2="openarm_body_link0" reason="Adjacent"/>
 
 </robot>

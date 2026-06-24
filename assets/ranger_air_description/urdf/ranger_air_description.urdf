@@ -414,33 +414,15 @@
     <axis xyz="0 0 1" />
     <limit lower="0" upper="0.85" effort="500" velocity="0.25" />
   </joint>
-  <joint name="openarm_mount_joint" type="fixed">
-    <origin xyz="-0.0175 0.19 0.4" rpy="0 0 -1.5707963267949" />
-    <parent link="lift_link" />
-    <child link="openarm_body_link0" />
-  </joint>
-  <link name="openarm_body_link0">
-    <visual name="openarm_body_link0_visual">
-      <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 0.0" />
-      <geometry>
-        <mesh filename="package://openarm_description/assets/robot/openarm_v2.0/meshes/body/visual/body_link0.stl" />
-      </geometry>
-      <material name="openarm_body_link0_material">
-        <color rgba="0.752941176470588 0.752941176470588 0.752941176470588 1" />
-      </material>
-    </visual>
-    <collision name="openarm_body_link0_collision">
-      <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 0.0" />
-      <geometry>
-        <mesh filename="package://openarm_description/assets/robot/openarm_v2.0/meshes/body/collision/body_link0_symp.stl" scale="0.001 0.001 0.001" />
-      </geometry>
-    </collision>
-    <inertial>
-      <origin rpy="0 0 0" xyz="0 0 0" />
-      <mass value="13.89" />
-      <inertia ixx="1.653" ixy="0.0" ixz="0.0" iyy="1.653" iyz="0.0" izz="0.051" />
-    </inertial>
-  </link>
+  <!-- The OpenArm "body" extrusion (openarm_body_link0) + its openarm_mount_joint
+       were REMOVED: the two arms now bolt FLUSH onto the moving lift carriage
+       (lift_link) instead of on top of the ~0.70 m riser. Each arm base mount
+       joint below was re-parented from openarm_body_link0 to lift_link, keeping
+       the old carriage interface pose (xyz -0.0175 0.19 0.4, yaw -90 deg) and the
+       per-arm +/-0.031 lateral spread, but DROPPING the 0.698 m vertical riser.
+       The mount was then lowered a further 2 in (0.0508 m): carriage-interface z
+       0.4 -> 0.3492. Net effect: both arm bases sit ~0.749 m below the original
+       extrusion mount, directly on (and 2 in into) the carriage. -->
   <link name="openarm_left_base_link">
     <visual name="openarm_left_base_link_visual">
       <origin rpy="0 0 0" xyz="0 0 0" />
@@ -464,8 +446,8 @@
     </inertial>
   </link>
   <joint name="openarm_left_base_link_mount_joint" type="fixed">
-    <origin rpy="0.0 0.0 0.0" xyz="0.0 0.031 0.698" />
-    <parent link="openarm_body_link0" />
+    <origin rpy="0.0 0.0 -1.5707963267949" xyz="0.0135 0.19 0.3492" />
+    <parent link="lift_link" />
     <child link="openarm_left_base_link" />
   </joint>
   <link name="openarm_left_link1">
@@ -753,8 +735,8 @@
     </inertial>
   </link>
   <joint name="openarm_right_base_link_mount_joint" type="fixed">
-    <origin rpy="0.0 0.0 0.0" xyz="0.0 -0.031 0.698" />
-    <parent link="openarm_body_link0" />
+    <origin rpy="0.0 0.0 -1.5707963267949" xyz="-0.0485 0.19 0.3492" />
+    <parent link="lift_link" />
     <child link="openarm_right_base_link" />
   </joint>
   <link name="openarm_right_link1">

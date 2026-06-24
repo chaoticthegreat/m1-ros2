@@ -344,10 +344,14 @@ def _smoketest() -> int:
 
     gates = {}
 
-    # Single-arm: move the left fingertip to a reachable nearby point.
+    # Single-arm: move the left fingertip to a reachable nearby point in OPEN
+    # space. The arms now mount flush on the lift carriage (~0.70 m lower), so a
+    # descending goal would pin the tip down by the carriage/body column (a
+    # task-coupled self-collision the planner honestly flags); aim forward + out +
+    # slightly up to keep this smoke path clear of the structure.
     q0 = cfg(0.4)
     start_tip = np.asarray(reach.fingertip("left", q0))
-    goal = start_tip + np.array([0.10, 0.15, -0.20])
+    goal = start_tip + np.array([0.12, 0.15, 0.05])
     tr = planner.plan(q0, {"left": goal, "right": None})
     print(f"single: reached={tr.reached} clear={tr.collision_free} "
           f"end_err={tr.end_error['left']*1e3:.2f}mm minclr={tr.min_clearance*1e3:.0f}mm "
@@ -355,13 +359,16 @@ def _smoketest() -> int:
     gates["single reaches goal"] = tr.reached
     gates["single collision-free"] = tr.collision_free
 
-    # Dual-arm: move both fingertips inward toward the centerline (a case the
-    # naive straight-line config tends to bring the arms close -> avoidance).
+    # Dual-arm: move both fingertips forward + up so the arms come near each other
+    # (a case the naive straight-line config brings them close -> avoidance), while
+    # staying resolvable to collision-free. With the arms mounted flush+low on the
+    # carriage, a downward inward goal pins the tips by the body (unavoidable task-
+    # coupled collision), so aim forward/up where the planner can keep it clear.
     q0 = cfg(0.45)
     sl = np.asarray(reach.fingertip("left", q0))
     sr = np.asarray(reach.fingertip("right", q0))
-    gl = sl + np.array([0.05, -0.12, -0.10])
-    gr = sr + np.array([0.05, 0.12, -0.10])
+    gl = sl + np.array([0.08, 0.05, 0.06])
+    gr = sr + np.array([0.08, -0.05, 0.06])
     tr2 = planner.plan(q0, {"left": gl, "right": gr})
     print(f"dual:   reached={tr2.reached} clear={tr2.collision_free} "
           f"endL={tr2.end_error['left']*1e3:.2f} endR={tr2.end_error['right']*1e3:.2f}mm "

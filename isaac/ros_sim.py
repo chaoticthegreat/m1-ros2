@@ -61,6 +61,24 @@ FINGER_JOINTS = [
     "openarm_right_finger_joint1", "openarm_right_finger_joint2",
 ]
 
+# Startup posture. The arms mount flush+low on the lift carriage, so the all-zero
+# pose folds them straight down INTO the drivebase. This "arms-up ready" config
+# holds both grippers up/forward, clear of the base (verified: >0.4 m clear of the
+# base box, self-clearance >24 mm). Set as the initial joint state AND the drive
+# targets so the stiff arm drives hold it until the brain sends a command. Keep it
+# in sync with the MoveIt SRDF "home" group_states (m1.srdf).
+HOME_CONFIG = {
+    "lift_joint": 0.4879,
+    "openarm_left_joint1": 0.3925, "openarm_left_joint2": -0.8549,
+    "openarm_left_joint3": 1.2295, "openarm_left_joint4": 1.4446,
+    "openarm_left_joint5": -0.0023, "openarm_left_joint6": 0.0780,
+    "openarm_left_joint7": -0.4366,
+    "openarm_right_joint1": -0.3883, "openarm_right_joint2": 0.7599,
+    "openarm_right_joint3": -1.2386, "openarm_right_joint4": 1.4257,
+    "openarm_right_joint5": 0.0019, "openarm_right_joint6": -0.0691,
+    "openarm_right_joint7": 0.4254,
+}
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run Ranger Air as a ROS 2 sim node.")
@@ -184,6 +202,29 @@ def main() -> None:
             kp[name_to_idx[n]], kd[name_to_idx[n]] = GRIP_KP, GRIP_KD
     robot.set_gains(kps=kp.reshape(1, -1), kds=kd.reshape(1, -1))
     report("[ros_sim] drive gains configured (arms stiff, wheels velocity-driven)")
+
+    # --- Startup posture: hold the arms up, clear of the drivebase ----------
+    # All-zero folds the (now flush+low) arms into the base, so seed an arms-up
+    # ready pose. Set BOTH the physical state and the drive targets so the stiff
+    # arm drives hold it until /m1/joint_command takes over.
+    home = np.zeros(len(dof_names), dtype=np.float32)
+    for n, v in HOME_CONFIG.items():
+        if n in name_to_idx:
+            home[name_to_idx[n]] = v
+    for a in ("left", "right"):           # mimic: finger_joint2 follows finger_joint1
+        f1, f2 = f"openarm_{a}_finger_joint1", f"openarm_{a}_finger_joint2"
+        if f1 in name_to_idx and f2 in name_to_idx:
+            home[name_to_idx[f2]] = home[name_to_idx[f1]]
+    home2d = home.reshape(1, -1)
+    robot.set_joint_positions(home2d)
+    try:
+        robot.set_joint_position_targets(home2d)
+    except AttributeError:
+        from isaacsim.core.utils.types import ArticulationAction
+        robot.apply_action(ArticulationAction(joint_positions=home2d))
+    for _ in range(3):
+        simulation_app.update()
+    report("[ros_sim] startup posture set (arms up, clear of base)")
 
     report(f"[ros_sim] publishing /{JOINT_STATES_TOPIC} and /clock")
     report(f"[ros_sim] subscribing /{JOINT_COMMAND_TOPIC}")

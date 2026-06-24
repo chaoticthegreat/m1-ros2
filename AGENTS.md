@@ -11,6 +11,24 @@ Cartesian target pose and the arm joints + shared lift reach toward it; drive
 the base with a velocity command. Same control code is meant to later run on the
 real robot.
 
+> **Arm mounting (changed 2026-06-24).** The OpenArm "body" extrusion
+> (`openarm_body_link0`, the ~0.70 m riser) was **removed**: both arm bases now
+> bolt **FLUSH directly onto the moving lift carriage** (`lift_link`). They are
+> direct children of `lift_link` (left `xyz 0.0135 0.19 0.3492`, right
+> `-0.0485 0.19 0.3492`, both yaw −90°) — the carriage interface minus the riser,
+> then lowered a further 2 in (0.0508 m) by request. Net effect vs the old
+> description: the two arms (and their whole reachable workspace) sit **~0.749 m
+> lower** (arm base world z 0.629 at lift=0); the lift's 0.85 m travel more than
+> covers the drop, inter-arm spacing unchanged (62 mm). Purely a structural FK
+> change (verified exact to ~1e-18, no orientation leak). The Isaac **USD was
+> regenerated** (`isaac/convert_urdf_to_usd.py`; verified `openarm_body_link0` gone,
+> arm bases at world z 0.629), so the sim matches. **Startup posture:** all-zeros
+> now folds the (low) arms into the drivebase, so the sim seeds an **arms-up HOME
+> pose** (`HOME_CONFIG` in `isaac/ros_sim.py`, mirrored in the MoveIt SRDF `home`
+> group_states). All ROS-side consumers (solver/FK, RSP/RViz, MoveIt SRDF,
+> web/Quest viz) use the URDF and are updated. **If you edit the URDF geometry
+> again, re-run the convert script** — Isaac loads the USD, not the URDF.
+
 ## Environment (this machine)
 
 - Isaac Sim **5.1** native at `/home/jerry/isaac-sim`, bundled Python **3.11**.
@@ -89,9 +107,11 @@ real driver; everything in `ros2_ws/` is unchanged.
   once they share one stacked program, so the single lift is the least-squares
   compromise that best serves both grippers.
 
-  **Validation (all gated suites green):** `_solver_test.py` 14/14
+  **Validation (all gated suites green):** `_solver_test.py` 15/15
   (single/dual reach 100% sub-mm; worst-case `solve_step` ~21 ms, 0.5% over the
-  60 Hz budget, median ~2 ms), `_accuracy_bench.py` 10/10 (M1 singularity max
+  60 Hz budget, median ~2 ms; the far-jump held-arm gate was split into a settled
+  check + a bounded-transient check after the flush-mount drop — see below),
+  `_accuracy_bench.py` 10/10 (M1 singularity max
   1.13 mm / p95 ~0; M2 smooth 0.0 mm; M3 dual max 0.19 mm / p99 0.14; M4 near-
   boundary max 0.13 mm, 100% <1 mm; LAT max ~20 ms, 0.1% over budget),
   `_solver_test_positions.py` 21/21 (300 single + 200 dual reachable points 100%
@@ -386,12 +406,17 @@ is not running — the web panel's status dot makes this obvious.
 - **Solver is now Drake-backed** (see the `kinematics.py` key-file note). The
   numbers below are with the Drake `InverseKinematics` + amortized multi-start
   solver; they are equal-or-better than the bespoke DLS solver it replaced.
-- **Full solver suite `_solver_test.py` (no ROS): 14/14 gates pass.** Covers
+- **Full solver suite `_solver_test.py` (no ROS): 15/15 gates pass.** Covers
   reachability (single+dual), continuous tracking, hold-under-disturbance,
   latency distribution, and stress. Key results: **100% of reachable single-arm
   targets <1 mm *from a cold start*** (mean ~0.01 mm), dual-arm 100% <5 mm (max
   ~0.08 mm), **worst-case `solve_step` ~21 ms (median ~2 ms, 0.5% over the 60 Hz
-  budget — a goal, not a cutoff)**, held-arm far-jump disturbance 0 mm.
+  budget — a goal, not a cutoff)**. Held-arm far-jump disturbance: SETTLES at
+  0 mm with a brief ~67 mm transient while the shared lift slews to serve the
+  other arm's cold jump (was ~7 mm pre-flush-mount; the lower arms couple the
+  lift's z-slew into the held fingertip more — fully recovers, nowhere near the
+  old >130 mm "snap" bug). Gate split accordingly: settled <2 mm + transient
+  bounded <80 mm.
   Steady-state `solve_step` ~1 ms; the cold multi-start search is amortized across
   ticks (one or two Drake seeds per tick) so no tick blows the budget.
 - **Many-positions suite `_solver_test_positions.py` (no ROS): 21/21 gates** (the
@@ -526,3 +551,14 @@ is not running — the web panel's status dot makes this obvious.
   URDF has those frames if you want to add sensor graphs).
 - Node/attribute names in `ros_sim.py` target the Isaac Sim 5.x
   `isaacsim.ros2.bridge`; if Isaac is upgraded, re-check them.
+- **Isaac USD regenerated for the flush-mount change (2026-06-24).** The arms were
+  re-mounted flush on the lift carriage (extrusion removed, ~0.70 m lower) in
+  `assets/ranger_air_description/urdf/ranger_air_description.urdf`. Isaac loads the
+  USD (`assets/usd/ranger_air.usd` + `configuration/*.usd`), not the URDF, so it was
+  re-derived by re-running `/home/jerry/isaac-sim/python.sh isaac/convert_urdf_to_usd.py`
+  (headless; ROS-bridge OmniGraph is added at runtime by `ros_sim.py`, so nothing is
+  lost). Verified: `openarm_body_link0` absent, arm bases at world z 0.68 (matches the
+  URDF FK), gripper `mimic` honored. **Reminder: any future URDF geometry edit needs
+  that convert script re-run** or the sim silently diverges. The ROS-side stack
+  (solver, RSP/RViz, MoveIt SRDF, web/Quest viz, all gated suites) uses the URDF and
+  is validated (10/10 suites green; browser-rendered the new model).

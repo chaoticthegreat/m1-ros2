@@ -62,10 +62,6 @@
    "mesh": "/meshes/b65fd926d3.glb?v=d096cab0"
   },
   {
-   "link": "openarm_body_link0",
-   "mesh": "/meshes/b6a19a0437.glb?v=e6dc336b"
-  },
-  {
    "link": "openarm_left_base_link",
    "mesh": "/meshes/514d760237.glb?v=e693f92a"
   },
