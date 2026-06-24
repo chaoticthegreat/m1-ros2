@@ -129,14 +129,21 @@ class MotorBus:
         self.transport.send(dm.arb_id(info["id"], "mit"), data)
 
     # --- telemetry / scan --------------------------------------------------
-    def telemetry(self, joint: str, timeout: float = 0.01) -> Optional[dict]:
+    def telemetry(self, joint: str, timeout: float = 0.01,
+                  poll: bool = True) -> Optional[dict]:
         """Read & decode the most recent feedback frame for *joint*.
 
         Returns the decoded ``{id, err, pos, vel, torque, t_mos, t_rotor}`` (with
         ``dir``/``offset`` applied to ``pos``), or ``None`` if no frame arrived.
+        When ``poll`` (default), first sends a non-energizing **refresh** request
+        (``0xCC`` -> ``0x7FF``) so a motor that isn't streaming still replies --
+        the documented way to poll DM state, and what makes passive maintenance
+        telemetry work without enabling the motor.
         """
         info = self._info(joint)
         want = info.get("master_id", dm.master_id(info["id"]))
+        if poll:
+            self.transport.send(dm.PARAM_ARB_ID, dm.refresh_frame(info["id"]))
         frame = self.transport.recv(timeout=timeout)
         while frame is not None:
             arb, data = frame

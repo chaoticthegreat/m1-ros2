@@ -106,6 +106,28 @@
     <div id="scanResult" class="muted">No scan yet.</div>
   </section>
 
+  <!-- ASSIGN / MAP -->
+  <section class="card">
+    <h2>Assign &amp; map</h2>
+    <div class="muted">Map a motor to a logical joint (persists to the motor map),
+      or re-assign a motor's CAN id on the bus.</div>
+    <div class="row" style="margin-top:12px"><label>Joint</label>
+      <select id="mapJoint"></select></div>
+    <div class="row"><label>CAN / master</label>
+      <input type="number" id="mapId" min="1" placeholder="id"/>
+      <input type="number" id="mapMaster" min="1" placeholder="master"/></div>
+    <div class="row"><label>Model</label>
+      <select id="mapModel"></select>
+      <button id="mapBtn">Map joint</button></div>
+    <div id="mapMsg" class="muted"></div>
+    <div class="row" style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px">
+      <label>Re-assign id</label>
+      <input type="number" id="asgOld" min="1" placeholder="old"/>
+      <input type="number" id="asgNew" min="1" placeholder="new"/>
+      <button id="asgBtn">Reassign</button></div>
+    <div id="asgMsg" class="muted"></div>
+  </section>
+
   <!-- LIMITS EDITOR -->
   <section class="card">
     <h2>Per-joint limits</h2>
@@ -186,10 +208,38 @@ document.getElementById("scanBtn").onclick = async ()=>{
     : "No motors responded.";
 };
 
+/* ---------- assign / map ---------- */
+const MODELS = ["DM3507","DM4310","DM4310_48V","DM4340","DM4340_48V","DM6006",
+  "DM8006","DM8009","DM10010L","DM10010","DMH3510","DMH6215","DMG6220"];
+document.getElementById("mapModel").innerHTML = MODELS.map(m=>`<option>${m}</option>`).join("");
+function syncMapFields(){
+  const j = document.getElementById("mapJoint").value, info = MAP[j]||{};
+  if(info.id!=null) document.getElementById("mapId").value = info.id;
+  if(info.master_id!=null) document.getElementById("mapMaster").value = info.master_id;
+  if(info.model) document.getElementById("mapModel").value = info.model;
+}
+document.getElementById("mapJoint").onchange = syncMapFields;
+document.getElementById("mapBtn").onclick = async ()=>{
+  const r = await post("/api/map", {
+    joint: document.getElementById("mapJoint").value,
+    id: +document.getElementById("mapId").value,
+    master_id: +document.getElementById("mapMaster").value,
+    model: document.getElementById("mapModel").value});
+  document.getElementById("mapMsg").textContent =
+    r.code===200 ? "mapped + saved to motor map." : ("rejected: "+(r.body.error||r.code));
+};
+document.getElementById("asgBtn").onclick = async ()=>{
+  const r = await post("/api/assign", {
+    old_id: +document.getElementById("asgOld").value,
+    new_id: +document.getElementById("asgNew").value});
+  document.getElementById("asgMsg").textContent =
+    r.code===200 ? "id reassigned." : ("rejected: "+(r.body.error||r.code));
+};
+
 /* ---------- limits ---------- */
 function fillJointSelects(){
   const names = Object.keys(MAP);
-  for(const id of ["limJoint","jogJoint"]){
+  for(const id of ["limJoint","jogJoint","mapJoint"]){
     const sel = document.getElementById(id);
     const cur = sel.value;
     sel.innerHTML = names.map(n=>`<option>${n}</option>`).join("");
@@ -251,7 +301,7 @@ function applyMode(){
   const run = MODE==="run";
   document.getElementById("ownerText").textContent = run ? "run (ros2_control)" : "maintenance";
   document.getElementById("banner").className = "banner"+(run?" run":"");
-  for(const id of ["scanBtn","limSave","enBtn","disBtn","zeroBtn","jogHold"])
+  for(const id of ["scanBtn","limSave","enBtn","disBtn","zeroBtn","jogHold","mapBtn","asgBtn"])
     document.getElementById(id).disabled = run;
   if(run) stopJog();
 }
@@ -265,7 +315,7 @@ async function poll(){
     else { dot.classList.remove("on"); st.textContent = "no bus"; }
     applyMode();
     if(Object.keys(MAP).length && !document.getElementById("limJoint").options.length){
-      fillJointSelects(); syncLimitFields();
+      fillJointSelects(); syncLimitFields(); syncMapFields();
     }
     const body = document.getElementById("telBody");
     body.innerHTML = (s.motors||[]).map(m=>{

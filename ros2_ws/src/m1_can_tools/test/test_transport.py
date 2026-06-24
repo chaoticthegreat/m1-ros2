@@ -81,3 +81,27 @@ def test_serial_is_lazy(monkeypatch):
     assert t.dev == "/dev/ttyACM0" and t.baud == 921600
     with pytest.raises(AssertionError):
         t.send(0x01, b"\x00" * 8)
+
+
+# --- SimTransport: virtual motors reply to refresh / MIT -------------------
+def test_sim_transport_refresh_and_mit():
+    import m1_can_tools.transport as tp
+    from m1_can_tools import dm_protocol as dm
+    sim = tp.make_transport({"kind": "sim", "motors": {
+        0x02: {"master_id": 0x12, "model": "DM8009"},
+    }})
+    # Refresh poll -> a feedback frame on the master id.
+    sim.send(dm.PARAM_ARB_ID, dm.refresh_frame(0x02))
+    frame = sim.recv()
+    assert frame is not None and frame[0] == 0x12
+    # MIT command -> virtual motor moves to commanded pos; next refresh reflects it.
+    sim.send(dm.arb_id(0x02, "mit"), dm.encode_mit(0.5, 0, 30, 1, 0, "DM8009"))
+    sim.recv()  # drain the immediate MIT reply
+    sim.send(dm.PARAM_ARB_ID, dm.refresh_frame(0x02))
+    arb, data = sim.recv()
+    fb = dm.decode_feedback(data, "DM8009")
+    assert abs(fb["pos"] - 0.5) < 0.02
+    # recv with empty queue returns None (no infinite streaming).
+    while sim.recv() is not None:
+        pass
+    assert sim.recv() is None

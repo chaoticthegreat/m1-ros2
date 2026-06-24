@@ -21,7 +21,9 @@ from __future__ import annotations
 import abc
 import struct
 from collections import deque
-from typing import Deque, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Tuple
+
+from m1_can_tools import dm_protocol as dm
 
 Frame = Tuple[int, bytes]
 
@@ -194,18 +196,118 @@ class SerialTransport(Transport):
             self._ser = None
 
 
+class SimTransport(Transport):
+    """In-memory simulation of a set of DM motors (no hardware, no third-party deps).
+
+    Models each motor's virtual state (position/velocity/torque/temperature) and
+    replies with a faithful feedback frame (:func:`dm_protocol.encode_feedback`) on
+    the motor's master id, in response to:
+
+    * a **refresh** poll (``0x7FF`` + ``0xCC`` -> reply for the addressed motor),
+    * a **special** frame (enable ``0xFC`` / disable ``0xFD`` / set-zero ``0xFE`` /
+      clear-error ``0xFB`` -> update + reply), and
+    * a **MIT** command (decode the commanded position, move the virtual motor to
+      it, reply).
+
+    :meth:`recv` returns only queued replies (``None`` when empty), so a polling
+    reader (:meth:`MotorBus.telemetry`, which now sends a refresh before reading)
+    drives it correctly. Used for offline demos of ``m1_hwconfig`` and as a richer
+    test double than :class:`FakeTransport`.
+    """
+
+    def __init__(self, motors: Dict[int, dict]) -> None:
+        self._m: Dict[int, dict] = {}
+        for sid, info in motors.items():
+            sid = int(sid)
+            self._m[sid] = {
+                "master_id": int(info.get("master_id", dm.master_id(sid))),
+                "model": info.get("model", "DM4310"),
+                "pos": float(info.get("pos", 0.0)),
+                "vel": 0.0,
+                "torque": 0.0,
+                "t_mos": 32,
+                "t_rotor": 30,
+                "enabled": False,
+                "err": 0,
+            }
+        self._rx: Deque[Frame] = deque()
+        self.sent: List[Frame] = []
+        self.closed = False
+
+    def _reply(self, sid: int) -> None:
+        m = self._m.get(int(sid))
+        if m is None:
+            return
+        data = dm.encode_feedback(
+            int(sid) & 0x0F, m["pos"], m["vel"], m["torque"],
+            m["t_mos"], m["t_rotor"], m["model"], err=m["err"],
+        )
+        self._rx.append((m["master_id"], data))
+
+    def send(self, arb_id: int, data: bytes) -> None:
+        arb_id = int(arb_id)
+        data = bytes(data)
+        self.sent.append((arb_id, data))
+
+        # Refresh poll: 0x7FF, [id_lo, id_hi, 0xCC, ...].
+        if arb_id == dm.PARAM_ARB_ID and len(data) >= 3 and data[2] == 0xCC:
+            self._reply(data[0] | (data[1] << 8))
+            return
+
+        # Special control frame: [0xFF*7, opcode], sent to the slave (MIT) id.
+        if len(data) == 8 and data[:7] == b"\xff" * 7:
+            m = self._m.get(arb_id)
+            if m is not None:
+                op = data[7]
+                if op == 0xFC:
+                    m["enabled"] = True
+                elif op == 0xFD:
+                    m["enabled"] = False
+                    m["vel"] = m["torque"] = 0.0
+                elif op == 0xFE:           # set zero
+                    m["pos"] = 0.0
+                elif op == 0xFB:           # clear error
+                    m["err"] = 0
+                self._reply(arb_id)
+            return
+
+        # Otherwise treat it as a MIT command at arb_id == slave id: move there.
+        m = self._m.get(arb_id)
+        if m is not None and len(data) == 8:
+            try:
+                cmd = dm.decode_mit_command(data, m["model"])
+                m["pos"] = cmd["p"]
+                m["torque"] = round(0.1 + 0.02 * abs(cmd["p"]), 3)
+                m["t_mos"] = 34
+                m["t_rotor"] = 31
+            except Exception:  # noqa: BLE001
+                pass
+            self._reply(arb_id)
+
+    def recv(self, timeout: float = 0.0) -> Optional[Frame]:
+        if self._rx:
+            return self._rx.popleft()
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def make_transport(spec: dict) -> Transport:
     """Build a :class:`Transport` from a spec dict.
 
     ``spec["kind"]`` selects the backend:
 
     * ``"fake"`` -> :class:`FakeTransport`
+    * ``"sim"`` -> :class:`SimTransport` (``motors``: ``{slave_id: {master_id, model, pos}}``)
     * ``"socketcan"`` -> :class:`SocketCanTransport` (``channel``, ``fd``)
     * ``"serial"`` -> :class:`SerialTransport` (``dev``, ``baud``)
     """
     kind = spec.get("kind")
     if kind == "fake":
         return FakeTransport()
+    if kind == "sim":
+        return SimTransport(spec.get("motors", {}))
     if kind == "socketcan":
         return SocketCanTransport(
             channel=spec.get("channel", "can0"), fd=bool(spec.get("fd", False))
@@ -215,5 +317,5 @@ def make_transport(spec: dict) -> Transport:
             dev=spec.get("dev", "/dev/ttyACM0"), baud=int(spec.get("baud", 921600))
         )
     raise ValueError(
-        f"unknown transport kind {kind!r}; expected 'fake', 'socketcan', or 'serial'"
+        f"unknown transport kind {kind!r}; expected 'fake', 'sim', 'socketcan', or 'serial'"
     )

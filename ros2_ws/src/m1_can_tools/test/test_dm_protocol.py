@@ -92,3 +92,22 @@ def test_decode_roundtrip_pos():
     fb = dm.decode_feedback(data, "DM4310")
     assert fb["id"] == 1 and fb["err"] == 0
     assert abs(fb["pos"]) < 0.001 and fb["t_mos"] == 40 and fb["t_rotor"] == 45
+
+
+# --- encode_feedback / decode_mit_command (inverse of decode_feedback/encode_mit)
+def test_encode_feedback_roundtrips():
+    for model in ("DM4310", "DM8009", "DM4340"):
+        for pos in (-1.0, 0.0, 0.5, 2.0):
+            data = dm.encode_feedback(3, pos, 0.0, 0.0, 41, 39, model, err=0)
+            fb = dm.decode_feedback(data, model)
+            assert fb["id"] == 3 and fb["err"] == 0
+            assert fb["t_mos"] == 41 and fb["t_rotor"] == 39
+            p_max, _, _ = dm.limits(model)
+            assert abs(fb["pos"] - pos) <= (2 * p_max) / (1 << 16) + 1e-9
+
+
+def test_decode_mit_command_roundtrips():
+    cmd = dm.encode_mit(0.7, 0.0, 30.0, 0.8, 0.0, "DM4310")
+    out = dm.decode_mit_command(cmd, "DM4310")
+    assert abs(out["p"] - 0.7) < 0.01
+    assert abs(out["kp"] - 30.0) < 0.5 and abs(out["kd"] - 0.8) < 0.1

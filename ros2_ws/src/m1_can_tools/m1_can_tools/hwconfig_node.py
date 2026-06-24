@@ -455,12 +455,27 @@ def main(args=None):
             # /joint_states instead of owning the bus).
             bus = None
             if mode == "maintenance":
+                kind = self.get_parameter("transport").value
                 spec = {
-                    "kind": self.get_parameter("transport").value,
+                    "kind": kind,
                     "channel": self.get_parameter("can_channel").value,
                     "fd": bool(self.get_parameter("can_fd").value),
                     "dev": self.get_parameter("serial_dev").value,
                 }
+                if kind == "sim":
+                    # Seed virtual motors from the map (small distinct start poses
+                    # so the demo page isn't all-zeros), keyed by slave id.
+                    motors = {}
+                    for i, (joint, info) in enumerate(motor_map.items()):
+                        motors[int(info["id"])] = {
+                            "master_id": int(info.get(
+                                "master_id", dm.master_id(int(info["id"])))),
+                            "model": info.get("model", "DM4310"),
+                            "pos": round(0.05 * ((i % 5) - 2), 3),
+                        }
+                    spec["motors"] = motors
+                    self.get_logger().info(
+                        f"SIM transport: {len(motors)} virtual motors")
                 try:
                     transport = make_transport(spec)
                     bus = MotorBus(transport, motor_map)

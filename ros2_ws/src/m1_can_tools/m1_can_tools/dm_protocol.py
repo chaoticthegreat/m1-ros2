@@ -241,3 +241,54 @@ def decode_feedback(data: bytes, model: str) -> dict:
         "t_mos": int(data[6]),
         "t_rotor": int(data[7]),
     }
+
+
+def encode_feedback(
+    motor_id: int, pos: float, vel: float, torque: float,
+    t_mos: int, t_rotor: int, model: str, err: int = 0,
+) -> bytes:
+    """Inverse of :func:`decode_feedback` -- build an 8-byte feedback frame.
+
+    Used by the off-bus motor simulator (:class:`~m1_can_tools.transport.SimTransport`)
+    and tests to synthesize a motor's reply. Bit layout matches decode_feedback
+    exactly, so ``decode_feedback(encode_feedback(...)) == inputs`` to quantization.
+    """
+    p_max, v_max, t_max = limits(model)
+    pos_u = float_to_uint(pos, -p_max, p_max, 16)
+    vel_u = float_to_uint(vel, -v_max, v_max, 12)
+    tau_u = float_to_uint(torque, -t_max, t_max, 12)
+    return bytes(
+        (
+            (motor_id & 0x0F) | ((err & 0x0F) << 4),
+            (pos_u >> 8) & 0xFF,
+            pos_u & 0xFF,
+            (vel_u >> 4) & 0xFF,
+            ((vel_u & 0x0F) << 4) | ((tau_u >> 8) & 0x0F),
+            tau_u & 0xFF,
+            int(t_mos) & 0xFF,
+            int(t_rotor) & 0xFF,
+        )
+    )
+
+
+def decode_mit_command(data: bytes, model: str) -> dict:
+    """Decode an 8-byte MIT command frame (inverse of :func:`encode_mit`).
+
+    Returns ``{p, v, kp, kd, tau}``. Used by the motor simulator to move a
+    virtual motor to the commanded position.
+    """
+    if len(data) < 8:
+        raise ValueError(f"MIT frame needs 8 bytes, got {len(data)}")
+    p_max, v_max, t_max = limits(model)
+    q_u = (data[0] << 8) | data[1]
+    dq_u = (data[2] << 4) | (data[3] >> 4)
+    kp_u = ((data[3] & 0x0F) << 8) | data[4]
+    kd_u = (data[5] << 4) | (data[6] >> 4)
+    tau_u = ((data[6] & 0x0F) << 8) | data[7]
+    return {
+        "p": uint_to_float(q_u, -p_max, p_max, 16),
+        "v": uint_to_float(dq_u, -v_max, v_max, 12),
+        "kp": uint_to_float(kp_u, KP_MIN, KP_MAX, 12),
+        "kd": uint_to_float(kd_u, KD_MIN, KD_MAX, 12),
+        "tau": uint_to_float(tau_u, -t_max, t_max, 12),
+    }
