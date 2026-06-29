@@ -5,7 +5,6 @@ follows the commanded joint positions (same assumption as _e2e_check's
 FakeRobot), so we can measure how close the ReachController gets to a range of
 Cartesian targets and how fast.
 """
-import math
 import os
 import sys
 import time

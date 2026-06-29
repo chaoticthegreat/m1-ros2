@@ -100,7 +100,7 @@ def main() -> None:
 
     # Find the prim carrying the articulation root (fall back to the robot root).
     articulation_path = robot_root
-    for prim in Usd_iter(stage, robot_root):
+    for prim in _iter_prims(stage, robot_root):
         if prim.HasAPI(UsdPhysics.ArticulationRootAPI):
             articulation_path = prim.GetPath().pathString
             break
@@ -141,14 +141,14 @@ def main() -> None:
     report("[sim] done.")
 
 
-def Usd_iter(stage, root_path):
+def _iter_prims(stage, root_path):
     """Yield the prim at root_path and all of its descendants."""
     root = stage.GetPrimAtPath(root_path)
     if not root or not root.IsValid():
         return
     yield root
     for child in root.GetChildren():
-        yield from Usd_iter(stage, child.GetPath().pathString)
+        yield from _iter_prims(stage, child.GetPath().pathString)
 
 
 def _setup_wheel_drive_demo(stage, robot_root, UsdPhysics):
@@ -160,7 +160,7 @@ def _setup_wheel_drive_demo(stage, robot_root, UsdPhysics):
         "rr_wheel_joint",
     ]
     found = 0
-    for prim in Usd_iter(stage, robot_root):
+    for prim in _iter_prims(stage, robot_root):
         name = prim.GetName()
         if name in wheel_joint_names:
             drive = UsdPhysics.DriveAPI.Get(prim, "angular")

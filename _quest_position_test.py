@@ -130,7 +130,6 @@ def main():
     # --- 4. thumbsticks drive the base ---------------------------------------
     n = make_node(enable_base=True)
     # left stick pushed forward (y=-1), right stick pushed right (x=+1)
-    phys = {"left": "right", "right": "left"}
     controllers = {
         "left": ctrl([0, 0, 0], stick=(0.0, -1.0)),
         "right": ctrl([0, 0, 0], stick=(1.0, 0.0)),

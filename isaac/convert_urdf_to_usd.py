@@ -2,7 +2,7 @@
 
 Run with the Isaac Sim python environment, e.g.:
 
-    cd /home/jerry/Downloads/M1-visualizer
+    cd /home/jerry/Downloads/m1-ros2-setup
     /home/jerry/isaac-sim/python.sh isaac/convert_urdf_to_usd.py
 
 The resulting USD is written to assets/usd/ranger_air.usd by default.
@@ -49,7 +49,7 @@ def main() -> None:
     import omni.kit.commands
     from pxr import Usd
 
-    status, import_config = omni.kit.commands.execute("URDFCreateImportConfig")
+    _, import_config = omni.kit.commands.execute("URDFCreateImportConfig")
     # Keep all links/frames (lidars, imu, camera mounts) instead of collapsing them.
     import_config.merge_fixed_joints = False
     # Mobile robot: base is free unless --fix-base is passed.

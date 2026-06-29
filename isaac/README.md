@@ -16,7 +16,7 @@ the base conda env). Run everything from the repo root.
 ## 1. Convert the URDF to USD
 
 ```bash
-cd /home/jerry/Downloads/M1-visualizer
+cd /home/jerry/Downloads/m1-ros2-setup
 /home/jerry/isaac-sim/python.sh isaac/convert_urdf_to_usd.py
 ```
 

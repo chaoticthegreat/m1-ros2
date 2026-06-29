@@ -142,8 +142,6 @@ class Bench:
                 "pct_lt5mm": 100 * (errs < 5e-3).mean()}
 
     def m4_boundary(self, n=300):
-        out = {}
-        worst = 0.0
         allmax = 0.0
         pct1 = []
         for arm in ("left", "right"):

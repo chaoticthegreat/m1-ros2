@@ -25,8 +25,6 @@ import threading
 import time
 import types
 
-import numpy as np
-
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "ros2_ws/src/m1_control"))
 
 from m1_control.quest_node import M1QuestNode, _make_handler, _Server  # noqa: E402

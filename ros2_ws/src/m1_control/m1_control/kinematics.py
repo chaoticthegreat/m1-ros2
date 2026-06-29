@@ -339,7 +339,7 @@ class UrdfModel:
         child_links = {j.child for j in self.joints.values()}
         all_links = set(children) | child_links
         roots = [lk for lk in all_links if lk not in child_links]
-        order = []  # (joint_name, child_link); parent already resolved
+        order = []  # joint names, parent-before-child (a joint's parent link transform is resolved before the joint is applied)
         stack = list(roots)
         while stack:
             link = stack.pop()
@@ -497,15 +497,16 @@ class ArmChain:
 
 
 class ReachController:
-    """Converged DLS Cartesian reach for one or both arms + shared lift.
+    """Drake-backed Cartesian reach for one or both arms + shared lift.
 
-    Each :meth:`solve_step` runs a full damped Gauss-Newton IK (iterated to
-    convergence against the URDF model, with adaptive damping and multi-seed
-    restarts) to find the optimal joint configuration for the requested
-    target(s), then leads the measured pose toward it by a bounded step. When
-    both arms reach at once they are solved in one stacked system, so the shared
-    lift column is resolved as the least-squares compromise that best serves
-    both grippers.
+    Each :meth:`solve_step` dispatches to a Drake-backed position-cost IK -- a
+    warm in-branch tracking solve when the target moved only a little, or an
+    amortized cold multi-start (a few Drake seeds per tick) for a first/big-jump
+    solve -- to find the optimal joint configuration for the requested
+    target(s), then leads the measured command toward it by a bounded step and
+    applies a small capped per-arm Cartesian polish. When both arms reach at
+    once they share one stacked Drake program, so the single shared lift is
+    resolved as the least-squares compromise that best serves both grippers.
     """
 
     def __init__(self, model: UrdfModel):
@@ -535,8 +536,9 @@ class ReachController:
         return self.chains[arm].fk(q)[0]
 
     def gripper_pose(self, arm: str, q: dict):
-        """(tip_pos, R_tip) of one arm's gripper -- used to seed a 6-DOF target
-        onto the live pose so the arm doesn't jump when orientation turns on."""
+        """(tip_pos, R_tip) of one arm's gripper from FK -- a position+orientation
+        FK helper retained so the viz/tests can report gripper rotation. The
+        reach itself is position-only and never constrains R_tip."""
         tip_pos, R_tip, _ = self.chains[arm].fk_pose(q)
         return tip_pos, R_tip
 
@@ -588,34 +590,6 @@ class ReachController:
         J = np.vstack(Jblocks)
         e = np.concatenate(eblocks)
         return J, e, dist
-
-    def _errs(self, q_vec, joint_order, arms, pos):
-        """Stacked task error (no Jacobian) for the current joint vector.
-
-        The error-only counterpart of :meth:`_stack`: it runs only forward
-        kinematics (no Jacobian assembly), so it is the cheap evaluation the
-        iteration's backtracking line search uses to test trial steps. Returns
-        ``(e, dist)`` so ``e @ e`` is the identical task cost as :meth:`_stack`.
-        """
-        q = {jn: float(q_vec[k]) for k, jn in enumerate(joint_order)}
-        eblocks = []
-        dist = {}
-        for a in arms:
-            tip_pos, _ = self.chains[a].fk(q)
-            ep = np.asarray(pos[a], dtype=np.float64) - tip_pos
-            dist[a] = float(np.linalg.norm(ep))
-            eblocks.append(ep)
-        return np.concatenate(eblocks), dist
-
-    @staticmethod
-    def _resid(dist):
-        """Scalar solve residual: the worst per-arm position error."""
-        return max(dist.values())
-
-    @staticmethod
-    def _converged(dist):
-        """All arms within position tolerance."""
-        return all(d < IK_POS_TOL for d in dist.values())
 
     @staticmethod
     def _dls(J, e):

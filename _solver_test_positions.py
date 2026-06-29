@@ -12,10 +12,12 @@ number of positions:
   C. WORKSPACE GRID SWEEP      -- a dense 3D grid of points across a box in front
      of the robot; reports the reachable fraction and that every point the solver
      reports "reached" really is reached (no false convergence / NaNs).
-  D. ORIENTATION IS IGNORED    -- the same point solved as a bare 3-vector and as
+  D. WORKSPACE COVERAGE        -- a per-arm grid over the reach envelope (both
+     arms together) reporting the reachable fraction across the workspace box.
+  E. ORIENTATION IS IGNORED    -- the same point solved as a bare 3-vector and as
      a 6-DOF pose dict {"pos","R"} with a random rotation must yield the IDENTICAL
      joint solution (proves the rotation component was removed).
-  E. LATENCY                   -- solve_step stays inside the 60 Hz budget.
+  F. LATENCY                   -- solve_step stays inside the 60 Hz budget.
 
 Run:  /usr/bin/python3 _solver_test_positions.py
 Exit code is 0 only if every gate passes.
@@ -188,9 +190,9 @@ def test_grid_sweep(steps=7):
     }
 
 
-# --- F. workspace coverage (both arms, reach envelope) -----------------------
+# --- D. workspace coverage (both arms, reach envelope) -----------------------
 def test_workspace_coverage(steps=5):
-    print(f"F. WORKSPACE COVERAGE (both arms, {steps}^3 grid each)")
+    print(f"D. WORKSPACE COVERAGE (both arms, {steps}^3 grid each)")
     # A wide box per arm (right mirrored in y) spanning the reachable envelope, to
     # confirm the solver reaches accurately ACROSS the workspace -- both arms,
     # ARBITRARY points (not only FK-sampled ones). NB a box point just *outside*
@@ -228,9 +230,9 @@ def test_workspace_coverage(steps=5):
     }
 
 
-# --- D. orientation is ignored ----------------------------------------------
+# --- E. orientation is ignored ----------------------------------------------
 def test_orientation_ignored(n=60):
-    print(f"D. ORIENTATION IGNORED (n={n}: bare point == 6-DOF pose dict)")
+    print(f"E. ORIENTATION IGNORED (n={n}: bare point == 6-DOF pose dict)")
     rng = np.random.default_rng(2718)
 
     def _solve(reach, target):
@@ -262,11 +264,11 @@ def test_orientation_ignored(n=60):
     }
 
 
-# --- E. latency --------------------------------------------------------------
+# --- F. latency --------------------------------------------------------------
 def report_latency():
     tt = np.array(TICKS)
     over = int((tt > BUDGET_MS).sum())
-    print("E. LATENCY (solve_step over the whole suite)")
+    print("F. LATENCY (solve_step over the whole suite)")
     print(f"   mean {tt.mean():.2f}ms  p95 {np.percentile(tt,95):.2f}ms  "
           f"p99 {np.percentile(tt,99):.2f}ms  max {tt.max():.2f}ms  over-budget "
           f"{over}/{len(tt)} ({100*over/len(tt):.2f}%)")

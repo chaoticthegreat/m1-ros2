@@ -2,9 +2,11 @@
 #
 # Position/velocity/effort limits are taken VERBATIM from the <limit> tags in
 # assets/ranger_air_description/urdf/ranger_air_description.urdf (the source of
-# truth). Consumed by ros2_control's joint_limits / enforce_command_limits so a
-# streamed setpoint is clamped to these bounds (the framework version of the
-# brain's IK_MAX_DQ; defense in depth).
+# truth). This file is a human-readable MIRROR of those URDF <limit> tags and is
+# NOT the loaded enforcement source: enforce_command_limits reads the
+# robot_description / URDF that the controller_manager loads, not this YAML. It is
+# kept in sync as defense-in-depth documentation and as m1_hwconfig's default
+# limits-edit target.
 #
 # Acceleration limits are NOT in the URDF, so modest defaults are supplied:
 #   arms        20.0 rad/s^2

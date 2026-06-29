@@ -20,7 +20,7 @@ setup(
         # MoveIt config (Phase 3): SRDF + kinematics/OMPL/controllers yaml for
         # planned, collision-aware moves (m1_moveit.launch.py reads these).
         (os.path.join("share", package_name, "moveit"),
-            glob("moveit/*.srdf") + glob("moveit/*.srdf.xacro") + glob("moveit/*.yaml")),
+            glob("moveit/*.srdf") + glob("moveit/*.yaml")),
     ],
     install_requires=["setuptools"],
     zip_safe=True,

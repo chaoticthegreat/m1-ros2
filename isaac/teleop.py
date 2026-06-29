@@ -14,7 +14,7 @@ the robot can drive straight, crab sideways, turn in place, or arc while moving.
 This needs a display (it opens an Isaac Sim window and listens for keyboard
 events), so do NOT run it headless. Launch with Isaac Sim's bundled Python:
 
-    cd /home/jerry/Downloads/M1-visualizer
+    cd /home/jerry/Downloads/m1-ros2-setup
     /home/jerry/isaac-sim/python.sh isaac/teleop.py
 
 If the USD asset does not exist yet, run isaac/convert_urdf_to_usd.py first.
@@ -575,7 +575,6 @@ def main() -> None:
             idxs += list(arm_joint_idx[a])
         lift_in_ik = lift_idx is not None
         if lift_in_ik:
-            lift_pos = len(idxs)
             idxs.append(lift_idx)
         n_ik = len(idxs)
         cols = [i + col_offset for i in idxs]

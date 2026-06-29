@@ -21,14 +21,14 @@ position entry has no effect; every other joint is position-driven with a 0
 target velocity so it holds its pose. This keeps the message free of NaNs,
 which the Isaac articulation controller handles more reliably.
 
-Given a target pose, the arms + shared lift run a damped-least-squares reach
+Given a target pose, the arms + shared lift run a Drake-backed Cartesian reach
 toward the requested point. The reach is **position-only**: the gripper
 fingertip is driven to the target point and the pose's orientation is ignored.
 Targets are interpreted in the robot ``base_link`` frame.
 
-Each tick the solver iterates a full Gauss-Newton IK to the optimal joint
-configuration for the active target(s) and leads the measured pose toward it by
-a bounded step, so reachable targets converge to sub-millimetre error and an
+Each tick the solver (Drake InverseKinematics + amortized multi-start) finds the
+optimal joint configuration for the active target(s) and leads the measured pose
+toward it by a bounded step, so reachable targets converge to sub-millimetre error and an
 unreachable one settles at the closest the joints allow. The shared prismatic
 lift is recruited automatically to help the arms reach; when both arms have
 targets they are solved together and the single lift is resolved as the

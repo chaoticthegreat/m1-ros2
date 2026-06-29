@@ -109,8 +109,6 @@ def run_traj(reach, traj, q, ticks_times, settle_first=True):
     arm.
     """
     arms = list(traj.keys())
-    n = None
-    # Probe length from the first traj.
     diag = {a: {"err": [], "fstep": [], "gstep": [], "res": []} for a in arms}
     prev_tip = {a: reach.fingertip(a, q) for a in arms}
     prev_goal = {a: None for a in arms}

@@ -6,8 +6,8 @@ This replaces the Isaac Sim process with the ros2_control stack:
   * ros2_control_node      - controller_manager hosting the hardware (mock or the
                              real m1_hardware/M1SystemInterface Damiao plugin)
   * spawners               - joint_state_broadcaster (-> /joint_states),
-                             arm_position_controller (forward position, the 19
-                             upper-body joints), left/right_arm_jtc (inactive,
+                             arm_position_controller (forward position, the 17
+                             commanded upper-body joints), left/right_arm_jtc (inactive,
                              for planned moves later)
   * m1_joint_bridge        - /m1/joint_command -> /arm_position_controller/commands
   * m1_controller          - the unchanged Drake brain (pose -> /m1/joint_command)

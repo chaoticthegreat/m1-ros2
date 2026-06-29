@@ -139,9 +139,13 @@ def _heading_basis(head_fwd) -> tuple[np.ndarray, np.ndarray]:
     axis map makes "your left" land on the wrong robot axis. Instead we project
     the headset forward direction onto the floor and derive:
 
-        F = headset forward (horizontal)  -> robot +x (away from you = forward)
-        L = up x F                        -> robot +y (your left)
-        up (WebXR y)                      -> robot +z
+        F = headset forward (horizontal); L = up x F (your left); up = WebXR y.
+        The caller (on_xr_frame clutch) projects the hand delta onto this
+        {F, L, up} basis and maps it to robot axes as
+            robot x = -(d . L)   (your right -> +x; x/y swapped, x reversed)
+            robot y =  (d . F)   (your forward -> +y)
+            robot z =   d_up     (up -> +z)
+        (see the inline comments at the call site).
 
     Returns (F, L) as WebXR-space unit vectors. With no head pose we fall back
     to F=-z (facing the reference-space default), which reduces to the old map.
@@ -322,16 +326,10 @@ class M1QuestNode(Node):
                 return
             for arm in ("left", "right"):
                 # Seed each arm's target onto its current fingertip exactly once
-                # so the arm holds still on connect instead of snapping.
-                if self.seeded[arm]:
-                    continue
-                if all(j in self.q_meas for j in ARM_JOINTS[arm] + [LIFT_JOINT]):
-                    try:
-                        tip = self.reach.fingertip(arm, self.q_meas)
-                        self.target[arm] = [float(tip[0]), float(tip[1]), float(tip[2])]
-                        self.seeded[arm] = True
-                    except Exception:  # noqa: BLE001
-                        pass
+                # so the arm holds still on connect instead of snapping. _reseed
+                # does the same FK seed and is lock-free (we already hold _lock).
+                if not self.seeded[arm]:
+                    self._reseed(arm)
 
     def _reseed(self, arm: str):
         if self.reach is None:
@@ -887,7 +885,8 @@ def main(args=None):
     except OSError as exc:
         node.get_logger().error(
             f"could not open a port near {node.port} ({exc}). Another m1_quest "
-            f"may be running (`pkill -f m1_quest`) or pick another port "
+            f"may be running -- find it with `ss -ltnp | grep {node.port}` (or "
+            f"`lsof -i :{node.port}`) and `kill` that PID, or pick another port "
             "(`--ros-args -p port:=9443`).")
         node.destroy_node()
         if rclpy.ok():

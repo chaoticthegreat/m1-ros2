@@ -223,7 +223,7 @@ def test_tracking(reach):
 
 
 # --- C. hold under base-motion disturbance -----------------------------------
-def test_hold_disturbed(reach):
+def test_hold_disturbed(_reach):
     """Target held base-relative while the measured joints are jostled each tick.
 
     Base driving perturbs the arm (the joints deviate slightly from command). The
@@ -264,7 +264,7 @@ def test_hold_disturbed(reach):
 
 
 # --- E. stress ---------------------------------------------------------------
-def test_stress(reach):
+def test_stress(_reach):
     print("E. STRESS (random jumps, arm-set toggling, unreachable)")
     rng = np.random.default_rng(11)
     r = load()
@@ -283,7 +283,7 @@ def test_stress(reach):
             targets["right"] = r.fingertip("right", _cfg("right", rng.uniform(0, 0.85))) \
                 if rng.random() < 0.7 else np.array([rng.uniform(0.2, 1.2), rng.uniform(-0.6, 0.2), rng.uniform(0.2, 1.6)])
         for _ in range(rng.integers(1, 6)):  # hold each target a few ticks
-            res = _step(r, q, targets)
+            _step(r, q, targets)
             for a in ("left", "right"):
                 if targets[a] is not None:
                     tip = r.fingertip(a, q)

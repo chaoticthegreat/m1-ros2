@@ -34,7 +34,6 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "ros2_ws/src/m1_control"))
 
-import m1_control.kinematics as K  # noqa: E402
 from m1_control.kinematics import (  # noqa: E402
     ARM_JOINTS,
     LIFT_JOINT,
@@ -167,7 +166,7 @@ def test_plan_and_track(reach, planner):
 def test_warm_solve(reach):
     print("B. WARM SOLVE (settle at A, then move in-motion to B, land accurately)")
     rng = np.random.default_rng(202)
-    errs, max_step, branchflip = [], 0.0, 0
+    errs, max_step = [], 0.0
     N = 30
     for _ in range(N):
         lift = rng.uniform(0.2, 0.6)

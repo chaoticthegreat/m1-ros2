@@ -4,7 +4,7 @@ Covers the PURE FUNCTIONS at the core of the new bridge nodes -- no ROS, no DDS,
 no hardware -- the project's offline-gate idiom (cf. ``_ros_reach_check.py`` /
 ``_quest_position_test.py`` drive the real logic without a live graph):
 
-  * joint_command_bridge.map_command   -- /m1/joint_command -> 19-vector pick,
+  * joint_command_bridge.map_command   -- /m1/joint_command -> 17-vector pick,
                                            reorder / missing-name / drop-steer-wheel
   * base_bridge.select_motion_mode      -- AgileX PARALLEL / SPINNING /
                                            DUAL_ACKERMANN mode switch
@@ -73,7 +73,6 @@ try:
 except Exception:  # noqa: BLE001
     _stub_ros()
 
-from m1_control import base_bridge, joint_command_bridge, ranger_state_shim
 from m1_control.joint_command_bridge import UPPER_BODY, map_command
 from m1_control.base_bridge import select_motion_mode
 from m1_control.ranger_state_shim import BASE_JOINTS, steer_wheel_to_jointstate

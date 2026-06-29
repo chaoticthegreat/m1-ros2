@@ -316,7 +316,10 @@ def _bind_server(node: M1WebNode, handler, tries: int = 10):
             return server
         except OSError as exc:  # noqa: PERF203
             last_exc = exc
-            node.get_logger().warn(f"port {port} busy, trying {port + 1}…")
+            if port + 1 < node.port + tries:
+                node.get_logger().warn(f"port {port} busy, trying {port + 1}…")
+            else:
+                node.get_logger().warn(f"port {port} busy")
     raise last_exc
 
 
@@ -330,8 +333,8 @@ def main(args=None):
         node.get_logger().error(
             f"could not open a web port near {node.port} ({exc}). "
             "Another m1_web may be running. Find it with "
-            f"`ss -ltnp | grep {node.port}` (or `lsof -i :{node.port}`), stop it "
-            "with `pkill -f m1_web`, or pick another port: "
+            f"`ss -ltnp | grep {node.port}` (or `lsof -i :{node.port}`), `kill` "
+            "that PID, or pick another port: "
             "`ros2 run m1_control m1_web --ros-args -p port:=9000`.")
         node.destroy_node()
         if rclpy.ok():
@@ -525,6 +528,7 @@ document.getElementById("estop").onclick=()=>{keysDown.clear();heldBtns.clear();
 document.getElementById("resetBtn").onclick=()=>postCmd({type:"reset"});
 
 window.addEventListener("keydown",e=>{
+  const tag=(e.target&&e.target.tagName)||""; if(tag==="INPUT"||tag==="TEXTAREA") return;
   const k=e.key.toLowerCase();
   if(["w","a","s","d","q","e"].includes(k)){ keysDown.add(k); e.preventDefault(); }
   else if(k===" "){ keysDown.clear(); heldBtns.clear(); postCmd({type:"base_stop"}); e.preventDefault(); }

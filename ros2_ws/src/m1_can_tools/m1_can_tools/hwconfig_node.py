@@ -47,10 +47,6 @@ DEFAULT_LIMITS_PATH = "m1_joint_limits.yaml"
 ApiResult = Tuple[int, dict]
 
 
-def _clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
-
-
 class M1HwConfigNode:
     """The data-path owner behind the config web page.
 
@@ -218,9 +214,10 @@ class M1HwConfigNode:
         info = self.motor_map[joint]
         p_max, v_max, t_max = dm.limits(info["model"])
 
-        pos = payload.get("pos", info["soft_limits"].get("pos", [-p_max, p_max]))
-        vel = float(payload.get("vel", info["soft_limits"].get("vel", v_max)))
-        eff = float(payload.get("effort", info["soft_limits"].get("effort", t_max)))
+        sl = info.get("soft_limits", {})
+        pos = payload.get("pos", sl.get("pos", [-p_max, p_max]))
+        vel = float(payload.get("vel", sl.get("vel", v_max)))
+        eff = float(payload.get("effort", sl.get("effort", t_max)))
         lo, hi = float(pos[0]), float(pos[1])
 
         # Validate against the per-model [P, V, T]MAX.
@@ -335,12 +332,12 @@ class M1HwConfigNode:
         if self.mode != "maintenance" or self.bus is None:
             return
         for joint in self.motor_map:
-            try:
-                fb = self.bus.telemetry(joint, timeout=0.0)
-            except Exception:  # noqa: BLE001
-                fb = None
-            if fb is not None:
-                with self._lock:
+            with self._lock:
+                try:
+                    fb = self.bus.telemetry(joint, timeout=0.0)
+                except Exception:  # noqa: BLE001
+                    fb = None
+                if fb is not None:
                     self._telem[joint] = fb
 
 
@@ -422,7 +419,6 @@ def main(args=None):
     import rclpy
     from rclpy.node import Node
     from sensor_msgs.msg import JointState
-    from ament_index_python.packages import get_package_share_directory  # noqa: F401
 
     class _RosNode(Node, M1HwConfigNode):
         def __init__(self):
@@ -484,7 +480,6 @@ def main(args=None):
 
             self._init_state(bus=bus, motor_map=motor_map, mode=mode,
                              limits_path=limits_path, map_path=map_path)
-            self.bus_ok = bus is not None
 
             # Run-mode telemetry source: /joint_states (read-only).
             self.create_subscription(JointState, "/joint_states",

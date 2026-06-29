@@ -63,6 +63,7 @@ _AVOID_STEP_CAP = 0.08     # cap (rad) on one clearance nudge before re-convergi
 _RECONVERGE_ITERS = 8      # task cleanup iterations after each clearance nudge
 _POSTURE_GAIN = 0.02       # gentle pull toward the warm-start (branch continuity)
 _STEP_TOL = 1e-7           # stop a task solve when the step is this small
+_REACH_TOL = 5e-3          # task-satisfaction tol (m): avoidance acceptance + final reached gate
 # Path detour: when an INTERMEDIATE waypoint still self-collides after null-space
 # avoidance (a task-coupled collision the redundant DOFs can't open -- e.g. a
 # gripper pinned near the body), bow the fingertip PATH around the obstacle by
@@ -180,7 +181,7 @@ class TrajectoryPlanner:
             # Re-converge the fingertip onto the target after the nudge.
             q_try, dist_try = self._task_solve(
                 q_try, arms, joint_order, lo, hi, pos, q_try, _RECONVERGE_ITERS)
-            reached = all(d < 5e-3 for d in dist_try.values())
+            reached = all(d < _REACH_TOL for d in dist_try.values())
             clr_try = self.collision.clearance_of_vec(q_try, joint_order, background)
             # Accept only if the task is still met and clearance genuinely
             # improved -- so avoidance can never trade the goal away.
@@ -305,7 +306,7 @@ class TrajectoryPlanner:
 
         last = traj.waypoints[-1]
         traj.end_error = dict(last.residual)
-        traj.reached = all(v < 5e-3 for v in last.residual.values())
+        traj.reached = all(v < _REACH_TOL for v in last.residual.values())
         return traj
 
 

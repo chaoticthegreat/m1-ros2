@@ -472,10 +472,11 @@ is not running — the web panel's status dot makes this obvious.
   across repeated runs. (NB: drive target/metric loops from ROS timers, not a
   main-thread `sleep` loop — the latter starves callbacks and makes the
   controller see the target *teleport*, which falsely looks like a solver bug.)
-- `_e2e_check.py` (web-panel path): its web-node import was repaired
-  (`_make_handler(node)`; `_resolve_web_dir` no longer exists), but it still has
-  further stale web-panel API assumptions (`/api/state` no longer returns
-  `njoints`); the reach path is covered by `_ros_reach_check.py` instead.
+- `_e2e_check.py` was **removed** (maintenance pass): it had drifted to a broken,
+  unrunnable state — it POSTed to a non-existent `/api/cmd` route, used stale
+  command types (`target`/`cmd_vel`/`stop`) that `apply()` rejects, and `KeyError`'d
+  on a removed `njoints` field before any check ran — and was not in the gated
+  suite. The reach path is covered by `_ros_reach_check.py` instead.
 - `isaac/ros_sim.py` itself was NOT run end-to-end by the agent (no GPU/display
   in the sandbox). The user confirmed it loads after the `set_target_prims` fix.
 

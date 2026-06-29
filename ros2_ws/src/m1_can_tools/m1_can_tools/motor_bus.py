@@ -164,8 +164,7 @@ class MotorBus:
         inventory scan never energizes the arm. Returns one dict per responder
         ``{id, master_id, model, joint, ...fb}``.
         """
-        # Index the known map by slave id so a responder can be named.
-        by_id = {info["id"]: (joint, info) for joint, info in self.motor_map.items()}
+        # Index the known map by master id so a responder can be named.
         by_master = {
             info.get("master_id", dm.master_id(info["id"])): (joint, info)
             for joint, info in self.motor_map.items()

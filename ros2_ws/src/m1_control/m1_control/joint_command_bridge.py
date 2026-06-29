@@ -1,4 +1,4 @@
-"""Bridge: ``/m1/joint_command`` (JointState) -> forward_position_controller.
+"""Bridge: ``/m1/joint_command`` (JointState) -> arm_position_controller.
 
 On the real robot the upper body (shared lift + dual 7-DOF arms + the two gripper
 motors, 17 commanded joints) is driven through ros2_control. The
@@ -27,7 +27,7 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
 
 # The 17 COMMANDED upper-body joints, in EXACTLY the order the
-# forward_position_controller is configured with in m1_controllers.yaml. Order is
+# arm_position_controller is configured with in m1_controllers.yaml. Order is
 # load-bearing: the Float64MultiArray is positional, so this must match the
 # controller's `joints:` list bit-for-bit. (lift, then left arm 1..7, right arm
 # 1..7, then the two gripper motors left/right finger_joint1.) The two
