@@ -102,6 +102,12 @@ PUBLISH_RATE = 60.0      # Hz the joint command / targets are streamed at
 MOTION_SCALE = 1.0       # hand metres -> target metres while clutched (1:1)
 PRECISION_SCALE = 0.25   # hand->target scale while an arm is in precision mode
                          # (thumbstick-click), for fine sub-cm target placement
+TRAJ_PLAN_BUDGET = 0.15  # s wall-clock cap per arm for the COSMETIC path preview
+                         # (trajectory.plan(deadline=...)). The arms mount flush+low,
+                         # so descending/inward targets pin the tip near the body
+                         # column (the colliding regime) where an unbudgeted plan
+                         # runs 0.5-2s+ and pins a core; the budget keeps the
+                         # background worker responsive. Commands are unaffected.
 
 # Soft workspace clamp on the target point (base_link frame, m). Height (z) is
 # intentionally unbounded; the controller's IK reaches as close as the joint
@@ -646,7 +652,8 @@ class M1QuestNode(Node):
                         # doesn't disturb the other's preview.
                         tr = self._traj_planner.plan(
                             q_meas, {"left": g if arm == "left" else None,
-                                     "right": g if arm == "right" else None})
+                                     "right": g if arm == "right" else None},
+                            deadline=TRAJ_PLAN_BUDGET)
                         new_traj[arm] = (tr, [float(c) for c in g])
                     with self._lock:
                         for arm, (tr, g) in new_traj.items():
@@ -757,6 +764,18 @@ def _make_handler(node: M1QuestNode):
         # caught it.) We also coalesce the reply into ONE write below, so the
         # response leaves as a single segment regardless.
         disable_nagle_algorithm = True
+        # Finite request-socket timeout (StreamRequestHandler.setup applies it via
+        # connection.settimeout). The headset POSTs ride ONE keep-alive TLS
+        # connection on this SOLE handler thread; without a timeout a blocking
+        # SSL read/write to a stalled or half-open (roaming/sleeping) headset link
+        # parks that thread INDEFINITELY (Linux TCP retries for minutes), so the
+        # one in-flight POST never returns and the client -- which gates one POST
+        # at a time -- stops refreshing and holds the last pose: the reported
+        # multi-second freeze. A finite timeout reaps the wedged socket so the
+        # connection resets and the client's next POST lands on a fresh one.
+        # Generous (10s) so it never trips a healthy high-rate frame or a slow but
+        # progressing mesh download -- only a genuine stall.
+        timeout = 10.0
 
         _REASON = {200: "OK", 400: "Bad Request", 403: "Forbidden",
                    404: "Not Found"}
@@ -782,8 +801,13 @@ def _make_handler(node: M1QuestNode):
             ).encode("latin-1")
             try:
                 self.wfile.write(head + data)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+            except OSError:
+                # Any write failure -- broken pipe, reset, or a socket.timeout from
+                # a stalled SSL write (timeout is an OSError) -- means this
+                # connection is wedged. Tear it down (don't keep-alive it) so the
+                # sole POST handler thread is freed and the client reconnects,
+                # instead of parking here for the OS TCP timeout.
+                self.close_connection = True
 
         def _send_static(self, rel: str):
             """Serve a vendored asset (three.js / glTF / manifest) safely."""
@@ -1054,6 +1078,21 @@ let renderer=null, scene=null, camera=null, robotRoot=null, robotBase=null;
 let xrSession=null, refSpace=null, refIsFloor=false, robotPlaced=false;
 let lastViz=null, inFlight=false, meshesLoaded=false;
 
+/* ---- /api/xr request guard ---------------------------------------------------
+   POSTs are gated one-in-flight (the inFlight flag below). The robot pose only
+   advances when a POST round-trips, so if ONE request stalls (a roaming/sleeping
+   Quest WiFi link, TCP RTO backoff, a wedged TLS write) the model would freeze on
+   its last pose for the WHOLE stall -- the reported "freezes for 10s+ at times".
+   We bound every request with an AbortController firing at POST_TIMEOUT_MS, so a
+   hung request self-aborts, clears inFlight, and the next frame re-POSTs: a
+   multi-second freeze becomes a sub-second held-pose hiccup that self-heals.
+   abort() drops the keep-alive TLS connection, so after an abort/error we pause
+   POST_BACKOFF_S before retrying -- otherwise a marginal link would TLS-handshake-
+   thrash a new connection every frame. */
+const POST_TIMEOUT_MS=700;   // ms before a stalled /api/xr request is aborted
+const POST_BACKOFF_S=0.3;    // s to suppress POSTs after an abort/network error
+let postBackoffUntil=0;      // nowSec() until which POSTs are paused
+
 /* ---- snapshot interpolation -------------------------------------------------
    The robot pose only refreshes when an /api/xr POST round-trips, which over
    WiFi arrives at ~25-40 Hz with jitter -- far below the headset's 72-90 Hz
@@ -1146,10 +1185,14 @@ async function chooseMode(){
   return null;
 }
 
+// Reused constants (callers only .copy() the result, never mutate it) so the
+// per-arm, per-frame colour lookup allocates nothing -> no minor-GC pressure.
+const _COL_REACH=new THREE.Color(0x4cd964), _COL_MARGIN=new THREE.Color(0xf2b33a),
+      _COL_FAR=new THREE.Color(0xe64d40);
 function reachColor(d){
-  if(d<0.02) return new THREE.Color(0x4cd964);   // reaching
-  if(d<0.08) return new THREE.Color(0xf2b33a);   // marginal
-  return new THREE.Color(0xe64d40);              // out of reach
+  if(d<0.02) return _COL_REACH;   // reaching
+  if(d<0.08) return _COL_MARGIN;  // marginal
+  return _COL_FAR;                // out of reach
 }
 
 // CSS colour for the error HUD, matching reachColor's thresholds.
@@ -1201,6 +1244,24 @@ function initThree(){
   renderer.xr.enabled=true;
   renderer.domElement.style.display="none";   // only used inside the XR session
   document.body.appendChild(renderer.domElement);
+
+  // On a memory-constrained Quest the GPU can drop the WebGL context (memory
+  // pressure / backgrounding / thermal). Without these handlers three.js loses
+  // every buffer+texture and the robot goes blank PERMANENTLY (no self-recovery).
+  // preventDefault() lets the browser restore the context; meanwhile fall back to
+  // the wireframe, and on restore re-instance the meshes (clearing the old link
+  // children first so they don't double up).
+  renderer.domElement.addEventListener("webglcontextlost", (e)=>{
+    e.preventDefault(); meshesLoaded=false;
+    armComplete.left=false; armComplete.right=false;
+    log("WebGL context lost — wireframe fallback until restore");
+  }, false);
+  renderer.domElement.addEventListener("webglcontextrestored", ()=>{
+    log("WebGL context restored — re-uploading meshes");
+    for(const k in linkNodes){ const nd=linkNodes[k];
+      while(nd.children.length) nd.remove(nd.children[0]); }
+    loadRobot();                              // re-fetch (browser-cached) + re-instance
+  }, false);
 
   scene=new THREE.Scene();
   camera=new THREE.PerspectiveCamera(70, 1, 0.02, 50);
@@ -1630,7 +1691,7 @@ function onFrame(t, frame){
         if(robotBase){ robotBase.position.set(0,0,0); robotBase.quaternion.set(0,0,0,1); }
       }
     }
-    if(!inFlight){
+    if(!inFlight && nowSec()>=postBackoffUntil){
       inFlight=true;
       // place tells the node to zero its dead-reckoned base pose so the robot
       // sits exactly at the (re)anchored spot. Sticky: clear pendingPlace only
@@ -1638,11 +1699,16 @@ function onFrame(t, frame){
       const sentPlace=pendingPlace;
       const tSend=nowSec();
       let bytes=0;
+      // Abort a stalled request at POST_TIMEOUT_MS so it can't hold the
+      // one-in-flight gate (and freeze the model) for the full network stall.
+      const ac=new AbortController();
+      const killT=setTimeout(()=>ac.abort(), POST_TIMEOUT_MS);
       // No `keepalive:true` -- that flag routes the request through the browser's
       // constrained beacon pool; a plain fetch reuses the HTTP/1.1 keep-alive TLS
       // connection, which is what this high-rate loop wants. The response feeds
       // the two-frame interpolation buffer (ingestViz) instead of being shown raw.
       fetch("/api/xr",{method:"POST",headers:{"Content-Type":"application/json"},
+        signal:ac.signal,
         body:JSON.stringify({controllers:out, head:head, place:sentPlace})})
         .then(r=>{ bytes=+(r.headers.get("Content-Length")||0); return r.json(); })
         .then(j=>{ if(j&&j.viz){
@@ -1656,7 +1722,10 @@ function onFrame(t, frame){
                      if(sentPlace) vizPrev=null;
                    }
                    if(sentPlace) pendingPlace=false; })
-        .catch(()=>{}).finally(()=>{inFlight=false;});
+        // Aborted (timeout) or network error: brief backoff before the next POST
+        // so a flapping link doesn't open a fresh TLS connection every frame.
+        .catch(()=>{ postBackoffUntil=nowSec()+POST_BACKOFF_S; })
+        .finally(()=>{ clearTimeout(killT); inFlight=false; });
     }
     // Render FPS over a ~0.5 s window (perf HUD).
     fpsCount++;

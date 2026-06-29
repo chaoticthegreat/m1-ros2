@@ -299,6 +299,51 @@ real driver; everything in `ros2_ws/` is unchanged.
  keep-alive connection); `_quest_position_test.py` stays 10/10 (the data path is
  unchanged). The interpolation/recenter paths are JS-only — **validate the smooth
  model + the B/Y snap in the live headset** (the offline suites can't drive the JS).
+ **Performance pass 3 — the viz "lags majorly and freezes for 10s+ at times"
+ (intermittent hard freeze, smooth passthrough).** Diagnosed with a parallel
+ investigation + a live planner benchmark (which **refuted** the obvious
+ "trajectory worker hogs the GIL" theory: even 4 s of back-to-back pathological
+ plans kept the `/api/xr` handler's response build < 1 ms — numpy releases the GIL
+ and CPython's 5 ms switch interval keeps it fair). **Real root cause: a missing
+ request deadline.** The headset POSTs are gated **one-in-flight**, so a SINGLE
+ stalled request (roaming/sleeping Quest WiFi → TCP RTO backoff stacking to
+ seconds, or a half-open connection) suppresses ALL further POSTs; `ingestViz`
+ never advances and the two-frame interpolation clamps to the **last pose** —
+ frozen robot, smooth passthrough, for the full network stall, self-recovering
+ when the request finally settles. The server compounded it: the `/api/xr`
+ keep-alive handler had **no socket timeout**, so a wedged SSL write parked the
+ sole POST thread for the OS TCP timeout (minutes). Loopback never stalls, so the
+ offline suites couldn't catch it (same blind spot as the Nagle bug). Fix, three
+ parts: (1) **client `AbortController`** on the `/api/xr` fetch (`POST_TIMEOUT_MS`
+ 700 ms) so a hung request self-aborts and the next frame re-POSTs — a 10 s freeze
+ becomes a sub-second held-pose hiccup; a `POST_BACKOFF_S` (0.3 s) pause after an
+ abort stops a flapping link from TLS-handshake-thrashing (abort drops the
+ keep-alive connection). (2) **server** `Handler.timeout = 10.0` (reaps an
+ idle/backgrounded connection) + the `_send` write-failure handler broadened to
+ `except OSError: self.close_connection = True` (tears down a wedged write instead
+ of parking the thread — the primary reaper). (3) **planner amplifier** —
+ `trajectory.plan(deadline=...)` wall-clock budget (the worker passes
+ `TRAJ_PLAN_BUDGET` 0.15 s/arm); the arms mount flush+low so descending/inward
+ targets pin the tip near the body column where an unbudgeted plan ran **0.5–2 s+**
+ and pinned a core (measured worst 1908 ms → 236 ms; common ~1 cm clutch step
+ unchanged at ~19 ms). The preview is cosmetic, so once over budget the remaining
+ waypoints drop avoid/detour and cap their task solve (still flagged colliding/red).
+ Validated: `_solver_test_pathing.py` 23/23 (default `deadline=None` = full
+ fidelity, gates unchanged), `_quest_position_test.py` 10/10, `_quest_perf_bench.py`
+ 3/3 (1819 req/s, TCP_NODELAY intact — the timeouts only fire on the failure path).
+ Also hoisted `reachColor`'s `THREE.Color` to reused constants (no per-frame alloc)
+ and added a **WebGL context-loss/restore** handler (a memory-pressure GPU context
+ loss on the Quest otherwise blanks the model permanently — a vanish, not a freeze).
+ **The freeze fix is failure-path-only (happy path byte-identical) — validate the
+ live headset:** open `/?perf`, drag a clutched hand DOWN+INWARD (body-pinned
+ colliding regime) and confirm the model keeps refreshing with at most sub-0.5 s
+ hiccups (no multi-second freeze), and briefly walk out of WiFi range and confirm
+ it holds then resumes within ~0.7 s of reconnect. The offline suites can't
+ reproduce a WiFi stall. NB: a transport rewrite to a push/WebSocket library
+ (aiohttp/`websockets`) WOULD structurally remove the request/RTT coupling, but it
+ is far more new code + failure modes (asyncio loop alongside `rclpy.spin`, TLS
+ re-plumbing) than this ~6-line deadline — a deliberate future architecture choice,
+ not the freeze fix.
 - `.../web_node.py` — `ros2 run m1_control m1_web`: browser control panel on
  http://localhost:8080. Same `/m1/*`-only bridge (sim + real). Stdlib HTTP
  server + embedded HTML/JS (no extra deps); base drive pad, per-arm Cartesian

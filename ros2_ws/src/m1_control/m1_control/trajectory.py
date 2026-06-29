@@ -41,6 +41,7 @@ colliding flag, plus path-level summaries (``collision_free``, ``reached``,
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import time
 
 import numpy as np
 
@@ -72,6 +73,12 @@ _REACH_TOL = 5e-3          # task-satisfaction tol (m): avoidance acceptance + f
 _DETOUR_ITERS = 24         # max target shifts per colliding intermediate waypoint
 _DETOUR_STEP = 0.02        # how far (m) to nudge the target each detour iteration
 _DETOUR_MAX_DEV = 0.18     # cap (m) on how far a waypoint may leave the straight line
+# Live-preview wall-clock budget (see plan(deadline=...)): once a plan exceeds its
+# budget, the remaining waypoints drop the expensive avoid/detour stages and cap
+# their task solve to this many iterations, so a body-pinned/unreachable target
+# can't pin a CPU core for seconds. The offline suites pass deadline=None (full
+# fidelity), so their accuracy/latency gates are unchanged.
+_BUDGET_TAIL_ITERS = 30
 
 
 @dataclass
@@ -241,7 +248,8 @@ class TrajectoryPlanner:
 
     # --- public planning entry point ---------------------------------------
     def plan(self, start_q: dict, goals: dict, n: int = PLAN_WAYPOINTS,
-             avoid: bool = True, max_iters: int = PLAN_IK_ITERS) -> Trajectory:
+             avoid: bool = True, max_iters: int = PLAN_IK_ITERS,
+             deadline: float = None) -> Trajectory:
         """Plan a collision-free Cartesian path from ``start_q`` to ``goals``.
 
         ``goals`` maps arm -> goal point (3-vector) or ``None``. Active arms are
@@ -249,6 +257,14 @@ class TrajectoryPlanner:
         linearly from its start (FK of ``start_q``) to its goal over ``n+1``
         samples; each sample is solved with collision-avoiding IK warm-started
         from the previous one.
+
+        ``deadline`` (seconds, optional) caps wall-clock cost for the LIVE
+        preview: once exceeded, the remaining waypoints skip the expensive
+        null-space avoidance + detour stages and cap their task solve to
+        ``_BUDGET_TAIL_ITERS``, so a body-pinned/unreachable target can't pin a
+        CPU core for seconds (those waypoints are still flagged ``colliding`` and
+        drawn red). ``None`` (the default, used by every offline gated suite) =
+        full fidelity, so the accuracy/latency gates are unchanged.
         """
         arms = [a for a in ("left", "right") if goals.get(a) is not None]
         if not arms:
@@ -277,17 +293,23 @@ class TrajectoryPlanner:
 
         traj = Trajectory(arms=list(arms))
         q_seed = np.array([start_q.get(j, 0.0) for j in joint_order], dtype=np.float64)
+        t0 = time.perf_counter() if deadline is not None else None
         for i in range(n + 1):
             s = i / n if n > 0 else 1.0
             line = {a: (1.0 - s) * starts[a] + s * ends[a] for a in arms}
             pos = {a: line[a].copy() for a in arms}
+            # Once over the live-preview budget, finish the span cheaply: drop
+            # avoidance/detour and cap the task solve. None deadline = full effort.
+            over_budget = t0 is not None and (time.perf_counter() - t0) > deadline
+            wp_avoid = avoid and not over_budget
+            wp_iters = min(max_iters, _BUDGET_TAIL_ITERS) if over_budget else max_iters
             q_vec, dist, clr = self._solve_waypoint(
-                arms, joint_order, lo, hi, pos, q_seed, idx_all, max_iters, avoid,
+                arms, joint_order, lo, hi, pos, q_seed, idx_all, wp_iters, wp_avoid,
                 background=background)
             # Intermediate waypoint still colliding after null-space avoidance:
             # bow the PATH around the obstacle (endpoints A/B are never detoured,
             # they are the goals we must hit exactly).
-            if avoid and clr < self.margin and 0 < i < n:
+            if wp_avoid and clr < self.margin and 0 < i < n:
                 q_vec, dist, clr, pos = self._detour(
                     arms, joint_order, lo, hi, line, q_vec, dist, clr,
                     _DETOUR_ITERS, background=background)
