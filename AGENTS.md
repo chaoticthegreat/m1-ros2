@@ -608,3 +608,26 @@ is not running — the web panel's status dot makes this obvious.
   that convert script re-run** or the sim silently diverges. The ROS-side stack
   (solver, RSP/RViz, MoveIt SRDF, web/Quest viz, all gated suites) uses the URDF and
   is validated (10/10 suites green; browser-rendered the new model).
+- **Base mass 9.63 -> 63 kg to stop the robot TIPPING OVER (2026-06-29; USD
+  regenerated).** The operator reported "the solver fails to converge on some
+  positions"; the arm sat ~80-135 mm short of high/forward targets. It was NOT the
+  solver (reaches 0 mm offline), NOT self-collision (Isaac imports with
+  `self_collision=False`; the real-mesh probe found only constant mount overlaps),
+  and NOT gravity (Drake gravity torque ~7 N·m vs 40 N·m limits). The real cause:
+  the sim `base_link` mass was a **9.63 kg placeholder**, leaving the free-standing
+  base **top-heavy** (lift+arms ~15 kg up to ~1 m over a 0.39x0.34 m wheel
+  footprint). A high/forward dual reach pushed the combined COM past the support
+  edge and **the whole robot tipped over** -- the arm was then mashed on the ground
+  (joint1 effort pinned at its -40 N·m limit), so reaches "failed". Fix: set
+  `base_link` to a realistic **63 kg** (real AgileX Ranger Air) + a matching
+  ~0.5x0.4x0.25 m box inertia, COM kept low (z~0.14), in the URDF; **re-ran the
+  convert script** so the USD carries the new mass. Verified upright: the same
+  previously-failing target now reaches **7.6 mm / 13.7 mm** with joint1 at its ~7
+  N·m gravity load (was 134/80 mm, saturated). Mass-only is a *dynamics* change, so
+  the kinematic ROS stack/gated suites are unaffected. **NB:** `self_collision` is
+  off in the sim, so there is no arm self-collision protection there; the live
+  controller is still collision-unaware (a known limitation) -- if you add
+  collision-aware control, `tools/convert_collision_meshes.py` converts the URDF's
+  `.dae/.stl` collision meshes to Drake-loadable `.obj` (Drake hulls only
+  `.obj/.vtk/.gltf`). Diagnosis tooling left at repo root: `_solver_failure_logger.py`
+  (live reach-error + joint-effort logger), `_diag_contact.py`, `_gravity_drake.py`.

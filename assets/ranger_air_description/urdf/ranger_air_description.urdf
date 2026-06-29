@@ -2,9 +2,16 @@
 <robot name="ranger_air_description">
   <link name="base_link">
     <inertial>
+      <!-- Base mass raised 9.63 to 63 kg to match the real AgileX Ranger Air. The
+           original was a placeholder that left the free-standing base top-heavy:
+           with the lift+arms (~15 kg) mounted up to ~1 m over a 0.39x0.34 m wheel
+           footprint, a high/forward arm reach pushed the combined COM past the
+           support edge and the whole robot TIPPED OVER, which presented as "the
+           solver fails to converge" because the arm was then mashed on the floor.
+           COM kept low (z~0.14); inertia set to a realistic ~0.5x0.4x0.25 m box. -->
       <origin xyz="-0.0269453553477971 4.88289151054452E-05 0.138776943804503" rpy="0 0 0" />
-      <mass value="9.62557497725158" />
-      <inertia ixx="0.0836578300249299" ixy="-0.00247163484979424" ixz="0.000109124201879488" iyy="0.0555064526888553" iyz="7.6528928799148E-07" izz="0.127512148927851" />
+      <mass value="63.0" />
+      <inertia ixx="1.17" ixy="0.0" ixz="0.0" iyy="1.64" iyz="0.0" izz="2.15" />
     </inertial>
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0" />
