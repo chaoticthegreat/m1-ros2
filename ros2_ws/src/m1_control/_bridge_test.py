@@ -8,8 +8,11 @@ no hardware -- the project's offline-gate idiom (cf. ``_ros_reach_check.py`` /
                                            reorder / missing-name / drop-steer-wheel
   * base_bridge.select_motion_mode      -- AgileX PARALLEL / SPINNING /
                                            DUAL_ACKERMANN mode switch
-  * ranger_state_shim.steer_wheel_to_jointstate -- 4 steer + 4 wheel ->
-                                           8 base joints, names / order / signs
+  * ranger_state_shim.reorder_corners + steer_wheel_to_jointstate -- AgileX
+                                           steering_01..04 / wheel_01..04 ->
+                                           8 base joints: corner permutation,
+                                           names / order / signs, and the wheel
+                                           m/s -> rad/s (/ wheel_radius) conversion
 
 The bridge node CLASSES import ``rclpy`` at module top level; to keep this test
 truly ROS-free we stub the ROS message/`rclpy` modules BEFORE importing, then
@@ -75,8 +78,20 @@ except Exception:  # noqa: BLE001
 
 from m1_control.joint_command_bridge import UPPER_BODY, map_command
 from m1_control.base_bridge import select_motion_mode
-from m1_control.ranger_state_shim import BASE_JOINTS, steer_wheel_to_jointstate
-from m1_control.swerve import STEER_DIR, STEER_JOINTS, WHEEL_DIR, WHEEL_JOINTS
+from m1_control.ranger_state_shim import (
+    BASE_JOINTS,
+    CORNER_ORDER_DEFAULT,
+    reorder_corners,
+    steer_wheel_to_jointstate,
+)
+from m1_control.swerve import (
+    CORNERS,
+    STEER_DIR,
+    STEER_JOINTS,
+    WHEEL_DIR,
+    WHEEL_JOINTS,
+    WHEEL_RADIUS,
+)
 
 _results = []
 
@@ -236,10 +251,11 @@ def test_shim_steer_to_position_wheel_to_velocity():
 
 def test_shim_applies_swerve_sign_conventions():
     # The shim must apply swerve.py's STEER_DIR / WHEEL_DIR exactly. With unit
-    # inputs, each slot equals that joint's direction sign.
+    # inputs and wheel_radius=1 (isolate signs from the m/s->rad/s scaling), each
+    # slot equals that joint's direction sign.
     steer = [1.0, 1.0, 1.0, 1.0]
     wheel = [1.0, 1.0, 1.0, 1.0]
-    names, pos, vel = steer_wheel_to_jointstate(steer, wheel)
+    names, pos, vel = steer_wheel_to_jointstate(steer, wheel, wheel_radius=1.0)
     steer_ok = all(pos[k] == STEER_DIR[STEER_JOINTS[k]] for k in range(4))
     wheel_ok = all(vel[4 + k] == WHEEL_DIR[WHEEL_JOINTS[k]] for k in range(4))
     # Sanity: rr_steering_joint and rl... actually have a -1 / +1 mix and the
@@ -261,6 +277,64 @@ def test_shim_rejects_wrong_length():
     check("steer_wheel_to_jointstate: rejects non-length-4 input", ok)
 
 
+def test_shim_wheel_mps_to_rad_s():
+    # AgileX /wheel_speeds is LINEAR m/s; /joint_states wheel velocity is ANGULAR
+    # rad/s, so the shim divides by wheel_radius. With +1 m/s on each wheel and the
+    # default radius, |velocity| == 1/WHEEL_RADIUS (sign per WHEEL_DIR).
+    steer = [0.0, 0.0, 0.0, 0.0]
+    wheel = [1.0, 1.0, 1.0, 1.0]
+    _names, _pos, vel = steer_wheel_to_jointstate(steer, wheel)
+    expect = [WHEEL_DIR[WHEEL_JOINTS[k]] * 1.0 / WHEEL_RADIUS for k in range(4)]
+    ok = all(abs(vel[4 + k] - expect[k]) < 1e-9 for k in range(4))
+    check("steer_wheel_to_jointstate: wheel m/s -> rad/s (/ wheel_radius)",
+          ok, f"vel={vel[4:]} expect={expect}")
+
+
+def test_shim_rejects_bad_radius():
+    ok = False
+    try:
+        steer_wheel_to_jointstate([0, 0, 0, 0], [0, 0, 0, 0], wheel_radius=0.0)
+    except ValueError:
+        ok = True
+    check("steer_wheel_to_jointstate: rejects wheel_radius <= 0", ok)
+
+
+def test_reorder_corners_permutes():
+    # out[k] = values[order[k]]: identity passes through; a permutation reorders.
+    vals = [10.0, 20.0, 30.0, 40.0]
+    ident = reorder_corners(vals, [0, 1, 2, 3])
+    perm = reorder_corners(vals, [3, 0, 1, 2])
+    check("reorder_corners: identity pass-through + permute by index",
+          ident == vals and perm == [40.0, 10.0, 20.0, 30.0], f"perm={perm}")
+
+
+def test_corner_order_default_semantics():
+    # Default maps AgileX RF/RR/LR/LF (steering_01..04) onto our fl/fr/rr/rl: our
+    # corner k must read AgileX index CORNER_ORDER_DEFAULT[k]. Tag each slot with
+    # its AgileX index so the read-out is directly checkable.
+    agilex = [0.0, 1.0, 2.0, 3.0]   # value == AgileX index
+    out = reorder_corners(agilex, CORNER_ORDER_DEFAULT)
+    ok = (all(out[k] == CORNER_ORDER_DEFAULT[k] for k in range(4))
+          and sorted(CORNER_ORDER_DEFAULT) == [0, 1, 2, 3]
+          and len(CORNERS) == 4)
+    check("corner_order default: our corner k reads AgileX index order[k]",
+          ok, f"out={out} CORNERS={CORNERS}")
+
+
+def test_reorder_corners_rejects_bad():
+    bad_len = bad_idx = False
+    try:
+        reorder_corners([1, 2, 3], [0, 1, 2, 3])
+    except ValueError:
+        bad_len = True
+    try:
+        reorder_corners([1, 2, 3, 4], [0, 1, 2, 9])
+    except ValueError:
+        bad_idx = True
+    check("reorder_corners: rejects bad length / out-of-range index",
+          bad_len and bad_idx)
+
+
 def main():
     tests = [
         test_map_command_canonical_passthrough,
@@ -278,6 +352,11 @@ def main():
         test_shim_steer_to_position_wheel_to_velocity,
         test_shim_applies_swerve_sign_conventions,
         test_shim_rejects_wrong_length,
+        test_shim_wheel_mps_to_rad_s,
+        test_shim_rejects_bad_radius,
+        test_reorder_corners_permutes,
+        test_corner_order_default_semantics,
+        test_reorder_corners_rejects_bad,
     ]
     for t in tests:
         try:

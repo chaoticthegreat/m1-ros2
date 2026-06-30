@@ -393,9 +393,13 @@ the Drake position-only IK as the reactive brain; MoveIt is optional/later for
 *planned collision-aware* moves only (it structurally **cannot** express the
 shared-lift-serving-both-arms coupling — KDL is one-chain-one-tip — nor
 position-only reach nor 60 Hz reactive teleop; the Drake brain does all four). The
-arms are customized OpenArm (Damiao DM motors); the base is (likely stock) AgileX
+arms are customized OpenArm (Damiao DM motors); the base is (assumed stock) AgileX
 Ranger Air whose firmware takes only body `Twist` (mode-switched) — `swerve.py`'s
-per-module output can't drive it (memory `agilex-ranger-no-per-module-cmd`).
+per-module output can't drive it (memory `agilex-ranger-no-per-module-cmd`). The
+real AgileX **`air_delta` driver is now vendored** (`ros2_ws/src/vendor/agx_bringup`,
+self-contained SocketCAN, no `ugv_sdk`); the base path drives it over a body `Twist`
+(the driver auto-selects the motion mode internally) and reads back its
+`/steering_angles` + `/wheel_speeds` for `/joint_states`.
 
 **The `/m1/*` + `/joint_states` contract is invariant** (27-DOF name order, wheels=
 velocity, rest=position, fingers mimic-coupled), so the brain + all operator nodes
@@ -414,10 +418,21 @@ with a `ros2_control` stack + bridges:
 - `m1_control/` adds three pure-function bridge nodes: `m1_joint_bridge`
   (`/m1/joint_command` → `arm_position_controller`, the 17 commanded upper-body
   joints; the 2 `finger_joint2` are state-only mimics), `m1_base_bridge`
-  (`/m1/cmd_vel` → AgileX body Twist + motion-mode), `m1_ranger_shim` (AgileX wheel
-  feedback → `/joint_states`).
+  (`/m1/cmd_vel` → a single-intent body `Twist` on `/cmd_vel`; the AgileX driver
+  auto-selects the mode from the Twist, so the old separate motion-mode Int8 was
+  dropped), `m1_ranger_shim` (AgileX `/steering_angles` + `/wheel_speeds` →
+  `/joint_states`, with a configurable module→corner map + m/s→rad/s wheel scaling).
+- `vendor/agx_bringup/` (NEW, vendored third-party, Apache-2.0) — the AgileX
+  Ranger-Air `ranger_ros2 @ air_delta` driver: self-contained raw SocketCAN (**no
+  `ugv_sdk`**), generates `SteeringAngles`/`WheelSpeeds`/etc., builds clean on Jazzy.
+  Two minimal local patches (honor the `interface` param; vendor the `nlohmann/json`
+  single header) — see `agx_bringup/VENDOR.md`. **NB:** building this *message*
+  package needs the conda base env OFF (its Python 3.13 `empy` breaks `rosidl`
+  message gen) — scrub `/home/jerry/miniconda3` from PATH before `colcon build`.
 - `m1_bringup/` adds `hardware.launch.py` (`use_mock:=true` mock_components default,
-  `use_mock:=false` real plugin, `use_base:=`), `m1.ros2_control.xacro`,
+  `use_mock:=false` real plugin, `use_base:=` launches the vendored `agx_bringup`
+  driver + the two base bridges, `base_can_interface:=can1` selects the base bus),
+  `m1.ros2_control.xacro`,
   `m1_controllers.yaml` (forward_position + JSB + per-arm JTC; `enforce_command_limits`
   on), `m1_joint_limits.yaml`.
 
@@ -426,12 +441,15 @@ Run: `ros2 launch m1_bringup hardware.launch.py use_mock:=true` (offline) or
 with **SIGINT to `ros2 launch`** then a PID sweep — do NOT `pkill -f <node-name>`
 (the pattern matches your own shell's command line and SIGKILLs your shell).
 
-**Validated offline (no hardware):** `m1_can_tools` 34/34; `_bridge_test.py` 15/15;
+**Validated offline (no hardware):** `m1_can_tools` 39/39; `_bridge_test.py` 20/20
+(now also covers the AgileX module→corner permutation + the wheel m/s→rad/s
+conversion); the vendored `agx_bringup` builds clean on Jazzy + its msgs import;
 mock ros2_control loop (controllers active, brain reach flows brain→bridge→
 controller→mock); real plugin loads + activates with no bus; config page serves;
-**all brain gated suites still green (113/113)**. Deferred to hardware: per-joint
+**all brain gated suites still green (119/119 across 8 suites)**. Deferred to hardware: per-joint
 sign/offset, the live closed loop (command-fingertip ≈ measured), gain tuning, the
-base Twist path. See HARDWARE.md "Deferred live-validation checkpoints".
+base Twist path + the `ranger_state_shim` module→corner / wheel-radius /
+steering-sign checkpoints. See HARDWARE.md "Deferred live-validation checkpoints".
 
 ## How to run
 

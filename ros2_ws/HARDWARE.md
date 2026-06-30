@@ -16,8 +16,8 @@ operators ──/m1/*──► controller_node (Drake IK + swerve, 60 Hz) ──
                                                                           │
               ┌───────────────────────────────────────────────────────────┤
               ▼ upper body (lift+arms+grippers)                            ▼ base
-   m1_joint_bridge ─► ros2_control                              m1_base_bridge ─/cmd_vel(Twist)─► AgileX driver
-   forward_position_controller (+ JTC for planned moves)                   │
+   m1_joint_bridge ─► ros2_control                  m1_base_bridge ─/cmd_vel(Twist)─► agx_bringup (vendored)
+   forward_position_controller (+ JTC for planned moves)                   │  steering_angles/wheel_speeds
               │ loaned-memory                                              │ CAN feedback
               ▼                                                            ▼
    m1_hardware/M1SystemInterface (Damiao MIT, SocketCAN) + lift   ranger_state_shim ─► /joint_states (base)
@@ -137,30 +137,56 @@ check refuses to drive if the configured master_ids don't match the live device
 set. Operators can therefore reassign IDs via the config page without cross-wiring
 commands/feedback.
 
-## AgileX base integration (path, not yet vendored)
+## AgileX base integration (vendored: `agx_bringup`)
 
-The ROS-side base bridges are implemented and unit-tested:
-- `m1_base_bridge`: `/m1/cmd_vel` → body `geometry_msgs/Twist` on `/cmd_vel` +
-  motion-mode (`/m1/base/motion_mode`, Int8). Stock Ranger firmware is
-  **mode-switched, not free-holonomic** — it never blends strafe + rotate (see the
-  memory note `agilex-ranger-no-per-module-cmd`). The bridge picks PARALLEL
-  (strafe), SPINNING (yaw), or DUAL_ACKERMANN per command.
-- `ranger_state_shim`: AgileX per-wheel feedback → `/joint_states` (8 base joints)
-  so RViz/RSP animate the base.
+The AgileX Ranger-Air base driver is **vendored** into the workspace at
+`ros2_ws/src/vendor/agx_bringup` (AgileX `ranger_ros2` @ **`air_delta`**, the
+Ranger-Air-specific driver — the `jazzy`/`ranger_base`/`ugv_sdk` driver supports
+only Ranger / Ranger Mini, *not* the Air; Apache-2.0; see `agx_bringup/VENDOR.md`
+for origin + the two minimal local patches). It is **self-contained** (raw Linux
+SocketCAN, **no `ugv_sdk`/libasio**) and builds clean on Jazzy with no API port.
+`hardware.launch.py use_base:=true` launches it (`agx_bringup_node`) alongside the
+two bridges.
 
-To finish on hardware:
-1. Clone + build the AgileX driver for **your** base on Jazzy — `ranger_ros2`
-   (`air_delta` branch for the Ranger Air) + `ugv_sdk`. There is no official Jazzy
-   branch; budget a recompile/port (plain rclcpp + tf2, low risk).
-2. Bring up the base CAN (separate adapter, 500 kbps): the AgileX `setup_can2usb`
-   scripts.
-3. Point `m1_base_bridge`'s output `/cmd_vel` at the driver, and set
-   `ranger_state_shim`'s `steer_topic`/`wheel_topic` params to the driver's
-   per-wheel feedback topics (the `air_delta` branch publishes `/steering_angles`
-   + `/wheel_speeds`). Map the motion-mode Int8 to the driver's `SetMotionMode`.
-4. **Confirm whether your base is stock AgileX (Twist-only) or exposes per-module
-   control.** If per-module, `swerve.py` can drive it directly instead of the
-   Twist path.
+- `m1_base_bridge`: `/m1/cmd_vel` → a single-intent body `geometry_msgs/Twist` on
+  `/cmd_vel` (the driver's `/sub_cmd_vel`, remapped). The driver **auto-selects the
+  motion mode itself** from the Twist (PARALLEL when `linear.y≠0`; SPINNING when
+  turn radius `|vx/yaw|<0.5 m`; else DUAL_ACKERMANN) and emits the enable (`0x421`)
+  + mode (`0x141`) + motion (`0x111`) CAN frames — so there is **no motion-mode
+  topic/service** (the old `/m1/base/motion_mode` Int8 was dropped; nothing
+  consumed it). The bridge still collapses to one mode's components via
+  `select_motion_mode` so we never ask the firmware to blend strafe+yaw (it's
+  mode-switched, never holonomic — memory `agilex-ranger-no-per-module-cmd`;
+  `swerve.py`'s per-module output cannot drive this base). Dead-man'd (`BASE_HOLD`);
+  the actual mode is readable on the driver's `/motion_mode_feedback`.
+- `ranger_state_shim`: subscribes the driver's `/steering_angles`
+  (`agx_bringup/SteeringAngles`, rad) + `/wheel_speeds` (`agx_bringup/WheelSpeeds`,
+  m/s) → `/joint_states` for the 8 base joints, applying the swerve sign
+  conventions and converting wheel m/s → rad/s (÷ `wheel_radius`).
+
+**Build note:** building the vendored *message* package needs the **conda base env
+off** — scrub `/home/jerry/miniconda3` from `PATH` (or `conda deactivate`) before
+`colcon build`. The active conda Python 3.13 otherwise shadows ROS's `empy` and
+breaks `rosidl` message generation (`em.TransientParseError: not enough data to
+read`). Use system Python 3.12 (matches CLAUDE.md's `/usr/bin/python3` rule).
+
+Deferred to hardware (cannot be derived from the driver source — see
+`ranger_state_shim`'s "HARDWARE CHECKPOINTS" docstring):
+1. **Module → corner mapping**: the driver labels modules `01..04` with no
+   FL/FR/RR/RL legend. Default `corner_order:=[3,0,1,2]` (AgileX motor-ID order
+   RF/RR/LR/LF → our fl/fr/rr/rl); confirm by jogging one module at a time and
+   watching which `/joint_states` entry moves, then override the param.
+2. **Wheel radius**: `/wheel_speeds` is linear m/s; set `wheel_radius` to the real
+   Ranger-Air rolling radius (default `swerve.WHEEL_RADIUS` = 0.055 m).
+3. **Steering sign / zero** vs our URDF (same class of check as the arm
+   `dir`/`offset`).
+4. **Base CAN bus**: a *separate* adapter from the Damiao arm bus (classic CAN,
+   ~500 kbps — the base driver is **not** CAN-FD). Bring it up, then
+   `base_can_interface:=canX` (default `can1`) selects it (the vendor patch wires
+   the driver's `interface` param through).
+5. **Per-module vs stock**: still **assumed STOCK** (Twist + internal auto-mode). If
+   your specific unit instead exposes per-module control, `swerve.py` could drive it
+   directly instead of this Twist path.
 
 ## Safety
 
@@ -181,8 +207,10 @@ To finish on hardware:
 
 Validated offline today: byte-exact CAN codec (34 tests), the full mock
 ros2_control loop (controllers active, brain reach flows through), the real plugin
-loads + activates with no bus, the config page serves, and **all brain gated
-suites stay green (113/113)**. On hardware, additionally verify:
+loads + activates with no bus, the config page serves, the vendored AgileX base
+driver (`agx_bringup`) builds clean on Jazzy and its `SteeringAngles`/`WheelSpeeds`
+msgs import, the base bridges' pure mappers pass (`_bridge_test.py`), and **all
+brain gated suites stay green**. On hardware, additionally verify:
 
 1. Per-joint **sign/direction** (`dir`) and **offset** match the real motors
    (the `dir`/`offset` math is implemented but untested against real encoders).
@@ -192,5 +220,9 @@ suites stay green (113/113)**. On hardware, additionally verify:
    fingers and can't catch a live mimic/sign bug.
 3. **Gains** (`config/control_gains.yaml` kp/kd) — expect gravity-comp tuning,
    like OpenArm's open issues.
-4. The base Twist path + motion-mode on the real chassis.
+4. The base Twist path on the real chassis: `/m1/cmd_vel` → `m1_base_bridge` →
+   `/cmd_vel` → `agx_bringup` drives, and the driver's auto-selected mode (read on
+   `/motion_mode_feedback`) matches intent. Plus the `ranger_state_shim` checkpoints
+   (module→corner `corner_order`, `wheel_radius`, steering sign/zero — see the
+   "AgileX base integration" section).
 ```

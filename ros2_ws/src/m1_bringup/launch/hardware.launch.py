@@ -11,15 +11,19 @@ This replaces the Isaac Sim process with the ros2_control stack:
                              for planned moves later)
   * m1_joint_bridge        - /m1/joint_command -> /arm_position_controller/commands
   * m1_controller          - the unchanged Drake brain (pose -> /m1/joint_command)
-  * (use_base) base path   - m1_base_bridge (/m1/cmd_vel -> AgileX Twist) +
-                             m1_ranger_shim (AgileX feedback -> /joint_states)
+  * (use_base) base path   - the vendored AgileX driver (agx_bringup_node, the
+                             Ranger-Air SocketCAN driver) + m1_base_bridge
+                             (/m1/cmd_vel -> /cmd_vel Twist) + m1_ranger_shim
+                             (AgileX /steering_angles + /wheel_speeds -> /joint_states)
 
 Args:
   use_mock:=true|false   mock_components (default) vs the real Damiao plugin
   use_rviz:=true|false
-  use_base:=true|false   start the AgileX base bridges (off by default)
-  can_interface:=can0    real-mode CAN device
-  can_fd:=true|false
+  use_base:=true|false   start the AgileX base driver + bridges (off by default)
+  can_interface:=can0    real-mode arm (Damiao) CAN device
+  can_fd:=true|false     arm bus CAN-FD
+  base_can_interface:=can1   AgileX base CAN device (separate bus from the arms,
+                             classic CAN -- the base driver is not CAN-FD)
   motor_map:=<path>      real-mode motor-id -> joint map
 
 The operator interfaces (m1_web, m1_quest, m1_teleop) and m1_hwconfig are run
@@ -48,6 +52,7 @@ def generate_launch_description():
     use_base = LaunchConfiguration("use_base")
     can_interface = LaunchConfiguration("can_interface")
     can_fd = LaunchConfiguration("can_fd")
+    base_can_interface = LaunchConfiguration("base_can_interface")
     motor_map = LaunchConfiguration("motor_map")
 
     # Expand the hardware URDF (ranger_air description + the <ros2_control> tag).
@@ -72,6 +77,7 @@ def generate_launch_description():
         DeclareLaunchArgument("use_base", default_value="false"),
         DeclareLaunchArgument("can_interface", default_value="can0"),
         DeclareLaunchArgument("can_fd", default_value="true"),
+        DeclareLaunchArgument("base_can_interface", default_value="can1"),
         DeclareLaunchArgument("motor_map", default_value=""),
     ]
 
@@ -123,9 +129,28 @@ def generate_launch_description():
         output="screen",
     )
 
-    # Base path (AgileX) -- off by default; the AgileX driver itself is added in
-    # Phase 2.4 (vendored ranger_ros2). The bridges are launched here so the
-    # wiring is in place.
+    # Base path (AgileX) -- off by default (use_base:=true needs the real Ranger
+    # Air + its CAN bus). The vendored AgileX driver (agx_bringup, the Ranger-Air
+    # SocketCAN driver) is launched here together with the two bridges. The driver
+    # subscribes /sub_cmd_vel (remapped <- /cmd_vel, which m1_base_bridge feeds) and
+    # publishes /steering_angles + /wheel_speeds (which m1_ranger_shim consumes).
+    # Its `interface` param selects the base CAN bus (separate from the arm bus).
+    # NB: get_package_share_directory is NOT used for agx_bringup so the default
+    # mock launch (use_base:=false) does not require it to be built; FindPackageShare
+    # is a lazy substitution resolved only when this conditioned node runs.
+    agx_driver = Node(
+        package="agx_bringup",
+        executable="agx_bringup_node",
+        name="agx_bringup_node",
+        output="screen",
+        parameters=[
+            PathJoinSubstitution([
+                FindPackageShare("agx_bringup"), "config", "agx_bringup.yaml"]),
+            {"interface": base_can_interface},
+        ],
+        remappings=[("/sub_cmd_vel", "/cmd_vel")],
+        condition=IfCondition(use_base),
+    )
     base_bridge = Node(
         package="m1_control",
         executable="m1_base_bridge",
@@ -150,6 +175,7 @@ def generate_launch_description():
         joint_bridge,
         brain,
         rviz,
+        agx_driver,
         base_bridge,
         ranger_shim,
     ])

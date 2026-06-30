@@ -9,6 +9,8 @@
 
   <exec_depend>m1_control</exec_depend>
   <exec_depend>ranger_air_description</exec_depend>
+  <!-- AgileX Ranger-Air base driver, launched by hardware.launch.py (use_base). -->
+  <exec_depend>agx_bringup</exec_depend>
   <exec_depend>robot_state_publisher</exec_depend>
   <exec_depend>rviz2</exec_depend>
   <exec_depend>xacro</exec_depend>

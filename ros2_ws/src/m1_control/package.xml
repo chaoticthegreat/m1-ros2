@@ -15,6 +15,9 @@
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>ranger_air_description</exec_depend>
+  <!-- AgileX Ranger-Air base driver msgs (SteeringAngles/WheelSpeeds) used by
+       ranger_state_shim; only needed on the real-hardware base path. -->
+  <exec_depend>agx_bringup</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
