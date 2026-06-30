@@ -205,15 +205,41 @@ real driver; everything in `ros2_ws/` is unchanged.
  with openssl into `~/.cache/m1_quest/`; WebXR needs a secure context over LAN
  IP). The Quest browser opens it, enters immersive-ar (passthrough) and POSTs
  both controllers' grip-space **positions** + buttons to `/api/xr` (orientation is
- no longer sent). The node maps each hand to the same-side arm with **clutched
- relative translation** (hold Grip to translate; release to reposition your hand).
+ no longer sent). **Two control schemes**, toggled live by an **A/X+B/Y chord**
+ (both buttons together, edge-triggered; `self.control_mode`, default `relative`,
+ surfaced in the viz + 2D page + in-VR HUD tag):
+   * **relative** (default, unchanged): hold Grip to "grab"; the target follows the
+     hand's **MOTION** (delta, heading-projected). Controllers **CROSS-mapped**
+     (left hand → right arm). Standard ratcheted VR teleop.
+   * **absolute** ("embodiment", new): the robot's chest/arms frame **rides the
+     headset** (`bodyAnchor`, a chest-locked base_link frame). Its POSITION follows
+     the head every frame (arms stay on you as you walk), but its FORWARD/yaw is a
+     **STABLE captured direction** (grabbed on entering absolute + on B/Y recenter,
+     robust to looking up/down via the head-up fallback) — continuously following the
+     head GAZE re-rotated the whole mapping when you looked down/around (the "arm
+     forward goes 90° to the right" bug). So the two robot arms overlay the operator's
+     arms and **mirror them**. The PAGE maps each hand into `base_link` via that body
+     frame (`pos_base` = `inv(bodyAnchor.matrixWorld)·hand_world`) and the node sets
+     `target = engage + scale·(hand_base − hand_base@engage)` (scale 1.0, or
+     `PRECISION_SCALE` fine). **CROSS-mapped** (left controller → right arm) — same
+     as relative; verified live (the arm meshes render mirrored from the URDF's
+     left/right labels, so cross-map is what puts each gripper under the right hand).
+     Grip-gated (release frees). A SECOND set of the two **arm meshes** is
+     drawn under `bodyAnchor` (live joints) as the on-body overlay; the existing full
+     robot stays ~1.1 m in front, joystick-drivable. The chord drops any grab; the
+     page suppresses B/Y recenter while A/X is down. **NB the body-frame mapping +
+     overlay are JS-only (live-only) — validate handedness/alignment in the headset.**
  **Thumbstick click toggles a per-arm PRECISION mode** (`fine`, edge-triggered):
  while on, hand motion is scaled by `PRECISION_SCALE` (0.25) for fine sub-cm target
- placement — the old rotation-lock repurposed now that there's no rotation to lock.
- Trigger→gripper, A/X→re-seed the target to the live fingertip ("home to here").
- Validated headless by `_quest_position_test.py` (10/10: clutch, precision toggle
- + edge-trigger, A/X reseed, base drive, and the error-window data path, driving
- the real `on_xr_frame`/`_viz_locked`/`snapshot`).
+ placement (scales the delta in relative, the displacement-from-engage in absolute).
+ Trigger→gripper, A/X→re-seed the target to the live fingertip ("home to here"),
+ B/Y→recenter the hologram.
+ Validated headless by `_quest_position_test.py` (18/18: relative clutch, precision
+ toggle + edge-trigger, A/X reseed, base drive, the error-window data path, AND the
+ absolute snap-on-engage / 1:1 tracking / fine-scale / chord toggle, driving the
+ real `on_xr_frame`/`_viz_locked`/`snapshot`). **The client-side anchor-inverse
+ (`pos_base`) is JS three.js matrix math — LIVE-only, not unit-testable; validate
+ reach-to-hologram in the headset.**
  **Base drive (thumbstick push):** LEFT stick fwd/back→drive fwd/back (vx),
  left/right→strafe (vy); RIGHT stick left/right→turn (yaw); smooth rescaled
  deadzone; cmd_vel is set every frame so centring the stick stops at once

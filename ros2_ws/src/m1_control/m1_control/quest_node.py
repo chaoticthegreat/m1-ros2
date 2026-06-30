@@ -17,11 +17,25 @@ The reach is POSITION-ONLY: each hand drives its arm's target POINT; gripper
 orientation is not controlled (the controller's orientation is not used). An
 in-headset "REACH ERROR" HUD shows each arm's target-to-fingertip distance.
 
+There are TWO control schemes, toggled live with the A/X+B/Y chord (below):
+
+  * RELATIVE (clutched, the default): hold Grip to "grab" that arm; while held the
+    gripper target follows your hand's MOTION (a delta, heading-projected).
+    Release to freeze and reposition your hand (like lifting a mouse off the desk).
+    Controllers are CROSS-mapped (left hand drives the right arm) and good for
+    covering the whole reach with small ratcheted strokes.
+  * ABSOLUTE (embodiment): the robot's chest/arms frame RIDES your headset, so the
+    two robot arms overlay YOUR arms and mirror them -- you "wear" the robot. The
+    page maps each hand into base_link via that body frame; controllers are
+    CROSS-mapped (left controller -> right arm, verified live -- the arm meshes
+    render mirrored from the URDF's left/right labels). Grip-gated (hold to engage,
+    release to freeze); precision mode makes a
+    fine nudge around where you engaged. A SEPARATE full robot model stands ~1.1 m in
+    front showing the live robot driving around (joysticks).
+
 Controls (per hand):
-    * Grip (squeeze) ......... CLUTCH. Hold to "grab" that arm; while held the
-                               gripper target follows your hand's MOTION (relative).
-                               Release to freeze the arm and reposition your hand
-                               (like lifting a mouse off the desk).
+    * Grip (squeeze) ......... ENGAGE that arm (see the two schemes above). Release
+                               to freeze the arm.
     * Trigger ................ that arm's gripper, analog 0 (open) .. 1 (closed).
     * Thumbstick CLICK ....... toggle PRECISION mode for that arm -- hand motion is
                                scaled down (PRECISION_SCALE) for fine, sub-cm target
@@ -32,11 +46,16 @@ Controls (per hand):
                                headset drives through the room to match.
     * A / X button ........... re-seed that arm's target to its live fingertip --
                                "home to here".
+    * B / Y button ........... recenter the robot hologram in front of you.
+    * A/X + B/Y together ..... toggle the control scheme (relative <-> absolute).
+                               The active scheme shows on the in-VR REACH panel.
 
 Why relative (clutched) position? It lets you move a small real distance, release,
 recenter, and continue (standard VR teleop) without matching the robot's whole
-reach with your shoulders. Precision mode then scales that motion down so you can
-nudge the target onto a point with sub-cm accuracy.
+reach with your shoulders. Absolute is the embodiment alternative: the robot's arms
+ride your body and mirror your arms (and a separate full robot model stands in
+front, showing the live robot and drivable with the sticks). Precision mode scales
+hand motion down in either scheme so you can nudge a target with sub-cm accuracy.
 
 WebXR requires a SECURE CONTEXT. ``http://<ip>`` is not secure, so this server
 speaks HTTPS with a self-signed certificate (auto-generated on first run via
@@ -241,6 +260,14 @@ class M1QuestNode(Node):
         self.clutch = {"left": False, "right": False}
         self.clutch_hand0 = {"left": None, "right": None}
         self.clutch_target0 = {"left": None, "right": None}
+        # Control scheme, toggled live by the A/X+B/Y chord (see on_xr_frame):
+        #   "relative" -- clutched delta: the target follows the hand's MOTION
+        #                 (default, the original behaviour); CROSS-mapped hand<->arm.
+        #   "absolute" -- reach-to-hologram: the hand's ACTUAL position (mapped into
+        #                 base_link by the page) IS the target; SAME-side mapping so
+        #                 you reach to the gripper you see. Still grip-gated.
+        self.control_mode = "relative"
+        self._last_mode_chord = False   # edge-detect the toggle chord
         # Precision mode (thumbstick click, per arm): while set, the clutch maps
         # hand motion to target motion at PRECISION_SCALE for fine sub-cm placement.
         # The reach is position-only, so the thumbstick-click no longer locks any
@@ -361,9 +388,25 @@ class M1QuestNode(Node):
             # drifting off by however far it had already been driven.
             if data.get("place"):
                 self.odom.reset()
-            # Physical controllers are cross-mapped: the LEFT controller drives
-            # the RIGHT arm and vice versa.
+                # A recenter moves the room anchor, so in ABSOLUTE mode the page's
+                # base-frame hand (pos_base) jumps to a NEW frame while an engaged
+                # arm's captured anchor (clutch_hand0) is still in the OLD one --
+                # using both would snap the target. Drop any grab so the next
+                # squeeze re-snaps cleanly in the new frame. (Relative mode anchors
+                # on the raw WebXR hand, which the room anchor doesn't touch, so it
+                # is unaffected.)
+                if self.control_mode == "absolute":
+                    self.clutch = {"left": False, "right": False}
+            # Active control scheme, snapshotted at frame start so a mid-frame
+            # toggle (the chord below) only takes effect NEXT frame.
+            mode = self.control_mode
+            # Controllers are CROSS-mapped in BOTH schemes (verified live in the
+            # headset): the LEFT controller drives the RIGHT arm and vice versa.
+            # (Relative: you face the front hologram, mirror. Absolute/embodiment:
+            # the same mapping is what put each gripper under the right hand -- the
+            # arm meshes render mirrored from how the URDF labels left/right.)
             controller_for_arm = {"left": "right", "right": "left"}
+            chord_any = False
             for arm in ("left", "right"):
                 c = controllers.get(controller_for_arm[arm])
                 if not c or not c.get("valid"):
@@ -375,48 +418,107 @@ class M1QuestNode(Node):
                 hand = np.array(c.get("pos", [0.0, 0.0, 0.0]), dtype=np.float64)
                 squeeze = bool(c.get("squeeze"))
                 trigger = _clamp(float(c.get("trigger", 0.0)), 0.0, 1.0)
-                button = bool(c.get("button"))
-                precision = bool(c.get("lock"))  # thumbstick click (gamepad btn 3)
+                button = bool(c.get("button"))       # A/X
+                recenter = bool(c.get("recenter"))   # B/Y
+                precision = bool(c.get("lock"))      # thumbstick click (gamepad btn 3)
+                # A/X+B/Y held together is the scheme-toggle chord (applied after the
+                # loop). Track it so the per-button actions below ignore that combo.
+                chord_any = chord_any or (button and recenter)
 
-                # A/X edge: re-seed this arm's target to the live fingertip
-                # ("home to here") and drop the clutch.
-                if button and not self.last_btn[arm]:
+                # ABSOLUTE scheme input: the page sends this hand mapped into the
+                # robot base_link frame ("pos_base"). Validate it is a finite 3-vec
+                # (a degenerate anchor inverse could yield NaN/Inf, and z is
+                # unbounded so a bad value would pass the target clamp) -- a missing
+                # or non-finite value means "no placement anchor yet" and is treated
+                # as not engaged below. None/unused in relative mode.
+                hand_base = None
+                if mode == "absolute":
+                    pb = c.get("pos_base")
+                    if pb is not None:
+                        v = np.asarray(pb, dtype=np.float64)
+                        if v.shape == (3,) and np.all(np.isfinite(v)):
+                            hand_base = v
+
+                # A/X edge (alone, NOT the chord): re-seed this arm's target to the
+                # live fingertip ("home to here") and drop the clutch.
+                if button and not recenter and not self.last_btn[arm]:
                     self._reseed(arm)
                     self.clutch[arm] = False
                 self.last_btn[arm] = button
 
                 # Thumbstick-click edge: toggle this arm's PRECISION mode (fine
                 # placement). Position-only reach, so there is no rotation to lock;
-                # the click now scales hand motion down for sub-cm accuracy.
+                # the click scales hand motion down for sub-cm accuracy.
                 if precision and not self.last_precision[arm]:
                     self.fine[arm] = not self.fine[arm]
+                    # In absolute mode the scale multiplies displacement from the
+                    # engage anchor, so a live scale change would snap the target;
+                    # re-anchor on the engaged hand to keep the switch continuous.
+                    if mode == "absolute" and self.clutch[arm] and hand_base is not None:
+                        self.clutch_hand0[arm] = hand_base
+                        self.clutch_target0[arm] = np.array(self.target[arm], dtype=np.float64)
                 self.last_precision[arm] = precision
 
-                # Clutch logic: target follows hand delta only while squeezed. The
-                # delta (raw WebXR metres) is projected into the operator's heading
-                # frame captured at the squeeze, so "forward/left/up relative to
-                # where you're looking" map to robot x/y/z.
-                if squeeze and not self.clutch[arm]:
-                    self.clutch[arm] = True
-                    self.clutch_hand0[arm] = hand
-                    self.clutch_target0[arm] = np.array(self.target[arm])
-                    F, L = _heading_basis(head_fwd)
-                    self.clutch_F[arm], self.clutch_L[arm] = F, L
-                    self.seeded[arm] = True
-                elif squeeze and self.clutch[arm]:
-                    scale = self.motion_scale * (PRECISION_SCALE if self.fine[arm] else 1.0)
-                    d = (hand - self.clutch_hand0[arm]) * scale
-                    F, L = self.clutch_F[arm], self.clutch_L[arm]
-                    robot_delta = np.array([
-                        float(-(d @ L)),  # right    -> +x  (x/y swapped, x reversed)
-                        float(d @ F),     # forward  -> +y  (x/y swapped)
-                        float(d[1]),      # up       -> +z
-                    ])
-                    self._set_target(arm, self.clutch_target0[arm] + robot_delta)
-                elif not squeeze:
-                    self.clutch[arm] = False
+                if mode == "absolute":
+                    # Embodiment: the page expresses the hand in base_link via a BODY
+                    # anchor that rides the operator's headset ("pos_base"), so the
+                    # robot arms mirror the operator's arms. Grip-gated: on the
+                    # squeeze edge snap the target to the hand and capture an engage
+                    # anchor; while held the target is anchor + scale*(hand -
+                    # hand@engage) -- scale 1.0 mirrors the hand 1:1, PRECISION_SCALE
+                    # makes a fine nudge around the engage point. Release frees the arm.
+                    if squeeze and hand_base is not None:
+                        if not self.clutch[arm]:
+                            self.clutch[arm] = True
+                            self.clutch_hand0[arm] = hand_base
+                            self.clutch_target0[arm] = hand_base.copy()
+                            self.seeded[arm] = True
+                        scale = PRECISION_SCALE if self.fine[arm] else 1.0
+                        self._set_target(
+                            arm, self.clutch_target0[arm] + scale * (hand_base - self.clutch_hand0[arm]))
+                    else:
+                        # Released, OR squeezing before a placement anchor exists
+                        # (hand_base None/invalid): treat as not engaged so the
+                        # state is well-defined and the next valid frame re-snaps
+                        # cleanly, rather than silently holding a stale grab.
+                        self.clutch[arm] = False
+                else:
+                    # Relative (clutched): target follows hand delta only while
+                    # squeezed. The delta (raw WebXR metres) is projected into the
+                    # operator's heading frame captured at the squeeze, so
+                    # "forward/left/up relative to where you're looking" map to
+                    # robot x/y/z.
+                    if squeeze and not self.clutch[arm]:
+                        self.clutch[arm] = True
+                        self.clutch_hand0[arm] = hand
+                        self.clutch_target0[arm] = np.array(self.target[arm])
+                        F, L = _heading_basis(head_fwd)
+                        self.clutch_F[arm], self.clutch_L[arm] = F, L
+                        self.seeded[arm] = True
+                    elif squeeze and self.clutch[arm]:
+                        scale = self.motion_scale * (PRECISION_SCALE if self.fine[arm] else 1.0)
+                        d = (hand - self.clutch_hand0[arm]) * scale
+                        F, L = self.clutch_F[arm], self.clutch_L[arm]
+                        robot_delta = np.array([
+                            float(-(d @ L)),  # right    -> +x  (x/y swapped, x reversed)
+                            float(d @ F),     # forward  -> +y  (x/y swapped)
+                            float(d[1]),      # up       -> +z
+                        ])
+                        self._set_target(arm, self.clutch_target0[arm] + robot_delta)
+                    elif not squeeze:
+                        self.clutch[arm] = False
 
                 self.grip[arm] = trigger
+
+            # Scheme-toggle chord (A/X + B/Y together on either controller),
+            # edge-triggered: flip relative<->absolute and drop any in-progress grab
+            # so the new scheme starts clean. Takes effect next frame (mode was
+            # snapshotted above). The page suppresses its own B/Y recenter while A/X
+            # is also down, so the chord doesn't ALSO re-anchor the hologram.
+            if chord_any and not self._last_mode_chord:
+                self.control_mode = "absolute" if self.control_mode == "relative" else "relative"
+                self.clutch = {"left": False, "right": False}
+            self._last_mode_chord = chord_any
 
             # Base from the thumbsticks:
             #   LEFT stick  forward/back -> drive forward/back (vx)
@@ -459,6 +561,7 @@ class M1QuestNode(Node):
             "q_ver": getattr(self, "_q_ver", 0),
             "target": {a: list(self.target[a]) for a in ("left", "right")},
             "fine": {a: self.fine[a] for a in ("left", "right")},
+            "mode": getattr(self, "control_mode", "relative"),
             "base": {
                 "p": [round(x, 4), round(y, 4), 0.0],
                 "q": [round(c, 5) for c in self.odom.quaternion()],
@@ -550,6 +653,9 @@ class M1QuestNode(Node):
             # +z). The page applies this to the robot group so the whole model
             # translates/turns through the room as the base drives.
             "base": snap["base"],
+            # Active control scheme ("relative" | "absolute"), shown on the in-VR
+            # HUD so the operator always knows which scheme the chord left them in.
+            "mode": snap.get("mode", "relative"),
         }
         err = {"left": None, "right": None}
         for arm in ("left", "right"):
@@ -736,7 +842,8 @@ class M1QuestNode(Node):
             now = self._now()
             connected = (now - getattr(self, "_last_update", 0.0)) < 1.0
             js_live = bool(self.q_meas)
-            out = {"xr_connected": connected, "joint_states": js_live, "arms": {}}
+            out = {"xr_connected": connected, "joint_states": js_live,
+                   "mode": getattr(self, "control_mode", "relative"), "arms": {}}
             for arm in ("left", "right"):
                 out["arms"][arm] = {
                     "target": [round(v, 3) for v in self.target[arm]],
@@ -1008,6 +1115,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <div class="status">
       <span class="dot" id="jsDot"></span>
       <span id="jsText">robot feedback: unknown</span>
+      <span style="margin-left:auto">scheme: <b id="scheme">relative</b></span>
     </div>
     <table>
       <tr><td>left target</td><td id="lt">–</td><td id="lg">grip –</td><td id="le">err –</td><td id="lc"></td></tr>
@@ -1018,15 +1126,23 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <div class="card">
     <h3 style="margin:0 0 8px;font-family:var(--serif)">Controls</h3>
     <p class="muted">
-      <kbd>Grip</kbd> (squeeze) — hold to "grab" that arm; the gripper's target
-      follows your hand's motion. Release to reposition your hand.<br/>
+      <kbd>Grip</kbd> (squeeze) — hold to "grab" that arm. In <b>relative</b> mode
+      the gripper's target follows your hand's <em>motion</em> (release to
+      reposition your hand). In <b>absolute (embodiment)</b> mode the robot's arms
+      ride your body and <em>mirror your arms</em> — hold Grip to move, release to
+      freeze.<br/>
       <kbd>Trigger</kbd> — that arm's gripper (squeeze to close).<br/>
       <kbd>Stick click</kbd> — toggle <em>precision mode</em> for that arm (hand
       motion scaled down for fine, sub-cm placement).<br/>
       <kbd>Left stick</kbd> — drive: forward/back = drive fwd/back, left/right = strafe.<br/>
       <kbd>Right stick</kbd> — left/right = turn (yaw).<br/>
       <kbd>A</kbd>/<kbd>X</kbd> — re-home that arm's target to where it is now.<br/>
-      <kbd>B</kbd>/<kbd>Y</kbd> — recenter the robot hologram in front of you.
+      <kbd>B</kbd>/<kbd>Y</kbd> — recenter the robot hologram in front of you.<br/>
+      <kbd>A</kbd>+<kbd>B</kbd> (or <kbd>X</kbd>+<kbd>Y</kbd>) <b>together</b> —
+      switch control scheme: <b>relative</b> (your hand's motion nudges the target)
+      ⇄ <b>absolute / embodiment</b> (the robot's arms ride your body and mirror
+      your arms; a separate full robot stands in front and drives with the sticks).
+      The current scheme shows on the in-VR panel and above.
     </p>
     <p class="muted">
       In the headset you'll see a 3D model of the robot (its real meshes) drawn
@@ -1053,6 +1169,8 @@ async function poll(){
     const d=document.getElementById("jsDot"), t=document.getElementById("jsText");
     if(s.joint_states){ d.classList.add("on"); t.textContent="robot feedback: live"; }
     else { d.classList.remove("on"); t.textContent="robot feedback: none — start sim/robot"; }
+    const sc=document.getElementById("scheme");
+    if(sc && s.mode) sc.textContent=s.mode;
     const f=(a)=>{ const arm=s.arms[a]; if(!arm) return;
       document.getElementById(a[0]+"t").textContent="["+arm.target.join(", ")+"]";
       document.getElementById(a[0]+"g").textContent="grip "+arm.grip.toFixed(2);
@@ -1075,6 +1193,9 @@ const enterBtn=document.getElementById("enter");
 const hint=document.getElementById("xrhint");
 
 let renderer=null, scene=null, camera=null, robotRoot=null, robotBase=null;
+let bodyAnchor=null;   // embodiment frame (absolute mode): rides the headset
+let bodyFwd=null;      // captured horizontal forward [x,0,z] for the body yaw
+let prevAbsMode=false; // edge-detect entering absolute (to (re)capture bodyFwd)
 let xrSession=null, refSpace=null, refIsFloor=false, robotPlaced=false;
 let lastViz=null, inFlight=false, meshesLoaded=false;
 
@@ -1112,6 +1233,21 @@ const RENDER_DELAY_MIN=0.015, RENDER_DELAY_MAX=0.080;
 const _vA=new THREE.Vector3(), _vB=new THREE.Vector3();
 const _qA=new THREE.Quaternion(), _qB=new THREE.Quaternion();
 const _hudV=new THREE.Vector3(), _hudQ=new THREE.Quaternion();
+// Scratch for the ABSOLUTE scheme: map a controller's world position into the
+// robot base_link frame via the inverse of the hologram anchor (robotBase's world
+// matrix). Reused so the per-frame mapping allocates nothing.
+const _invBase=new THREE.Matrix4(), _handBaseV=new THREE.Vector3();
+// Embodiment (absolute mode): the robot's chest/arms frame rides the headset so
+// the two arm models overlay the operator's own arms and mirror them. CHEST_DROP
+// = head->chest (m, world down). BODY_REF_BASELINK = the robot base_link point
+// (x fwd, y left, z up) pinned to the operator's chest -- roughly the arm-mount
+// centre at a nominal lift, so neutral hands map to a comfortable mid-reach.
+// Both are tunable knobs for how the robot sits on the operator.
+const CHEST_DROP=0.25;
+const BODY_REF_BASELINK=[-0.018, 0.19, 0.75];
+// Reused scratch for the per-frame bodyAnchor matrix build (no allocation).
+const _bodyMat=new THREE.Matrix4(), _bodyRef=new THREE.Vector3();
+const _bX=new THREE.Vector3(), _bY=new THREE.Vector3(), _bZ=new THREE.Vector3(0,1,0);
 
 // Perf HUD (dev metric) gated by ?perf in the URL: render FPS, data-update Hz,
 // POST RTT, payload size. Zero clutter on the normal URL.
@@ -1147,6 +1283,10 @@ function interpState(){
 let armLinks={left:[], right:[]};
 const armComplete={left:false, right:false};
 const linkNodes={}, targetMesh={}, tipMesh={}, errLine={}, wire={};
+// Embodiment overlay: a SECOND instance of each ARM link mesh, parented under
+// bodyAnchor so the two arms can be drawn ON the operator in absolute mode (posed
+// from the same live link transforms as the front model).
+const bodyLinkNodes={};
 // Per-arm trajectory PREVIEW: a vertex-coloured polyline (green=clear, red where
 // a waypoint self-collides) plus camera-facing dots at the waypoints, both under
 // robotBase so they drive with the robot. Preallocated once in initThree(),
@@ -1157,7 +1297,7 @@ let errHud=null, hudCanvas=null, hudCtx=null, hudTex=null;   // in-VR REACH ERRO
 // Last distances actually drawn into the HUD canvas (mm, quantized to 0.1). The
 // canvas redraw + GPU texture upload is the costly part of the HUD, so we skip
 // it while the displayed values are unchanged and only re-billboard the panel.
-let hudDrawnL=null, hudDrawnR=null;
+let hudDrawnL=null, hudDrawnR=null, hudDrawnMode=null;
 const recenterPrev={left:false, right:false};
 // Sticky "(re)anchor the robot" signal. Set when we place/recenter, sent to the
 // node so it zeroes the dead-reckoned base pose, and cleared only once a POST
@@ -1207,13 +1347,13 @@ function errCss(d){
    Skips the (expensive) canvas clear+draw+texture upload when both displayed
    values are unchanged since the last draw, quantized to 0.1 mm -- the panel is
    still re-billboarded every frame by updateHud(), which is cheap. ---- */
-function drawHud(dl, dr){
+function drawHud(dl, dr, mode){
   if(!hudCtx) return;
   // Quantize to 0.1 mm (null stays null) so sub-tenth jitter doesn't redraw.
   const ql = dl==null?null:Math.round(dl*1e4);
   const qr = dr==null?null:Math.round(dr*1e4);
-  if(ql===hudDrawnL && qr===hudDrawnR) return;   // nothing visible changed
-  hudDrawnL=ql; hudDrawnR=qr;
+  if(ql===hudDrawnL && qr===hudDrawnR && mode===hudDrawnMode) return;   // nothing visible changed
+  hudDrawnL=ql; hudDrawnR=qr; hudDrawnMode=mode;
   const W=hudCanvas.width, H=hudCanvas.height, c=hudCtx;
   c.clearRect(0,0,W,H);
   c.fillStyle="rgba(18,18,22,0.72)";
@@ -1223,6 +1363,13 @@ function drawHud(dl, dr){
   c.fillStyle="#e8e6df";
   c.font="600 34px system-ui,-apple-system,'Segoe UI',sans-serif";
   c.fillText("REACH ERROR",36,46);
+  // Active control scheme tag (top-right): absolute = blue, relative = sand. The
+  // chord (A/X+B/Y) flips it; this is the operator's in-VR confirmation.
+  const absMode = mode==="absolute";
+  c.textAlign="right"; c.font="600 24px system-ui,-apple-system,'Segoe UI',sans-serif";
+  c.fillStyle = absMode ? "#9fe0ff" : "#d8c089";
+  c.fillText(absMode ? "ABSOLUTE" : "RELATIVE", W-36, 44);
+  c.textAlign="left";
   const row=(label,d,y)=>{
     const col=errCss(d);
     c.beginPath(); c.arc(54,y,14,0,Math.PI*2); c.fillStyle=col; c.fill();
@@ -1281,6 +1428,14 @@ function initThree(){
   // swerve pose, so the whole robot (meshes, targets, wires) drives through the
   // room as the base is commanded. Everything below hangs off robotBase.
   robotBase=new THREE.Group(); robotRoot.add(robotBase);
+
+  // Embodiment anchor (absolute mode): a body-locked frame that REPRESENTS
+  // base_link and rides the headset, so the robot's two arm meshes can be drawn ON
+  // the operator and pos_base is taken relative to their chest. matrixAutoUpdate
+  // off -- onFrame sets its matrix from the live head pose each frame. Hidden until
+  // absolute mode (updateRobot toggles visibility).
+  bodyAnchor=new THREE.Group(); bodyAnchor.matrixAutoUpdate=false;
+  bodyAnchor.visible=false; scene.add(bodyAnchor);
 
   for(const arm of ["left","right"]){
     const tg=new THREE.Mesh(new THREE.SphereGeometry(0.05,24,16),
@@ -1405,6 +1560,14 @@ async function loadRobot(){
       // so it drives with the robot through the room.
       if(!node){ node=new THREE.Group(); node.visible=false; linkNodes[e.link]=node; robotBase.add(node); }
       node.add(obj); ok++;
+      // Embodiment overlay: ARM links get a SECOND instance under bodyAnchor so the
+      // two arms can be drawn on the operator in absolute mode. (Cheap clone --
+      // geometry + the shared material are reused by reference.)
+      if(bodyAnchor && (e.link.indexOf("openarm_left")>=0 || e.link.indexOf("openarm_right")>=0)){
+        let bn=bodyLinkNodes[e.link];
+        if(!bn){ bn=new THREE.Group(); bn.visible=false; bodyLinkNodes[e.link]=bn; bodyAnchor.add(bn); }
+        bn.add(obj.clone(true));
+      }
     }catch(err){ failed.push(e.link); log("mesh instance failed "+e.link+": "+err); }
   }
 
@@ -1457,6 +1620,21 @@ function updateRobot(){
       const tb=B.links[name], ta=al[name]||tb;
       applyInterp(node, ta, tb, s);
       node.visible=true;   // now it has a real pose -> safe to show
+    }
+  }
+  // EMBODIMENT overlay (absolute mode only): pose the SECOND arm-mesh set under the
+  // body anchor from the SAME interpolated link transforms, so the robot's two arms
+  // appear ON the operator and mirror them. bodyAnchor.matrix is set live in
+  // onFrame from the head pose; here we just toggle visibility + pose by mode.
+  const embodied = !!(lastViz && lastViz.mode==="absolute");
+  if(bodyAnchor) bodyAnchor.visible = embodied;
+  if(embodied && B.links){
+    const al=A.links||{};
+    for(const name in bodyLinkNodes){
+      const tb=B.links[name]; if(!tb) continue;
+      const ta=al[name]||tb;
+      applyInterp(bodyLinkNodes[name], ta, tb, s);
+      bodyLinkNodes[name].visible=true;
     }
   }
   updateWire(!meshesLoaded, B);   // both arms before load; per-arm gap fallback after
@@ -1543,7 +1721,7 @@ function updateHud(){
     const dl=al&&al.dist!=null?al.dist:null, dr=ar&&ar.dist!=null?ar.dist:null;
     if(dl==null && dr==null){ errHud.visible=false; }
     else {
-      drawHud(dl, dr);
+      drawHud(dl, dr, (lastViz&&lastViz.mode)||"relative");
       errHud.position.set(_hudV.x, _hudV.y+1.35, _hudV.z);   // float above the robot
       if(cam) errHud.quaternion.copy(_hudQ);
       errHud.visible=true;
@@ -1643,6 +1821,26 @@ function setAnchor(vpose, head){
   log("placed robot model");
 }
 
+/* ---- EMBODIMENT (absolute mode): place bodyAnchor (which represents base_link)
+   so the robot's arm-mount centre (BODY_REF_BASELINK) sits at the operator's chest,
+   yawed to their facing. Rebuilt every frame from the live head pose, so it
+   continuously RIDES the headset: the robot arms stay on the operator's body as
+   they walk/turn. headPos is the viewer position, fwd the head forward vector. ---- */
+function updateBodyAnchor(headPos, fwd){
+  const n=Math.hypot(fwd[0],fwd[2]);
+  const F=n>1e-4?[fwd[0]/n,0,fwd[2]/n]:[0,0,-1];     // horizontal forward
+  // base_link axes -> world: x=F (fwd), y=(Fz,0,-Fx) (left), z=up. Reused scratch.
+  _bX.set(F[0],0,F[2]); _bY.set(F[2],0,-F[0]);        // _bZ stays (0,1,0)
+  _bodyMat.makeBasis(_bX,_bY,_bZ);
+  // Pin BODY_REF_BASELINK (arm-mount centre) to the chest: pos = chestWorld - R*ref.
+  // _bodyMat has no translation yet, so applyMatrix4 rotates ref by R only.
+  _bodyRef.set(BODY_REF_BASELINK[0],BODY_REF_BASELINK[1],BODY_REF_BASELINK[2]).applyMatrix4(_bodyMat);
+  _bodyMat.setPosition(headPos.x - _bodyRef.x,
+                       (headPos.y - CHEST_DROP) - _bodyRef.y,
+                       headPos.z - _bodyRef.z);
+  bodyAnchor.matrix.copy(_bodyMat); bodyAnchor.matrixWorldNeedsUpdate=true;
+}
+
 function readController(src, frame){
   if(!src || !src.gripSpace || !src.gamepad) return null;
   const pose=frame.getPose(src.gripSpace, refSpace);
@@ -1671,24 +1869,70 @@ function onFrame(t, frame){
       if(src.handedness==="left"||src.handedness==="right")
         out[src.handedness]=readController(src, frame);
     }
+    // (pos_base for the ABSOLUTE/embodiment scheme is computed below, AFTER the
+    // head pose is read, because it is taken in the body anchor frame.)
+    // B/Y recenters the hologram -- but B/Y held WITH A/X is the scheme-toggle
+    // chord (handled server-side), so suppress recenter while A/X is also down so
+    // toggling the scheme doesn't yank the model back to the anchor.
     let recenter=false;
     for(const h of ["left","right"]){
-      const c=out[h]; const now=!!(c&&c.recenter);
+      const c=out[h]; const now=!!(c&&c.recenter&&!c.button);
       if(now && !recenterPrev[h]) recenter=true; recenterPrev[h]=now;
     }
-    let head=null;
+    let head=null, headPos=null, headUpH=null;
     const vpose=frame.getViewerPose(refSpace);
     if(vpose){
       const q=vpose.transform.orientation;     // rotate (0,0,-1) by q
       head=[ -2*(q.x*q.z + q.w*q.y),
              -2*(q.y*q.z - q.w*q.x),
              -(1 - 2*(q.x*q.x + q.y*q.y)) ];
+      headPos=vpose.transform.position;        // viewer position (for the body anchor)
+      // Head UP vector's horizontal part (R*(0,1,0)).xz -- used as a robust fallback
+      // for the facing yaw when the head is pitched steeply (looking down at your
+      // hands), where the forward vector's horizontal projection degenerates.
+      headUpH=[ 2*(q.x*q.y - q.w*q.z), 2*(q.y*q.z + q.w*q.x) ];
       if(!robotPlaced || recenter){
         setAnchor(vpose, head); robotPlaced=true; pendingPlace=true;
         // Snap the model back to the anchor immediately; updateRobot() holds it
         // here (it skips the stale cached base while pendingPlace) until the
         // server's zeroed pose comes back.
         if(robotBase){ robotBase.position.set(0,0,0); robotBase.quaternion.set(0,0,0,1); }
+      }
+    }
+    // EMBODIMENT body anchor. The anchor POSITION follows the head every frame (so
+    // the arms stay on your body as you walk), but its FORWARD (yaw) is a STABLE
+    // captured direction, NOT the live head gaze: continuously following the gaze
+    // re-rotated the whole mapping every time you looked down/around (the reported
+    // "arm forward goes to the right / 90 deg off"). We capture the forward when you
+    // ENTER absolute mode and on a B/Y recenter, robust to looking up/down (fall
+    // back to the head-up vector when the forward is near-vertical). pos_base is then
+    // taken in this stable frame. Finite-guarded (a degenerate inverse must never
+    // feed NaN/Inf to the target -- z is unbounded so the clamp can't save it).
+    if(head && headPos && bodyAnchor){
+      // robust horizontal forward at this instant
+      let fhx=head[0], fhz=head[2];
+      if(Math.hypot(fhx,fhz) < 0.5 && headUpH){
+        const sgn = head[1] < 0 ? 1 : -1;       // looking down -> up points forward
+        fhx = sgn*headUpH[0]; fhz = sgn*headUpH[1];
+      }
+      const absNow = !!(lastViz && lastViz.mode==="absolute");
+      // (re)capture the stable forward on entering absolute, on a B/Y recenter, or
+      // if we don't have one yet; forget it when leaving absolute so re-entry
+      // recaptures from wherever you're then facing.
+      if(absNow && (!prevAbsMode || recenter || !bodyFwd)) bodyFwd=[fhx,0,fhz];
+      if(!absNow) bodyFwd=null;
+      prevAbsMode=absNow;
+      const useFx = bodyFwd?bodyFwd[0]:fhx, useFz = bodyFwd?bodyFwd[2]:fhz;
+      updateBodyAnchor(headPos, [useFx,0,useFz]);
+      bodyAnchor.updateWorldMatrix(false,false);
+      _invBase.copy(bodyAnchor.matrixWorld).invert();
+      for(const h of ["left","right"]){
+        const c=out[h];
+        if(c && c.valid && c.pos){
+          _handBaseV.set(c.pos[0],c.pos[1],c.pos[2]).applyMatrix4(_invBase);
+          if(Number.isFinite(_handBaseV.x)&&Number.isFinite(_handBaseV.y)&&Number.isFinite(_handBaseV.z))
+            c.pos_base=[_handBaseV.x,_handBaseV.y,_handBaseV.z];
+        }
       }
     }
     if(!inFlight && nowSec()>=postBackoffUntil){

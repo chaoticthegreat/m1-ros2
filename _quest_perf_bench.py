@@ -64,6 +64,8 @@ def make_node(reach):
     n.fine = {a: False for a in ARMS}
     n.last_precision = {a: False for a in ARMS}
     n.last_btn = {a: False for a in ARMS}
+    n.control_mode = "relative"
+    n._last_mode_chord = False
     n._last_base_cmd = 0.0
     n._last_update = 0.0
     n.odom = SwerveOdometry()
