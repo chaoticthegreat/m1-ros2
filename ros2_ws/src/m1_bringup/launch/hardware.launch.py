@@ -161,6 +161,15 @@ def generate_launch_description():
         package="m1_control",
         executable="m1_ranger_shim",
         output="screen",
+        parameters=[{
+            # --- AgileX base feedback calibration (HARDWARE CHECKPOINTS) ---
+            # See ros2_ws/AGILEX_SETUP.md §6. Module 01..04 -> our fl/fr/rr/rl;
+            # default = AgileX motor order RF,RR,LR,LF. Confirm by jogging one
+            # module at a time and watching /joint_states, then edit these.
+            "corner_order": [3, 0, 1, 2],
+            # Ranger Air wheel rolling radius (m); converts /wheel_speeds m/s -> rad/s.
+            "wheel_radius": 0.055,
+        }],
         condition=IfCondition(use_base),
     )
 
