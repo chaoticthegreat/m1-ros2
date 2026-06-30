@@ -55,3 +55,13 @@ ros2 run m1_control m1_teleop     # or a terminal keyboard console
 See [`ros2_ws/README.md`](ros2_ws/README.md) for the full ROS 2 interface,
 architecture, and deployment notes, and [`isaac/README.md`](isaac/README.md)
 for Isaac details.
+
+## Deploying on real hardware (Jetson AGX Orin)
+
+The same control code runs on the real robot — no Isaac. For a from-scratch
+bring-up on an **NVIDIA Jetson AGX Orin**, follow
+[`DEPLOY_AGX_ORIN.md`](DEPLOY_AGX_ORIN.md): a step-by-step agent runbook covering
+the OS/ROS strategy (native Jazzy on JetPack 7.2 vs Jazzy-in-Docker on JetPack 6),
+Drake, the Damiao CAN bus, and Jetson tuning, plus a bootstrap script and systemd
+units in [`deploy/agx-orin/`](deploy/agx-orin/). The hardware control seam itself
+is documented in [`ros2_ws/HARDWARE.md`](ros2_ws/HARDWARE.md).

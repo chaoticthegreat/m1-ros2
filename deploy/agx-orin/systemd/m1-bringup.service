@@ -1,0 +1,32 @@
+# Launch the M1 real-hardware control stack on boot, after CAN is up.
+# Install to /etc/systemd/system/m1-bringup.service ; edit /etc/m1/m1.env first.
+#   sudo systemctl enable --now m1-bringup.service
+#
+# SAFETY: this energizes motors on boot. Keep a HARDWARE e-stop. Do NOT enable
+# this while you are still using m1_hwconfig (bus ownership is exclusive). The
+# plugin refuses to open the bus if any commanded joint has kp==0 (bad motor_map).
+[Unit]
+Description=M1 control stack (Drake brain + ros2_control + Damiao CAN)
+After=can0.service network-online.target
+Requires=can0.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/m1/m1.env
+# EDIT THIS to the user that owns the workspace and is in the CAN/serial groups.
+# (User= cannot read EnvironmentFile, so it must be a literal here.)
+User=USER
+# Source ROS + the workspace overlay, then exec the launch in the foreground.
+ExecStart=/bin/bash -lc 'source "$ROS_SETUP" && source "$M1_WS/install/setup.bash" && \
+  exec ros2 launch m1_bringup hardware.launch.py \
+    can_interface:="$CAN_IFACE" can_fd:="$CAN_FD" motor_map:="$MOTOR_MAP" $M1_LAUNCH_ARGS'
+Restart=on-failure
+RestartSec=3
+# Allow SCHED_FIFO if you pin the control loop (Phase 10, Tier 2):
+LimitRTPRIO=99
+KillSignal=SIGINT
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

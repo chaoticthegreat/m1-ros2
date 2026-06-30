@@ -59,7 +59,10 @@ ros2 run m1_can_tools m1_hwconfig                            # motor config/test
 
 **Real-hardware deployment** lives in **@ros2_ws/HARDWARE.md** (Damiao CAN motors +
 AgileX base; the `m1_hardware` C++ ros2_control plugin, `m1_can_tools` config page,
-and the bridge nodes). Standalone `m1_can_tools` modules need
+and the bridge nodes). **Deploying from a fresh clone onto a Jetson AGX Orin:**
+follow **@DEPLOY_AGX_ORIN.md** — a step-by-step, detect→do→verify agent runbook
+(OS/ROS/Drake/CAN/tuning) with bootstrap script + systemd templates in
+`deploy/agx-orin/`. Standalone `m1_can_tools` modules need
 `PYTHONPATH=ros2_ws/src/m1_can_tools`. **Cleaning up a launched ros2 stack:** SIGINT
 the `ros2 launch` then sweep leftover PIDs — never `pkill -f <node-name>` (the
 pattern matches your own shell's command line and SIGKILLs your shell).

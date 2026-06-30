@@ -1,0 +1,21 @@
+# Lock Jetson clocks at max (disable DVFS) for a flat per-tick control budget.
+# JETSON ONLY -- jetson_clocks / nvpmodel exist only on the L4T BSP. Skip on a
+# non-Jetson aarch64 box. Install to /etc/systemd/system/jetson-clocks.service.
+#   sudo systemctl enable --now jetson-clocks.service
+#
+# NB: nvpmodel -m 0 (MAXN) is persistent and should be set once by hand
+# (verify the mode number with `nvpmodel -q` first -- it is board-specific).
+# jetson_clocks is NOT persistent, hence this unit. The sleep works around the
+# known Orin quirk where jetson_clocks run too early in boot silently no-ops.
+[Unit]
+Description=Lock Jetson clocks to max (jetson_clocks)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/bin/sleep 90
+ExecStart=/usr/bin/jetson_clocks
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,17 @@
+# Bring up the M1 Damiao CAN bus (arms + lift) at boot, before the control stack.
+# Install to /etc/systemd/system/can0.service ; edit /etc/m1/m1.env first.
+#   sudo systemctl enable --now can0.service
+[Unit]
+Description=M1 SocketCAN bring-up (Damiao arms/lift)
+After=multi-user.target
+Wants=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/etc/m1/m1.env
+# Uses the repo's can_up.sh so the gs_usb / pinmux detection + retry logic applies.
+ExecStart=/bin/bash -lc 'IFACE="$CAN_IFACE" FD="$CAN_FD" "$M1_REPO/deploy/agx-orin/can_up.sh" "$CAN_IFACE"'
+
+[Install]
+WantedBy=multi-user.target

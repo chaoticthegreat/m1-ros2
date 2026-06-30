@@ -387,6 +387,15 @@ real driver; everything in `ros2_ws/` is unchanged.
 
 Full guide: **@ros2_ws/HARDWARE.md**. Design + the OpenArm-MoveIt-vs-Drake
 comparison: `docs/superpowers/specs/2026-06-23-real-hardware-deployment-design.md`.
+**Deploying from a fresh clone onto a Jetson AGX Orin** (OS/ROS/Drake/CAN/tuning,
+detect→do→verify): **@DEPLOY_AGX_ORIN.md** + the bootstrap script / systemd
+templates in `deploy/agx-orin/`. Key Orin facts (verified 2026-06-30): ROS 2 Jazzy
+needs Ubuntu 24.04 Noble, so use **JetPack 7.2** (L4T 39.2 / Noble / kernel 6.8 —
+the first JetPack 7 to support Orin) for native Jazzy, OR run Jazzy-in-Docker on
+JetPack 6 (Jammy). Drake ships an official `aarch64` Noble/py3.12 wheel **with
+SNOPT** (`pip install drake` just works, as on the dev box). The arms' CANable/
+`gs_usb` adapter is **not** in the stock JetPack kernel — prefer native `mttcan`
+(needs a Jetson-IO pinmux enable + transceiver) or a PEAK (`peak_usb`) dongle.
 
 **Decision (hybrid):** reuse OpenArm's Damiao CAN/ros2_control hardware layer; keep
 the Drake position-only IK as the reactive brain; MoveIt is optional/later for
