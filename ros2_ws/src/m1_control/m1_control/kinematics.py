@@ -106,6 +106,17 @@ _IK_REG_COLD = 1.0e-2     # light posture reg weight on a free arm's joints; eac
                           # which is what keeps the reach continuous (see _DrakeIK.solve)
 _IK_REG_TRACK = 1.0e-2    # posture reg weight pulling the config toward the cached
                           # solution while tracking (in-branch continuity)
+_IK_REG_LIFT_TRACK = 1.0e2   # EXTRA posture reg on the shared prismatic lift alone
+                          # while tracking. The lift has direct 1:1 leverage on the
+                          # world z axis, so the least-squares tracking solve recruits
+                          # it to chase even mm-scale target z-noise -- and because the
+                          # lift is SHARED it drags both arms, which the operator sees
+                          # as the arm+lift "oscillating after reaching" under a
+                          # streamed (jittery) teleop target. A stiffer lift reg makes
+                          # the arm's own joints absorb small target motion (the lift
+                          # only moves for sustained demand a re-solve/re-acquire hands
+                          # it), killing the amplification. Uniform reg can't do this
+                          # (it scales out of the least-squares distribution).
 _IK_REG_HELD = 0.5        # strong reg holding a not-jumped arm on its cached branch
                           # while the other arm's target is re-searched (the shared
                           # lift is hard-pinned to cached in that case, not anchored)
@@ -815,8 +826,12 @@ class ReachController:
         seed = dik.full_q(q_meas)
         for k, j in enumerate(joint_order):
             seed[dik.jstart[j]] = cached_vec[k]
-        # reg toward the seed (= cached config) keeps the warm solve in-branch
+        # reg toward the seed (= cached config) keeps the warm solve in-branch; the
+        # shared lift gets an extra-stiff reg so it does not chase small target motion
+        # (it has 1:1 z leverage and is shared -- see _IK_REG_LIFT_TRACK).
         reg_w = np.full(len(joint_order), _IK_REG_TRACK)
+        if LIFT_JOINT in joint_order:
+            reg_w[joint_order.index(LIFT_JOINT)] = _IK_REG_LIFT_TRACK
         qf = dik.solve(arms, pos, seed, active_idx, seed, reg_w, _IK_WPOS)
         return qf, self._dist(dik, arms, pos, qf)
 

@@ -135,6 +135,31 @@ real driver; everything in `ros2_ws/` is unchanged.
   ~0 mm, against the sim state). The sim arm gain `ARM_KP` in `isaac/ros_sim.py`
   was also raised 9000→30000 so the simulated arm actually holds a correct command
   at near-max reach (was sagging ~3-4 cm under gravity → amber); sim-fidelity only.
+
+  **NB — POST-REACH OSCILLATION fix (2026-07-01, found on the live sim+Quest loop).**
+  Operator report: "a lot of oscillation in the arm AND the lift *after* it has
+  reached the target" (the approach is smooth). Root cause (offline-reproduced in
+  `_osc_test.py`, which the perfect-feedback suites structurally miss): a *streamed*
+  teleop target (Quest) is never perfectly static — it carries ~mm hand tremor /
+  sensor noise — so every tick lands in the warm TRACKING branch, re-solving the
+  redundant reach (5-D null space) against a noisy goal with a near-negligible
+  posture anchor. The **shared prismatic lift** (direct 1:1 z leverage) is the worst
+  offender: the least-squares solve routed target-z-noise through it, amplifying
+  **1 mm of target jitter into ~9 mm of lift travel** (and, being shared, it dragged
+  both arms). Two-layer fix, both validated: (1) **solver** — `_IK_REG_LIFT_TRACK`
+  puts an *extra-stiff, lift-specific* reg on the shared lift in `_solve_track` so
+  small target motion is absorbed by the arm's own joints, not the lift (lift travel
+  9 mm→0.01 mm). Uniform reg can't do this (it scales out of the least-squares); a
+  separate freeze/hold-band broke the smooth-sweep suites, so it was rejected. (2)
+  **controller** (`M1Controller._hold_condition`, params `target_hold_band` 6 mm /
+  `target_hold_ticks` 8) — a *dwell-freeze*: once the raw target has stayed within
+  the band for N ticks it is latched, so the solver sees a static goal and parks
+  every joint (arm too); a genuine move past the band releases instantly (no lag / no
+  dead-zone). It lives in the operator layer *on purpose* — the solver suites call
+  `solve_step` directly so this can't regress them (and a solver-side dwell-freeze
+  would falsely trigger at a slow tracking target's turning points). **Live-validate
+  in the headset** (the offline gate models 1 mm iid jitter; tune the two params if
+  the real Quest tremor differs). Gate: `/usr/bin/python3 _osc_test.py` (6/6).
 - `.../collision.py` — **dependency-free capsule self-collision model** (new).
   Approximates each link as a capsule (its FK centerline + a radius) and reports
   the signed clearance between checked pairs via segment-to-segment distance —
