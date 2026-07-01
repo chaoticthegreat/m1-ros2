@@ -243,8 +243,23 @@ class M1Teleop(Node):
             self.step_scale = _clamp(self.step_scale / 1.5, STEP_SCALE_MIN, STEP_SCALE_MAX)
             return
         if key == "h":
-            self.seeded = {"left": False, "right": False}
-            self.target = {a: DEFAULT_TARGET[a].copy() for a in ("left", "right")}
+            # Re-seed each arm's target onto its live fingertip (no jump). Only
+            # fall back to the fixed default when q_meas/reach are unavailable.
+            for arm in ("left", "right"):
+                tip = None
+                if self.reach is not None:
+                    needed = ARM_JOINTS[arm] + [LIFT_JOINT]
+                    if all(j in self.q_meas for j in needed):
+                        try:
+                            tip = self.reach.fingertip(arm, self.q_meas)
+                        except Exception:  # noqa: BLE001
+                            tip = None
+                if tip is not None:
+                    self.target[arm] = np.asarray(tip, dtype=np.float64)
+                    self.seeded[arm] = True
+                else:
+                    self.target[arm] = DEFAULT_TARGET[arm].copy()
+                    self.seeded[arm] = False
             self.cmd_target = {"vx": 0.0, "vy": 0.0, "yaw": 0.0}
             self.cmd_vel = {"vx": 0.0, "vy": 0.0, "yaw": 0.0}
             return
@@ -282,14 +297,18 @@ class M1Teleop(Node):
 
         stamp = now.to_msg()
         for arm in ("left", "right"):
-            msg = PoseStamped()
-            msg.header.stamp = stamp
-            msg.header.frame_id = "base_link"
-            msg.pose.position.x = float(self.target[arm][0])
-            msg.pose.position.y = float(self.target[arm][1])
-            msg.pose.position.z = float(self.target[arm][2])
-            msg.pose.orientation.w = 1.0
-            self.pose_pub[arm].publish(msg)
+            # Don't publish a target until the arm is seeded from live feedback
+            # (so a URDF-backed session never jumps the arm to DEFAULT on
+            # connect). With no URDF the best-effort default is still published.
+            if self.seeded[arm] or self.reach is None:
+                msg = PoseStamped()
+                msg.header.stamp = stamp
+                msg.header.frame_id = "base_link"
+                msg.pose.position.x = float(self.target[arm][0])
+                msg.pose.position.y = float(self.target[arm][1])
+                msg.pose.position.z = float(self.target[arm][2])
+                msg.pose.orientation.w = 1.0
+                self.pose_pub[arm].publish(msg)
 
             g = Float64()
             g.data = float(self.grip[arm])

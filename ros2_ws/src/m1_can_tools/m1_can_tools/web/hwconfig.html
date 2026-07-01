@@ -116,6 +116,9 @@
     <div class="row"><label>CAN / master</label>
       <input type="number" id="mapId" min="1" placeholder="id"/>
       <input type="number" id="mapMaster" min="1" placeholder="master"/></div>
+    <div class="row"><label>Kp / Kd</label>
+      <input type="number" step="1" id="mapKp" placeholder="kp"/>
+      <input type="number" step="0.1" id="mapKd" placeholder="kd"/></div>
     <div class="row"><label>Model</label>
       <select id="mapModel"></select>
       <button id="mapBtn">Map joint</button></div>
@@ -217,14 +220,23 @@ function syncMapFields(){
   if(info.id!=null) document.getElementById("mapId").value = info.id;
   if(info.master_id!=null) document.getElementById("mapMaster").value = info.master_id;
   if(info.model) document.getElementById("mapModel").value = info.model;
+  if(info.kp!=null) document.getElementById("mapKp").value = info.kp;
+  if(info.kd!=null) document.getElementById("mapKd").value = info.kd;
 }
 document.getElementById("mapJoint").onchange = syncMapFields;
 document.getElementById("mapBtn").onclick = async ()=>{
-  const r = await post("/api/map", {
+  // Send kp/kd only when entered, so the server's per-model non-zero default
+  // applies for a blank field instead of persisting kp=0 (limp-arm guard).
+  const body = {
     joint: document.getElementById("mapJoint").value,
     id: +document.getElementById("mapId").value,
     master_id: +document.getElementById("mapMaster").value,
-    model: document.getElementById("mapModel").value});
+    model: document.getElementById("mapModel").value};
+  const kp = document.getElementById("mapKp").value;
+  const kd = document.getElementById("mapKd").value;
+  if(kp !== "") body.kp = +kp;
+  if(kd !== "") body.kd = +kd;
+  const r = await post("/api/map", body);
   document.getElementById("mapMsg").textContent =
     r.code===200 ? "mapped + saved to motor map." : ("rejected: "+(r.body.error||r.code));
 };

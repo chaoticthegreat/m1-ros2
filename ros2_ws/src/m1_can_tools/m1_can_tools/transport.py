@@ -146,6 +146,7 @@ class SerialTransport(Transport):
         self.dev = dev
         self.baud = baud
         self._ser = None  # built on first use
+        self._rxbuf = bytearray()  # persistent rx accumulator (framing/resync)
 
     def _ensure_port(self):
         if self._ser is None:
@@ -182,18 +183,60 @@ class SerialTransport(Transport):
         ser = self._ensure_port()
         ser.write(self._pack(arb_id, data))
 
+    @classmethod
+    def _find_header(cls, buf: bytearray) -> Optional[int]:
+        """Index of the first ``0x55 0xAA`` start-of-frame pair, else ``None``."""
+        for i in range(len(buf) - 1):
+            if buf[i] == cls.HEAD0 and buf[i + 1] == cls.HEAD1:
+                return i
+        return None
+
+    def _extract_frame(self) -> Optional[Frame]:
+        """Pull one validated frame from ``_rxbuf``, resyncing on misalignment.
+
+        Discards leading bytes until the buffer starts with the ``0x55 0xAA``
+        header; if the 16-byte window then fails validation (a stray/dropped byte
+        shifted alignment, or a corrupt frame), it advances ONE byte and re-scans
+        so the reader re-locks onto the next genuine start-of-frame -- instead of
+        the old behaviour where a single bad byte desynced the stream permanently.
+        """
+        buf = self._rxbuf
+        while True:
+            start = self._find_header(buf)
+            if start is None:
+                # No header yet; keep a trailing lone 0x55 (it may begin a header
+                # split across reads), drop everything else as garbage.
+                if buf and buf[-1] == self.HEAD0:
+                    del buf[:-1]
+                else:
+                    buf.clear()
+                return None
+            if start:
+                del buf[:start]                 # drop pre-header garbage
+            if len(buf) < self.FRAME_LEN:
+                return None                     # await the rest of the frame
+            frame = self._unpack(bytes(buf[:self.FRAME_LEN]))
+            if frame is not None:
+                del buf[:self.FRAME_LEN]         # consume the valid frame
+                return frame
+            del buf[:1]                          # header but bad frame: re-lock
+
     def recv(self, timeout: float = 0.0) -> Optional[Frame]:
         ser = self._ensure_port()
         ser.timeout = timeout
-        frame = ser.read(self.FRAME_LEN)
-        if not frame or len(frame) != self.FRAME_LEN:
-            return None
-        return self._unpack(frame)
+        # Append whatever is available to the persistent buffer (a frame may be
+        # split across reads, or several may arrive at once) before parsing, so no
+        # bytes are discarded and byte alignment survives across calls.
+        chunk = ser.read(self.FRAME_LEN)
+        if chunk:
+            self._rxbuf.extend(chunk)
+        return self._extract_frame()
 
     def close(self) -> None:
         if self._ser is not None:
             self._ser.close()
             self._ser = None
+        self._rxbuf.clear()
 
 
 class SimTransport(Transport):

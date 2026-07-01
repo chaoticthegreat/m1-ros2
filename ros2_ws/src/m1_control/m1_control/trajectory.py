@@ -212,6 +212,13 @@ class TrajectoryPlanner:
         ``(q, dist, clearance, achieved_targets)``.
         """
         cur = {a: np.array(line_pos[a], dtype=np.float64) for a in arms}
+        # ``cur`` keeps exploring (each gradient step nudges it) but the RETURNED
+        # detour target must stay in sync with the committed ``(q, dist)`` -- on a
+        # no-improvement break ``cur`` is already mutated past the last solved
+        # config, so returning it would record a waypoint whose ``points`` the
+        # joints don't actually reach (points/residual/tips desync). Track the
+        # target that matches the committed solution and return that instead.
+        cur_best = {a: cur[a].copy() for a in arms}
         for _ in range(max_iters):
             if clr >= self.margin:
                 break
@@ -242,9 +249,10 @@ class TrajectoryPlanner:
             # the original line residual -- ``cur`` IS the new target).
             if clr_try > clr + 1e-5:
                 q, dist, clr = q_try, dist_try, clr_try
+                cur_best = {a: cur[a].copy() for a in arms}
             else:
                 break
-        return q, dist, clr, cur
+        return q, dist, clr, cur_best
 
     # --- public planning entry point ---------------------------------------
     def plan(self, start_q: dict, goals: dict, n: int = PLAN_WAYPOINTS,

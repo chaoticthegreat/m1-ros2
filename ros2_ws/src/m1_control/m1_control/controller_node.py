@@ -75,6 +75,21 @@ POSITION_JOINTS = (
 )
 ALL_JOINTS = POSITION_JOINTS + WHEEL_JOINTS
 
+# Joints the brain must see in /joint_states before it can seed its command pose
+# and begin actuating: the upper body it actually controls (lift + both arms +
+# fingers). The 4 base STEER_JOINTS are deliberately EXCLUDED -- the base is
+# open-loop swerve (their command is overwritten from cmd_vel every tick and never
+# read back), and on the real-hardware / mock arms-only path (use_base:=false)
+# nothing publishes them, so requiring them would wedge the controller
+# uninitialized forever (the arms would never move).
+INIT_JOINTS = (
+    [LIFT_JOINT]
+    + ARM_JOINTS["left"]
+    + ARM_JOINTS["right"]
+    + LEFT_FINGERS
+    + RIGHT_FINGERS
+)
+
 
 def _default_urdf_path() -> str:
     try:
@@ -139,16 +154,25 @@ class M1Controller(Node):
     # --- callbacks ---------------------------------------------------------
     def _on_joint_states(self, msg: JointState):
         for name, pos in zip(msg.name, msg.position):
-            self.q_meas[name] = float(pos)
-        if not self._initialized and all(j in self.q_meas for j in POSITION_JOINTS):
+            p = float(pos)
+            if not np.isfinite(p):
+                continue                       # drop a glitched/garbage encoder sample
+            self.q_meas[name] = p
+        if not self._initialized and all(j in self.q_meas for j in INIT_JOINTS):
             for j in POSITION_JOINTS:
-                self.pos_cmd[j] = self.q_meas[j]
+                self.pos_cmd[j] = self.q_meas.get(j, 0.0)   # steer joints may be absent
             self._initialized = True
             self.get_logger().info("initialized command pose from /joint_states")
 
     def _on_target(self, arm: str, msg: PoseStamped):
         p = msg.pose.position
         new = np.array([p.x, p.y, p.z], dtype=np.float64)
+        if not np.isfinite(new).all():
+            # A non-finite target would trip Drake's NaN assertion (SystemExit) or
+            # the DLS SVD (LinAlgError) and kill the control brain -- drop it here.
+            self.get_logger().warning(
+                f"ignoring non-finite {arm} reach target ({p.x}, {p.y}, {p.z})")
+            return
         prev = self.targets[arm]
         # Position-only reach: the pose's orientation is ignored. Log only when
         # the target meaningfully changes; operator bridges (web/teleop) re-
@@ -159,9 +183,17 @@ class M1Controller(Node):
         self.targets[arm] = new
 
     def _on_cmd_vel(self, msg: Twist):
-        self.cmd_vel["vx"] = msg.linear.x
-        self.cmd_vel["vy"] = msg.linear.y
-        self.cmd_vel["yaw"] = msg.angular.z
+        vx, vy, yaw = msg.linear.x, msg.linear.y, msg.angular.z
+        if not np.isfinite([vx, vy, yaw]).all():
+            # A garbage (NaN/Inf) velocity is treated as a dead-man: stop the base
+            # rather than forwarding it -- swerve would propagate NaN into the wheel
+            # velocities, violating the NaN-free /m1/joint_command contract.
+            self.get_logger().warning("ignoring non-finite cmd_vel; stopping base")
+            self.cmd_vel["vx"] = self.cmd_vel["vy"] = self.cmd_vel["yaw"] = 0.0
+            return
+        self.cmd_vel["vx"] = vx
+        self.cmd_vel["vy"] = vy
+        self.cmd_vel["yaw"] = yaw
 
     def _on_gripper(self, arm: str, msg: Float64):
         self.grip[arm] = max(0.0, min(1.0, float(msg.data)))
@@ -184,7 +216,13 @@ class M1Controller(Node):
         if any(t is not None for t in self.targets.values()):
             # Position-only reach: each active arm's target is a bare point.
             reach_targets = {arm: self.targets[arm] for arm in ("left", "right")}
-            result = self.reach.solve_step(self.q_meas, reach_targets)
+            try:
+                result = self.reach.solve_step(self.q_meas, reach_targets)
+            except Exception as exc:  # noqa: BLE001 - one bad solve must not kill the loop
+                self.get_logger().error(
+                    f"solve_step failed ({exc}); holding last command",
+                    throttle_duration_sec=1.0)
+                result = {}
             for jname, q in result.items():
                 if jname.startswith("_"):       # meta keys (e.g. "_dist")
                     continue

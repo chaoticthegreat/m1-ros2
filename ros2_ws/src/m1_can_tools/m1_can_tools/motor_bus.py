@@ -23,6 +23,7 @@ The motor map (ID -> logical joint) is persisted to YAML. Schema, per joint::
 """
 from __future__ import annotations
 
+import math
 from typing import Dict, Iterable, List, Optional
 
 from m1_can_tools import dm_protocol as dm
@@ -113,6 +114,15 @@ class MotorBus:
         a limit should read the motor-frame setpoint accordingly. (The live
         ros2_control path applies dir/offset in C++.)
         """
+        # Reject non-finite fields up front with a clear error: a NaN/Inf would
+        # otherwise either be silently coerced by _clamp's max/min ordering or
+        # raise an opaque error deep in the codec. A jog drives a real motor, so
+        # a garbage setpoint must fail loudly, not emit a full-scale command.
+        for nm, val in (("pos", pos), ("vel", vel), ("kp", kp),
+                        ("kd", kd), ("tau", tau)):
+            if not math.isfinite(float(val)):
+                raise ValueError(f"jog {nm!r} must be finite, got {val!r}")
+
         info = self._info(joint)
         p_max, v_max, t_max = dm.limits(info["model"])
         soft = info.get("soft_limits", {})
@@ -124,6 +134,10 @@ class MotorBus:
         p = _clamp(float(pos), max(pos_lo, -p_max), min(pos_hi, p_max))
         v = _clamp(float(vel), -min(v_soft, v_max), min(v_soft, v_max))
         tq = _clamp(float(tau), -min(t_soft, t_max), min(t_soft, t_max))
+        # Clamp the gains to the encoder's valid range too (was passed raw), so
+        # the maintenance jog path can never emit an out-of-range stiffness.
+        kp = _clamp(float(kp), dm.KP_MIN, dm.KP_MAX)
+        kd = _clamp(float(kd), dm.KD_MIN, dm.KD_MAX)
 
         data = dm.encode_mit(p, v, kp, kd, tq, info["model"])
         self.transport.send(dm.arb_id(info["id"], "mit"), data)
@@ -173,7 +187,10 @@ class MotorBus:
         for sid in ids:
             self.transport.send(dm.PARAM_ARB_ID, dm.refresh_frame(sid))
 
-        found: List[dict] = []
+        # Collect responders keyed by their arbitration id (== master id), so a
+        # motor that emits more than one feedback frame in the poll window appears
+        # exactly once (last frame wins = freshest telemetry).
+        by_arb: Dict[int, dict] = {}
         frame = self.transport.recv(timeout=0.01)
         while frame is not None:
             arb, data = frame
@@ -182,8 +199,15 @@ class MotorBus:
             if len(data) >= 8:
                 fb = dm.decode_feedback(data, model)
                 joint = named[0] if named else None
+                # The feedback frame's id byte carries only the LOW 4 BITS of the
+                # slave id, so it mis-identifies any id > 0x0F (e.g. 0x11 reads as
+                # 1). The reply's arbitration id (== master id) is the only
+                # unambiguous identifier, so derive the slave id from it -- or use
+                # the authoritative mapped id when the responder is named.
+                slave_id = (named[1]["id"] if named is not None
+                            else arb - dm.MASTER_ID_OFFSET)
                 entry = {
-                    "id": fb["id"],
+                    "id": slave_id,
                     "master_id": arb,
                     "model": model,
                     "joint": joint,
@@ -194,11 +218,10 @@ class MotorBus:
                     "t_rotor": fb["t_rotor"],
                     "err": fb["err"],
                 }
-                found.append(entry)
+                by_arb[arb] = entry
             frame = self.transport.recv(timeout=0.01)
         # Sort by id for a stable inventory listing.
-        found.sort(key=lambda m: m["id"])
-        return found
+        return sorted(by_arb.values(), key=lambda m: m["id"])
 
     def close(self) -> None:
         """Disable everything and release the transport."""

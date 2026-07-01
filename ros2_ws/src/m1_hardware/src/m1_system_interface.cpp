@@ -370,6 +370,17 @@ bool M1SystemInterface::parse_joints(const hardware_interface::HardwareInfo & in
     {
       limp_config_ = true;
     }
+    if (m.direction == 0.0)
+    {
+      // dir==0 would freeze read() feedback at `offset` (0*motor+offset) while
+      // write() still drives the motor (its (dir==0?1:dir) guard) -- an open-loop
+      // runaway. Treat it as unsafe, like kp==0, and refuse the bus.
+      limp_config_ = true;
+      RCLCPP_ERROR(
+        rclcpp::get_logger(kLogger),
+        "Joint '%s' has dir==0 (illegal direction; must be +1 or -1) -- refusing the bus.",
+        m.name.c_str());
+    }
 
     RCLCPP_INFO(
       rclcpp::get_logger(kLogger),
@@ -379,6 +390,12 @@ bool M1SystemInterface::parse_joints(const hardware_interface::HardwareInfo & in
       model_string_of(m.model).c_str(), m.can_id, m.master_id, m.kp, m.kd, m.direction, m.offset,
       have_yaml ? "yes" : "no");
   }
+
+  // Record URDF mimic joints (state-only, e.g. *_finger_joint2 -> *_finger_joint1)
+  // so read() can propagate their state from the leader. joint_index /
+  // mimicked_joint_index are indices into info.joints, which is exactly the order
+  // state_names_ was built in (one entry per joint, in info.joints order).
+  mimics_ = info.mimic_joints;
 
   if (state_names_.empty())
   {
@@ -678,6 +695,37 @@ hardware_interface::CallbackReturn M1SystemInterface::on_activate(
       rclcpp::get_logger(kLogger), "Activating with no bus / mock I/O (no motors enabled).");
   }
 
+  // Copy the freshly-decoded motor feedback into pos_states_ BEFORE seeding the
+  // command interfaces, so "hold position on activate" actually holds the
+  // MEASURED pose. read() -- the only other pos_states_ writer -- does not run
+  // until after activation, so without this the seed below would be the on_init
+  // ZERO, commanding every joint to 0 rad at full kp: a violent lurch to the
+  // folded all-zeros posture on a real arm. (No-bus/mock legitimately stays 0.)
+  if (bus_ok_ && openarm_)
+  {
+    try
+    {
+      auto & arm = openarm_->get_arm();
+      for (const auto & m : motors_)
+      {
+        if (m.device_index < 0)
+        {
+          continue;
+        }
+        const auto motor = arm.get_motor(m.device_index);
+        pos_states_[m.state_index] = m.direction * motor.get_position() + m.offset;
+        vel_states_[m.state_index] = m.direction * motor.get_velocity();
+        tau_states_[m.state_index] = m.direction * motor.get_torque();
+      }
+    }
+    catch (const std::exception & e)
+    {
+      RCLCPP_WARN(
+        rclcpp::get_logger(kLogger),
+        "on_activate state seed failed: %s (seeding command from last known state)", e.what());
+    }
+  }
+
   // Seed command interfaces from current state so we hold position on activate.
   // pos_commands_/pos_states_ are indexed by state_index; pos_cmd_ifaces_[k] is
   // parallel to motors_[k] (commanded joints only).
@@ -779,6 +827,22 @@ hardware_interface::return_type M1SystemInterface::read(
       pos_states_[i] = pos_commands_[i];
       vel_states_[i] = 0.0;
       tau_states_[i] = 0.0;
+    }
+  }
+
+  // Propagate mimic (state-only) joints from their leader, in BOTH the real-bus
+  // and mock branches: a mimic has no motor, so its slot is otherwise never
+  // updated and would report a constant 0 (e.g. finger_joint2 stuck at 0 while
+  // finger_joint1 opens). state = offset + multiplier * leader, per the URDF.
+  for (const auto & mj : mimics_)
+  {
+    if (mj.joint_index < pos_states_.size() &&
+        mj.mimicked_joint_index < pos_states_.size())
+    {
+      pos_states_[mj.joint_index] =
+        mj.offset + mj.multiplier * pos_states_[mj.mimicked_joint_index];
+      vel_states_[mj.joint_index] = mj.multiplier * vel_states_[mj.mimicked_joint_index];
+      tau_states_[mj.joint_index] = 0.0;
     }
   }
 

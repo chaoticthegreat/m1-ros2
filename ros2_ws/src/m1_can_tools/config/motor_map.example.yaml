@@ -9,6 +9,8 @@
 #   id          CAN slave id (1..n on the bus)
 #   master_id   host/master id = id + 0x10 (feedback arbitration id); never 0
 #   model       DM model -> per-model [P,V,T]MAX (see dm_protocol.LIMITS)
+#   kp / kd     MIT-mode impedance gains (NON-ZERO -- the C++ plugin refuses the
+#               bus if a commanded joint has kp == 0; tune per control_gains.yaml)
 #   soft_limits pos: [lo, hi] (rad / m), vel (rad/s), effort (Nm) -- clamps jog
 #   dir         +1 / -1  joint-direction sign vs. the motor
 #   offset      zero offset (rad / m) applied to feedback position
@@ -22,6 +24,8 @@ lift_joint:
   id: 0x01
   master_id: 0x11
   model: DM8009
+  kp: 120.0
+  kd: 3.0
   soft_limits: {pos: [0.0, 0.85], vel: 0.25, effort: 50.0}
   dir: 1
   offset: 0.0
@@ -31,6 +35,8 @@ openarm_left_joint1:
   id: 0x02
   master_id: 0x12
   model: DM4340
+  kp: 70.0
+  kd: 2.0
   soft_limits: {pos: [-3.10, 3.10], vel: 6.0, effort: 20.0}
   dir: 1
   offset: 0.0
@@ -38,6 +44,8 @@ openarm_left_joint2:
   id: 0x03
   master_id: 0x13
   model: DM4340
+  kp: 70.0
+  kd: 2.0
   soft_limits: {pos: [-1.57, 1.57], vel: 6.0, effort: 20.0}
   dir: 1
   offset: 0.0
@@ -45,6 +53,8 @@ openarm_left_joint3:
   id: 0x04
   master_id: 0x14
   model: DM4310
+  kp: 10.0
+  kd: 0.7
   soft_limits: {pos: [-3.10, 3.10], vel: 8.0, effort: 10.0}
   dir: 1
   offset: 0.0
@@ -52,6 +62,8 @@ openarm_left_joint4:
   id: 0x05
   master_id: 0x15
   model: DM4310
+  kp: 10.0
+  kd: 0.7
   soft_limits: {pos: [-2.20, 2.20], vel: 8.0, effort: 10.0}
   dir: 1
   offset: 0.0
@@ -59,6 +71,8 @@ openarm_left_joint5:
   id: 0x06
   master_id: 0x16
   model: DM4310
+  kp: 10.0
+  kd: 0.7
   soft_limits: {pos: [-3.10, 3.10], vel: 12.0, effort: 10.0}
   dir: 1
   offset: 0.0
@@ -66,6 +80,8 @@ openarm_left_joint6:
   id: 0x07
   master_id: 0x17
   model: DM4310
+  kp: 10.0
+  kd: 0.7
   soft_limits: {pos: [-1.57, 1.57], vel: 12.0, effort: 10.0}
   dir: 1
   offset: 0.0
@@ -73,6 +89,8 @@ openarm_left_joint7:
   id: 0x08
   master_id: 0x18
   model: DM4310
+  kp: 10.0
+  kd: 0.7
   soft_limits: {pos: [-3.10, 3.10], vel: 12.0, effort: 10.0}
   dir: 1
   offset: 0.0
@@ -82,6 +100,8 @@ openarm_right_joint1:
   id: 0x09
   master_id: 0x19
   model: DM4340
+  kp: 70.0
+  kd: 2.0
   soft_limits: {pos: [-3.10, 3.10], vel: 6.0, effort: 20.0}
   dir: 1
   offset: 0.0
@@ -89,6 +109,8 @@ openarm_right_joint2:
   id: 0x0A
   master_id: 0x1A
   model: DM4340
+  kp: 70.0
+  kd: 2.0
   soft_limits: {pos: [-1.57, 1.57], vel: 6.0, effort: 20.0}
   dir: 1
   offset: 0.0
@@ -96,6 +118,8 @@ openarm_right_joint3:
   id: 0x0B
   master_id: 0x1B
   model: DM4310
+  kp: 10.0
+  kd: 0.7
   soft_limits: {pos: [-3.10, 3.10], vel: 8.0, effort: 10.0}
   dir: 1
   offset: 0.0
@@ -103,6 +127,8 @@ openarm_right_joint4:
   id: 0x0C
   master_id: 0x1C
   model: DM4310
+  kp: 10.0
+  kd: 0.7
   soft_limits: {pos: [-2.20, 2.20], vel: 8.0, effort: 10.0}
   dir: 1
   offset: 0.0
@@ -110,6 +136,8 @@ openarm_right_joint5:
   id: 0x0D
   master_id: 0x1D
   model: DM4310
+  kp: 10.0
+  kd: 0.7
   soft_limits: {pos: [-3.10, 3.10], vel: 12.0, effort: 10.0}
   dir: 1
   offset: 0.0
@@ -117,6 +145,8 @@ openarm_right_joint6:
   id: 0x0E
   master_id: 0x1E
   model: DM4310
+  kp: 10.0
+  kd: 0.7
   soft_limits: {pos: [-1.57, 1.57], vel: 12.0, effort: 10.0}
   dir: 1
   offset: 0.0
@@ -124,6 +154,8 @@ openarm_right_joint7:
   id: 0x0F
   master_id: 0x1F
   model: DM4310
+  kp: 10.0
+  kd: 0.7
   soft_limits: {pos: [-3.10, 3.10], vel: 12.0, effort: 10.0}
   dir: 1
   offset: 0.0
@@ -133,6 +165,8 @@ openarm_left_finger_joint1:
   id: 0x10
   master_id: 0x20
   model: DMH3510
+  kp: 5.0
+  kd: 0.1
   soft_limits: {pos: [0.0, 0.044], vel: 1.0, effort: 1.0}
   dir: 1
   offset: 0.0
@@ -140,6 +174,8 @@ openarm_right_finger_joint1:
   id: 0x11
   master_id: 0x21
   model: DMH3510
+  kp: 5.0
+  kd: 0.1
   soft_limits: {pos: [0.0, 0.044], vel: 1.0, effort: 1.0}
   dir: 1
   offset: 0.0

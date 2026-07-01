@@ -27,6 +27,7 @@ Conventions (verbatim from the deployment design's Global Constraints):
 """
 from __future__ import annotations
 
+import math
 import struct
 from typing import Dict, Tuple
 
@@ -92,8 +93,17 @@ def float_to_uint(x: float, lo: float, hi: float, bits: int) -> int:
     """Quantize *x* in ``[lo, hi]`` to an unsigned ``bits``-bit integer.
 
     Clamps *x* into the range first, then maps linearly so ``lo -> 0`` and
-    ``hi -> (1<<bits) - 1``. This matches the Damiao reference packing.
+    ``hi -> (1<<bits) - 1``. The operation order ``(x-lo)/span * (2^bits-1)`` is
+    byte-for-byte identical to the vendored C++ ``CanPacketEncoder::double_to_uint``
+    (m1_hardware/.../dm_motor_control.cpp), so the maintenance config tool and the
+    live ros2_control plugin emit the SAME CAN bytes for a given value -- the
+    multiply-then-divide order used previously diverged by 1 LSB at some inputs.
+
+    A non-finite *x* is rejected with a clear ``ValueError`` rather than letting
+    ``NaN`` crash ``int()`` or ``+/-Inf`` silently clamp to a full-scale command.
     """
+    if not math.isfinite(x):
+        raise ValueError(f"non-finite value {x!r} cannot be quantized")
     span = hi - lo
     if span <= 0.0:
         return 0
@@ -101,7 +111,7 @@ def float_to_uint(x: float, lo: float, hi: float, bits: int) -> int:
         x = lo
     elif x > hi:
         x = hi
-    return int((x - lo) * ((1 << bits) - 1) / span)
+    return int((x - lo) / span * ((1 << bits) - 1))
 
 
 def uint_to_float(u: int, lo: float, hi: float, bits: int) -> float:

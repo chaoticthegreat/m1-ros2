@@ -151,7 +151,12 @@ class SwerveSolver:
                 diff = wrap_to_pi(heading - applied)
                 spin = -spin
             applied = applied + diff * steer_blend
-            self.wheel_head[k] = applied
+            # Re-wrap on store: under continuous same-sense rotation ``applied``
+            # would otherwise grow without bound (it is emitted as a steering
+            # joint POSITION command). The flip-and-reverse logic recomputes
+            # ``diff = wrap_to_pi(heading - applied)``, so a wrapped ``applied``
+            # yields the same diff -- the wrap is behaviour-preserving.
+            self.wheel_head[k] = wrap_to_pi(applied)
             spins[k] = spin
 
         spins, _scale = desaturate(spins, self.max_wheel_speed)

@@ -26,6 +26,7 @@ closed, network drop) the node zeroes the base after ``BASE_HOLD`` seconds.
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -78,6 +79,20 @@ def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
 
+def _finite(v) -> float:
+    """Coerce to float and reject NaN/+-inf.
+
+    A non-finite value must never reach a publisher (PoseStamped.position would
+    carry inf/nan) nor the snapshot JSON (json.dumps would emit invalid
+    ``Infinity``/``NaN`` tokens that break the browser's strict ``JSON.parse``).
+    Raises ``ValueError`` so it propagates to do_POST's except block -> HTTP 400.
+    """
+    f = float(v)
+    if not math.isfinite(f):
+        raise ValueError("non-finite value")
+    return f
+
+
 class M1WebNode(Node):
     """Bridges the browser control panel to the m1_controller over ROS topics."""
 
@@ -108,7 +123,7 @@ class M1WebNode(Node):
         self.grip = {"left": 0.0, "right": 0.0}
         self.cmd_vel = {"vx": 0.0, "vy": 0.0, "yaw": 0.0}
         self._last_base_cmd = 0.0
-        self._last_js = 0.0
+        self._last_js = None
 
         # --- ROS interface --------------------------------------------------
         self.pose_pub = {
@@ -130,7 +145,10 @@ class M1WebNode(Node):
     def _on_joint_states(self, msg: JointState):
         with self._lock:
             for name, pos in zip(msg.name, msg.position):
-                self.q_meas[name] = float(pos)
+                p = float(pos)
+                if not math.isfinite(p):
+                    continue            # drop a glitched/garbage encoder sample
+                self.q_meas[name] = p
             self._last_js = self._now()
             if self.reach is None:
                 return
@@ -188,7 +206,9 @@ class M1WebNode(Node):
     def snapshot(self) -> dict:
         with self._lock:
             now = self._now()
-            connected = (now - self._last_js) < 1.0 if self._last_js else False
+            # `is not None`, not a truthiness test: a sim clock at t=0.0 makes
+            # self._last_js == 0.0, which would falsely read as "never received".
+            connected = self._last_js is not None and (now - self._last_js) < 1.0
             out = {
                 "connected": connected,
                 "base": dict(self.cmd_vel),
@@ -223,9 +243,9 @@ class M1WebNode(Node):
         with self._lock:
             if ctype == "base":
                 self.cmd_vel = {
-                    "vx": _clamp(float(cmd.get("vx", 0.0)), -MAX_LINEAR, MAX_LINEAR),
-                    "vy": _clamp(float(cmd.get("vy", 0.0)), -MAX_STRAFE, MAX_STRAFE),
-                    "yaw": _clamp(float(cmd.get("yaw", 0.0)), -MAX_YAW, MAX_YAW),
+                    "vx": _clamp(_finite(cmd.get("vx", 0.0)), -MAX_LINEAR, MAX_LINEAR),
+                    "vy": _clamp(_finite(cmd.get("vy", 0.0)), -MAX_STRAFE, MAX_STRAFE),
+                    "yaw": _clamp(_finite(cmd.get("yaw", 0.0)), -MAX_YAW, MAX_YAW),
                 }
                 self._last_base_cmd = self._now()
             elif ctype == "base_stop":
@@ -247,7 +267,7 @@ class M1WebNode(Node):
             elif ctype == "gripper":
                 arm = cmd.get("arm")
                 if arm in self.grip:
-                    self.grip[arm] = _clamp(float(cmd.get("value", 0.0)), 0.0, 1.0)
+                    self.grip[arm] = _clamp(_finite(cmd.get("value", 0.0)), 0.0, 1.0)
             elif ctype == "reset":
                 self.seeded = {"left": False, "right": False}
                 self.target = {a: list(DEFAULT_TARGET[a]) for a in ("left", "right")}
@@ -258,10 +278,12 @@ class M1WebNode(Node):
         return {"ok": True}
 
     def _set_target(self, arm: str, xyz):
+        # Validate finiteness BEFORE clamping: _clamp(nan, -inf, inf) returns
+        # +inf, which would otherwise be published and poison the snapshot JSON.
         self.target[arm] = [
-            _clamp(float(xyz[0]), *TARGET_LIMITS["x"]),
-            _clamp(float(xyz[1]), *TARGET_LIMITS["y"]),
-            _clamp(float(xyz[2]), *TARGET_LIMITS["z"]),
+            _clamp(_finite(xyz[0]), *TARGET_LIMITS["x"]),
+            _clamp(_finite(xyz[1]), *TARGET_LIMITS["y"]),
+            _clamp(_finite(xyz[2]), *TARGET_LIMITS["z"]),
         ]
 
 
@@ -282,7 +304,10 @@ def _make_handler(node: M1WebNode):
             if self.path in ("/", "/index.html"):
                 self._send(200, INDEX_HTML, "text/html; charset=utf-8")
             elif self.path == "/api/state":
-                self._send(200, json.dumps(node.snapshot()))
+                # allow_nan=False: belt-and-braces guard so a stray non-finite
+                # value can never silently emit invalid `Infinity`/`NaN` JSON
+                # (which would break the browser's strict JSON.parse).
+                self._send(200, json.dumps(node.snapshot(), allow_nan=False))
             else:
                 self._send(404, json.dumps({"error": "not found"}))
 
@@ -521,6 +546,11 @@ function bindHold(btn,name){
   btn.addEventListener("mouseleave",up);
   btn.addEventListener("touchstart",down,{passive:false});
   btn.addEventListener("touchend",up);
+  // A cancelled touch / pointer (gesture interrupted, finger dragged off,
+  // OS takeover) otherwise leaves the name stuck in heldBtns and the base
+  // keeps driving (and keeps refreshing the server dead-man). Bind cancels too.
+  btn.addEventListener("touchcancel",up,{passive:false});
+  btn.addEventListener("pointercancel",up);
 }
 document.querySelectorAll("[data-base]").forEach(b=>bindHold(b,b.dataset.base));
 document.getElementById("baseStop").onclick=()=>{heldBtns.clear();postCmd({type:"base_stop"});};
@@ -534,6 +564,12 @@ window.addEventListener("keydown",e=>{
   else if(k===" "){ keysDown.clear(); heldBtns.clear(); postCmd({type:"base_stop"}); e.preventDefault(); }
 });
 window.addEventListener("keyup",e=>keysDown.delete(e.key.toLowerCase()));
+
+/* Lost focus / hidden tab never delivers keyup/touchend, so a held key/button
+   would stay stuck and the base would keep driving (and keep refreshing the
+   server BASE_HOLD dead-man). Clear all held state and stop the base. */
+window.addEventListener("blur",()=>{keysDown.clear();heldBtns.clear();postCmd({type:"base_stop"});});
+document.addEventListener("visibilitychange",()=>{ if(document.hidden){keysDown.clear();heldBtns.clear();postCmd({type:"base_stop"});} });
 
 /* ---------- arm cards (built dynamically) ---------------------------------- */
 const armsRoot=document.getElementById("arms");

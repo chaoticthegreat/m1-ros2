@@ -220,19 +220,28 @@ def _so3_log(R: np.ndarray) -> np.ndarray:
                  dtype=np.float64)
     if angle < 1e-6:
         return 0.5 * v  # small-angle: vee of the skew part
-    if angle > math.pi - 1e-3:
-        # Near pi sin(angle)->0 makes v unreliable; recover the axis from the
-        # symmetric part (R+I)/2 = axis axis^T, pick its best-conditioned column.
-        A = 0.5 * (R + np.eye(3, dtype=np.float64))
-        i = int(np.argmax(np.diag(A)))
-        axis = A[:, i] / math.sqrt(max(A[i, i], 1e-12))
-        nrm = np.linalg.norm(axis)
-        axis = axis / nrm if nrm > 1e-9 else np.array([1.0, 0.0, 0.0])
-        # Sign at exactly pi is ambiguous; v carries the residual sign hint.
-        if float(axis @ v) < 0:
-            axis = -axis
-        return angle * axis
-    return (angle / (2.0 * math.sin(angle))) * v
+    vn = float(np.linalg.norm(v))
+    if vn > 1e-7:
+        # General case. v == 2*sin(angle)*axis EXACTLY, so v/|v| recovers the unit
+        # axis to ~machine precision and `angle` (from acos) is the accurate
+        # magnitude. Normalising v directly -- rather than the algebraically-equal
+        # (angle/(2 sin angle))*v -- avoids amplifying acos's error as angle->pi:
+        # there 2 sin(angle)->0, so the division turned a ~1e-16 trace error into a
+        # ~1e-3 axis error (the near-pi inaccuracy bug). |v| only vanishes within
+        # ~5e-8 rad of pi, which the symmetric-part branch below handles.
+        return angle * (v / vn)
+    # angle is (essentially) pi AND |v| ~ 0, so v's direction is unreliable:
+    # recover the axis from the symmetric part (R+I)/2 = axis axis^T (an identity
+    # that holds at pi), picking its best-conditioned column.
+    A = 0.5 * (R + np.eye(3, dtype=np.float64))
+    i = int(np.argmax(np.diag(A)))
+    axis = A[:, i] / math.sqrt(max(A[i, i], 1e-12))
+    nrm = np.linalg.norm(axis)
+    axis = axis / nrm if nrm > 1e-9 else np.array([1.0, 0.0, 0.0])
+    # Sign at exactly pi is ambiguous; v carries the residual sign hint.
+    if float(axis @ v) < 0:
+        axis = -axis
+    return angle * axis
 
 
 def _homogeneous(rot: np.ndarray, trans: np.ndarray) -> np.ndarray:
@@ -550,7 +559,9 @@ class ReachController:
         dict carrying ``"pos"`` (a legacy 6-DOF pose dict is still accepted --
         any ``"quat"``/``"R"`` it carries is ignored, because the reach is
         position-only). Returns ``pos[arm]`` as a 3-vector; arms whose target is
-        ``None`` are omitted.
+        ``None`` -- or malformed (an orientation-only dict, a non-3-vector, or
+        carrying a NaN/Inf coordinate) -- are omitted (treated as "no target"),
+        so a single bad message can never reach (and crash) the Drake solve.
         """
         pos = {}
         for a in ("left", "right"):
@@ -558,9 +569,15 @@ class ReachController:
             if t is None:
                 continue
             if isinstance(t, dict):
-                pos[a] = np.asarray(t["pos"], dtype=np.float64)
+                p = t.get("pos")
+                if p is None:
+                    continue          # orientation-only / malformed dict -> no target
+                p = np.asarray(p, dtype=np.float64)
             else:
-                pos[a] = np.asarray(t, dtype=np.float64)
+                p = np.asarray(t, dtype=np.float64)
+            if p.shape != (3,) or not np.isfinite(p).all():
+                continue              # wrong shape / non-finite -> no target
+            pos[a] = p
         return pos
 
     # --- internal solve helpers -------------------------------------------
@@ -817,6 +834,14 @@ class ReachController:
         arms = [a for a in ("left", "right") if a in pos]
         if not arms:
             return {}
+        # Defensive: a single glitched (NaN/Inf) encoder sample must never reach
+        # the Drake program (a NaN trips a DRAKE_DEMAND -> SystemExit) or the DLS
+        # SVD (-> LinAlgError). Replace any non-finite joint with 0.0 so one bad
+        # frame degrades gracefully instead of killing the 60 Hz control loop.
+        # (controller_node also drops non-finite feedback at ingress; defense in
+        # depth keeps any other caller of this public API safe too.)
+        if not all(math.isfinite(v) for v in q_meas.values()):
+            q_meas = {j: (v if math.isfinite(v) else 0.0) for j, v in q_meas.items()}
         dik = self._ensure_dik()
         joint_order = self._joint_order(arms)
         lo, hi = self._bounds(joint_order)
@@ -827,15 +852,33 @@ class ReachController:
         match = cache is not None and cache.get("arms") == tuple(arms)
         jump = (max(float(np.linalg.norm(cache["targets"][i] - pos_list[i]))
                     for i in range(len(arms))) if match else float("inf"))
+        # Drift measures how far the target has moved from where the cached
+        # SOLUTION was actually computed (cache["solve_target"]), NOT from the
+        # previous tick. The steady-reuse "cheap hold" branch gates on this so a
+        # target creeping < _IK_TARGET_EPS per tick eventually accumulates past
+        # the threshold and re-engages the tracking solve, instead of being
+        # treated as static forever -- the old bug where the fingertip lagged a
+        # slow (< _IK_TARGET_EPS*60 Hz ~= 6 mm/s) target without bound while
+        # _dist falsely reported ~0.
+        solve_tgt = cache.get("solve_target") if match else None
+        drift = (max(float(np.linalg.norm(solve_tgt[i] - pos_list[i]))
+                     for i in range(len(arms)))
+                 if solve_tgt is not None else float("inf"))
         job = cache.get("job") if match else None
         stuck = cache.get("stuck", 0) if match else 0
 
         def vec(qf):
             return np.array([qf[dik.jstart[j]] for j in joint_order])
 
-        def store(qbest_full, dist_best, job=None, stuck=0):
+        def store(qbest_full, dist_best, job=None, stuck=0, solve_target=None):
+            # solve_target snapshots the target the stored solution was computed
+            # against: every solving branch records the CURRENT target (default),
+            # while the steady-reuse branch passes the prior snapshot through (it
+            # reuses an old solution and does not re-solve), so drift accumulates
+            # across consecutive cheap holds.
             self._cache = {
                 "arms": tuple(arms), "targets": pos_list,
+                "solve_target": pos_list if solve_target is None else solve_target,
                 "q_best": vec(qbest_full), "q_best_full": qbest_full,
                 "dist": dist_best, "job": job, "stuck": stuck,
             }
@@ -847,11 +890,15 @@ class ReachController:
             # rather than dropping it and restarting from scratch each tick.
             qf, dist_best = self._pump_cold(dik, arms, pos, job, _IK_SEEDS_PER_TICK)
             q_best, dist_best = store(qf, dist_best, None if job["done"] else job)
-        elif (match and jump < _IK_TARGET_EPS and job is None
+        elif (match and drift < _IK_TARGET_EPS and job is None
               and max(cache["dist"].values()) <= _IK_REACQUIRE_POS):
-            # Steady on an already-good solution: reuse it (cheap hold), refreshing
-            # only the cached target snapshot.
-            q_best, dist_best = store(cache["q_best_full"], cache["dist"])
+            # Steady on an already-good solution AND the target has not drifted
+            # (cumulatively, since the solution was computed) past the threshold:
+            # reuse it (cheap hold), preserving the solution's target snapshot so
+            # drift keeps accumulating across consecutive holds rather than
+            # resetting every tick.
+            q_best, dist_best = store(cache["q_best_full"], cache["dist"],
+                                      solve_target=solve_tgt)
         elif match and jump < _IK_TRACK_JUMP:
             # Continuous tracking: warm solve in-branch from the cached solution.
             qf, dist_best = self._solve_track(

@@ -10,6 +10,7 @@ Targets are in the robot base_link frame (x forward, y left, z up).
 from __future__ import annotations
 
 import argparse
+import math
 
 import rclpy
 from geometry_msgs.msg import PoseStamped
@@ -46,6 +47,8 @@ def main(args=None):
     parser.add_argument("--xyz", nargs=3, type=float, required=True,
                         metavar=("X", "Y", "Z"))
     parsed, _ = parser.parse_known_args(args)
+    if not all(math.isfinite(v) for v in parsed.xyz):
+        parser.error("--xyz must be finite numbers")
 
     rclpy.init(args=args)
     node = PoseSender(parsed.arm, parsed.xyz)

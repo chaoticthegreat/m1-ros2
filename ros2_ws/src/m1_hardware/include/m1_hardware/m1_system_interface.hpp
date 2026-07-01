@@ -166,10 +166,17 @@ private:
   // per-joint storage vectors / state_names_.
   std::vector<JointMotor> motors_;
 
-  // True once parse_joints found a COMMANDED joint with kp==0 -- a limp/unsafe
-  // config. The bus is then refused (never enabled) so the arms can't silently
-  // go limp on hardware; mock/no-bus loads still succeed (FIX 1 safety guard).
+  // True once parse_joints found a COMMANDED joint with kp==0 (or dir==0) -- a
+  // limp/unsafe config. The bus is then refused (never enabled) so the arms can't
+  // silently go limp / run open-loop on hardware; mock/no-bus loads still succeed
+  // (FIX 1 safety guard).
   bool limp_config_ = false;
+
+  // Mimic (state-only) joints copied from the URDF, e.g. *_finger_joint2 mimicking
+  // *_finger_joint1. joint_index / mimicked_joint_index are state_names_ indices
+  // (== URDF joint order). read() propagates state = offset + multiplier * leader,
+  // since a mimic has no motor and would otherwise report a constant 0.
+  std::vector<hardware_interface::MimicJoint> mimics_;
 
   // --- CAN bus (lazily opened; null => mock I/O) -----------------------------
   std::unique_ptr<openarm::can::socket::OpenArm> openarm_;

@@ -41,6 +41,42 @@ DEADMAN_RATE = 20.0     # Hz the jog dead-man / telemetry loop ticks
 DEFAULT_JOG_KP = 10.0
 DEFAULT_JOG_KD = 1.0
 
+# --- Default MIT-mode impedance gains per DM model --------------------------
+# The C++ M1SystemInterface plugin reads kp/kd from the persisted motor map and
+# refuses to open the CAN bus if any commanded joint has kp == 0 (limp-arm
+# guard). The page may not always supply kp/kd, so api_map persists a sensible
+# NON-ZERO default keyed by motor model, mirroring the conventions in
+# ``m1_hardware/config/control_gains.yaml`` (lift/proximal DM8009 kp70/kd2.5,
+# DM4340 kp70/kd2, DM4310 wrist kp10/kd0.7, gripper DMH3510 kp5/kd0.1).
+# These are bring-up defaults -- the operator MUST tune per control_gains.yaml.
+_MODEL_DEFAULT_GAINS: Dict[str, Tuple[float, float]] = {
+    "DM8009": (70.0, 2.5),
+    "DM8006": (70.0, 2.5),
+    "DM4340": (70.0, 2.0),
+    "DM4340_48V": (70.0, 2.0),
+    "DM6006": (40.0, 1.5),
+    "DM4310": (10.0, 0.7),
+    "DM4310_48V": (10.0, 0.7),
+    "DM3507": (10.0, 0.7),
+    "DMH3510": (5.0, 0.1),
+    "DMH6215": (5.0, 0.1),
+    "DMG6220": (5.0, 0.1),
+    "DM10010": (120.0, 3.0),
+    "DM10010L": (120.0, 3.0),
+}
+# Safe non-zero fallback for any model not in the table above.
+_FALLBACK_KP, _FALLBACK_KD = 10.0, 1.0
+
+
+def _default_gains(model: str) -> Tuple[float, float]:
+    """Sensible NON-ZERO (kp, kd) bring-up gains for a DM *model*.
+
+    Keeps a commanded joint from defaulting to kp==0 (which would trip the C++
+    plugin's limp-arm guard and refuse the bus). Operator should tune these per
+    ``m1_hardware/config/control_gains.yaml``.
+    """
+    return _MODEL_DEFAULT_GAINS.get(model, (_FALLBACK_KP, _FALLBACK_KD))
+
 # Where the limits editor writes (consumed by ros2_control in Phase 1+).
 DEFAULT_LIMITS_PATH = "m1_joint_limits.yaml"
 
@@ -163,14 +199,63 @@ class M1HwConfigNode:
         master_id = payload.get("master_id", None)
         if old_id is None or new_id is None:
             return (400, {"ok": False, "error": "old_id and new_id required"})
+        # Validate the requested CAN id (standard 11-bit range; id 0 reserved).
+        err = self._validate_ids(new_id, master_id)
+        if err is not None:
+            return err
         with self._lock:
             for info in self.motor_map.values():
                 if info["id"] == old_id:
                     info["id"] = int(new_id)
-                    info["master_id"] = (int(master_id) if master_id is not None
+                    # A falsy/0 master_id (the page sends +('') === 0 when blank)
+                    # is reserved/invalid -> treat as absent and default to
+                    # id + 0x10.
+                    info["master_id"] = (int(master_id) if master_id
                                          else dm.master_id(int(new_id)))
                     break
         return (200, {"ok": True})
+
+    # --- id validation -----------------------------------------------------
+    _CAN_ID_MIN = 1
+    _CAN_ID_MAX = 0x7FF      # standard 11-bit CAN identifier
+
+    def _validate_ids(self, new_id, master_id) -> Optional[ApiResult]:
+        """Reject an out-of-range CAN id (and explicit master id) with a 400.
+
+        ``new_id`` must be in ``[1, 0x7FF]`` (standard CAN; id 0 reserved). A
+        ``master_id`` is optional, but if supplied (non-falsy) it must be in the
+        same range -- a falsy/0 master_id is handled as ABSENT by the caller.
+        Returns an ``ApiResult`` to return on failure, or ``None`` if valid.
+        """
+        try:
+            nid = int(new_id)
+        except (TypeError, ValueError):
+            return (400, {"ok": False, "error": f"id must be an integer, got {new_id!r}"})
+        if nid < self._CAN_ID_MIN or nid > self._CAN_ID_MAX:
+            return (400, {"ok": False, "error":
+                          f"id {nid} out of CAN range [{self._CAN_ID_MIN}, "
+                          f"{self._CAN_ID_MAX}]"})
+        if master_id:   # falsy/0/None -> treated as absent (defaulted elsewhere)
+            try:
+                mid = int(master_id)
+            except (TypeError, ValueError):
+                return (400, {"ok": False, "error":
+                              f"master_id must be an integer, got {master_id!r}"})
+            if mid < self._CAN_ID_MIN or mid > self._CAN_ID_MAX:
+                return (400, {"ok": False, "error":
+                              f"master_id {mid} out of CAN range "
+                              f"[{self._CAN_ID_MIN}, {self._CAN_ID_MAX}]"})
+        else:
+            # No explicit master_id -> the caller derives id + 0x10. Reject an id
+            # whose auto-derived master would overflow the CAN range (id > 0x7EF),
+            # so a boundary id can't silently persist a master_id > 0x7FF.
+            derived = dm.master_id(nid)
+            if derived > self._CAN_ID_MAX:
+                return (400, {"ok": False, "error":
+                              f"id {nid} too large: auto master_id {derived} exceeds "
+                              f"{self._CAN_ID_MAX} (supply an explicit master_id, or "
+                              f"use id <= {self._CAN_ID_MAX - 0x10})"})
+        return None
 
     def api_map(self, payload: dict) -> ApiResult:
         """Map a logical joint -> motor (id/model/limits/dir/offset) and persist."""
@@ -185,13 +270,31 @@ class M1HwConfigNode:
             return (400, {"ok": False, "error": f"unknown model {model!r}"})
         with self._lock:
             entry = self.motor_map.get(joint, {})
-            entry["id"] = int(payload.get("id", entry.get("id", 0)))
-            entry["master_id"] = int(payload.get(
-                "master_id", entry.get("master_id", dm.master_id(entry["id"]))))
+            new_id = payload.get("id", entry.get("id", 0))
+            # Validate the CAN id (and an explicit master_id) before persisting,
+            # so the derived master_id is never garbage.
+            err = self._validate_ids(new_id, payload.get("master_id"))
+            if err is not None:
+                return err
+            entry["id"] = int(new_id)
+            # A falsy/0 master_id (page sends +('') === 0 when blank) is
+            # reserved/invalid -> treat as absent and default to id + 0x10.
+            mid = payload.get("master_id", entry.get("master_id"))
+            entry["master_id"] = int(mid) if mid else dm.master_id(entry["id"])
             entry["model"] = model
             entry.setdefault("soft_limits", {"pos": [-1.0, 1.0], "vel": 1.0, "effort": 1.0})
-            entry.setdefault("dir", int(payload.get("dir", 1)))
-            entry.setdefault("offset", float(payload.get("offset", 0.0)))
+            # Persist dir/offset with payload-takes-precedence (NOT setdefault,
+            # which silently drops a re-map's new value). Defaults to current
+            # then 1 / 0.0.
+            entry["dir"] = int(payload.get("dir", entry.get("dir", 1)))
+            entry["offset"] = float(payload.get("offset", entry.get("offset", 0.0)))
+            # Persist NON-ZERO kp/kd: the C++ plugin defaults missing gains to
+            # 0.0 and refuses the bus when a commanded joint has kp == 0
+            # (limp-arm guard). Default per-model from control_gains.yaml
+            # conventions; operator should tune. (See _default_gains.)
+            d_kp, d_kd = _default_gains(model)
+            entry["kp"] = float(payload.get("kp", entry.get("kp", d_kp)))
+            entry["kd"] = float(payload.get("kd", entry.get("kd", d_kd)))
             self.motor_map[joint] = entry
             self._jog_active.setdefault(joint, None)
             if self.map_path:
