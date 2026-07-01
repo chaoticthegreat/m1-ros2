@@ -85,8 +85,20 @@ import rclpy
 from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import PoseStamped, Twist
 from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64
+
+# Low-latency QoS for the streamed teleop control signals (target_pose / cmd_vel /
+# gripper): a 60-90 Hz self-superseding stream where the newest sample always
+# replaces the last, so RELIABLE retransmit is pure overhead and, on a lossy
+# (cloud) link, head-of-line-blocks newer samples waiting on a retransmit ACK.
+# BEST_EFFORT + KEEP_LAST depth-1 delivers the latest sample and drops the rest.
+TELEOP_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=1,
+)
 
 from m1_control.kinematics import (
     ARM_JOINTS,
@@ -261,7 +273,9 @@ class M1QuestNode(Node):
                 self.get_logger().warn(f"URDF FK unavailable ({exc}); using default targets")
 
         # --- shared state (guarded by _lock) -------------------------------
-        self._lock = threading.Lock()
+        # Reentrant: the /api/ctrl and /api/xr entrypoints hold the lock and then
+        # call the shared _apply_place/_apply_controls helpers, which re-acquire it.
+        self._lock = threading.RLock()
         self.q_meas: dict = {}
         self.target = {a: list(DEFAULT_TARGET[a]) for a in ("left", "right")}
         # Per-arm reach error (m): target point - live fingertip. Computed in
@@ -297,6 +311,10 @@ class M1QuestNode(Node):
         self.last_btn = {"left": False, "right": False}  # A/X edge detect
         self._last_base_cmd = 0.0
         self._last_update = 0.0
+        # Monotonic control-frame sequence: with the control POST decoupled from
+        # the viz round-trip the client may have >1 in flight, so a stale/reordered
+        # control frame (seq <= the last applied) is dropped in on_ctrl_frame.
+        self._last_ctrl_seq = None
         # Dead-reckoned base pose (odom frame), integrated from the commanded
         # body velocity each tick so the headset model actually drives through
         # the room as the operator commands the swerve. Reset to the origin
@@ -335,14 +353,14 @@ class M1QuestNode(Node):
 
         # --- ROS interface --------------------------------------------------
         self.pose_pub = {
-            a: self.create_publisher(PoseStamped, f"/m1/{a}_arm/target_pose", 10)
+            a: self.create_publisher(PoseStamped, f"/m1/{a}_arm/target_pose", TELEOP_QOS)
             for a in ("left", "right")
         }
         self.grip_pub = {
-            a: self.create_publisher(Float64, f"/m1/{a}_arm/gripper", 10)
+            a: self.create_publisher(Float64, f"/m1/{a}_arm/gripper", TELEOP_QOS)
             for a in ("left", "right")
         }
-        self.cmd_vel_pub = self.create_publisher(Twist, "/m1/cmd_vel", 10)
+        self.cmd_vel_pub = self.create_publisher(Twist, "/m1/cmd_vel", TELEOP_QOS)
         self.create_subscription(JointState, "/joint_states", self._on_joint_states, 10)
         self.create_timer(1.0 / PUBLISH_RATE, self._tick)
 
@@ -391,27 +409,41 @@ class M1QuestNode(Node):
                 pass
 
     # --- WebXR frame ingest (called from the HTTP handler thread) -----------
-    def on_xr_frame(self, data: dict):
-        """Apply one batch of controller states posted by the headset."""
+    def _apply_place(self, data: dict):
+        """Handle a hologram (re)anchor (a B/Y recenter). Thread-safe (RLock).
+
+        The page raises ``place`` on the first frame or a B/Y recenter; a recenter
+        rides the VIZ fetch so the client's place/snap logic stays on that
+        response.
+        """
         with self._lock:
-            self._last_update = self._now()
+            if not data.get("place"):
+                return
+            # Zero the dead-reckoned base pose so the robot snaps back to the
+            # anchor in front of the operator instead of drifting off by however
+            # far it had already been driven.
+            self.odom.reset()
+            # A recenter moves the room anchor, so in ABSOLUTE mode the page's
+            # base-frame hand (pos_base) jumps to a NEW frame while an engaged
+            # arm's captured anchor (clutch_hand0) is still in the OLD one -- using
+            # both would snap the target. Drop any grab so the next squeeze
+            # re-snaps cleanly. (Relative mode anchors on the raw WebXR hand, which
+            # the room anchor doesn't touch, so it is unaffected.)
+            if self.control_mode == "absolute":
+                self.clutch = {"left": False, "right": False}
+
+    def _apply_controls(self, data: dict):
+        """Apply one batch of controller states (clutch / target / base / chord).
+
+        Thread-safe (acquires the reentrant _lock). Pure control -- no place, no
+        viz -- so it is shared by the fast ``/api/ctrl`` route (frame-rate, tiny
+        ack, control DECOUPLED from the ~4 KB viz round-trip so hand poses stream
+        at the headset frame rate regardless of RTT) and the legacy full-frame
+        ``/api/xr`` route (2D panel / headless tests).
+        """
+        with self._lock:
             controllers = data.get("controllers", {})
             head_fwd = data.get("head")  # headset forward vector (WebXR space)
-            # The page raises ``place`` when it (re)anchors the hologram (first
-            # frame or a B/Y recenter). Zero the dead-reckoned pose so the robot
-            # snaps back to the anchor in front of the operator instead of
-            # drifting off by however far it had already been driven.
-            if data.get("place"):
-                self.odom.reset()
-                # A recenter moves the room anchor, so in ABSOLUTE mode the page's
-                # base-frame hand (pos_base) jumps to a NEW frame while an engaged
-                # arm's captured anchor (clutch_hand0) is still in the OLD one --
-                # using both would snap the target. Drop any grab so the next
-                # squeeze re-snaps cleanly in the new frame. (Relative mode anchors
-                # on the raw WebXR hand, which the room anchor doesn't touch, so it
-                # is unaffected.)
-                if self.control_mode == "absolute":
-                    self.clutch = {"left": False, "right": False}
             # Active control scheme, snapshotted at frame start so a mid-frame
             # toggle (the chord below) only takes effect NEXT frame.
             mode = self.control_mode
@@ -568,12 +600,47 @@ class M1QuestNode(Node):
                     "yaw": _clamp(-rx * MAX_YAW, -MAX_YAW, MAX_YAW),
                 }
                 self._last_base_cmd = self._now()
-            # Take a cheap SNAPSHOT (copies) of everything the viz needs while we
-            # still hold the lock, then release it BEFORE the multi-millisecond
-            # FK / serialization runs -- so the heavy work no longer serializes
-            # against the 60 Hz _tick publish and the /joint_states callback.
+            # (end of _apply_controls -- the `with self._lock` block closes here)
+
+    def on_ctrl_frame(self, data: dict) -> dict:
+        """Fast control path (/api/ctrl): apply controls, return a tiny ack.
+
+        No viz is built, so a hand-pose update is NOT gated on the ~4 KB viz
+        round-trip -- control streams at the headset frame rate regardless of RTT.
+        An optional monotonic ``seq`` lets the client keep >1 request in flight; a
+        stale or reordered frame (seq <= the last applied) is dropped.
+        """
+        seq = data.get("seq")
+        with self._lock:
+            self._last_update = self._now()
+            if seq is not None:
+                if self._last_ctrl_seq is not None and seq <= self._last_ctrl_seq:
+                    return {"ok": True, "stale": True}
+                self._last_ctrl_seq = seq
+            self._apply_place(data)
+            if data.get("controllers"):
+                self._apply_controls(data)
+        return {"ok": True, "seq": seq}
+
+    def on_xr_frame(self, data: dict) -> dict:
+        """Viz path (/api/xr): build + return the robot viz.
+
+        Also applies a recenter (``place`` rides the viz fetch, keeping the
+        client's place/snap logic on this response) and, for BACKWARD
+        COMPATIBILITY (the 2D panel + headless tests post full frames here),
+        applies controls when the payload carries ``controllers``. The live WebXR
+        client posts controls to /api/ctrl and only {head, place} here, so this
+        route stays viz-only for it.
+        """
+        with self._lock:
+            self._last_update = self._now()
+            self._apply_place(data)
+            if data.get("controllers"):
+                self._apply_controls(data)
+            # Cheap SNAPSHOT (copies) of the viz inputs while we hold the lock,
+            # then release BEFORE the multi-ms FK/serialization so the heavy work
+            # no longer serializes against _tick / the /joint_states callback.
             snap = self._viz_snapshot_locked()
-        # Heavy FK + serialization happen OUTSIDE the lock, from the snapshot.
         viz = self._build_viz(snap)
         return {"ok": True, "viz": viz}
 
@@ -983,7 +1050,10 @@ def _make_handler(node: M1QuestNode):
                 self._send(404, json.dumps({"error": "not found"}))
 
         def do_POST(self):
-            if self.path != "/api/xr":
+            # /api/ctrl = fast control (tiny ack, no viz, streams at frame rate);
+            # /api/xr = viz (the ~4 KB robot pose, fetched on its own slower gate).
+            path = self.path.split("?", 1)[0]
+            if path not in ("/api/xr", "/api/ctrl"):
                 self._send(404, json.dumps({"error": "not found"}))
                 return
             # A negative/garbage Content-Length must not reach rfile.read(): read(-1)
@@ -996,7 +1066,10 @@ def _make_handler(node: M1QuestNode):
                 return
             try:
                 payload = json.loads(self.rfile.read(length) or b"{}")
-                self._send(200, json.dumps(node.on_xr_frame(payload)))
+                if path == "/api/ctrl":
+                    self._send(200, json.dumps(node.on_ctrl_frame(payload)))
+                else:
+                    self._send(200, json.dumps(node.on_xr_frame(payload)))
             except Exception as exc:  # noqa: BLE001
                 self._send(400, json.dumps({"ok": False, "error": str(exc)}))
 

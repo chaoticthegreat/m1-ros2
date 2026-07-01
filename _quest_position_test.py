@@ -37,7 +37,10 @@ URDF = "assets/ranger_air_description/urdf/ranger_air_description.urdf"
 def make_node(reach=None, enable_base=False):
     """A node with just the state on_xr_frame / _viz_locked / snapshot touch."""
     n = object.__new__(M1QuestNode)
-    n._lock = threading.Lock()
+    # RLock to match the real node: on_xr_frame/on_ctrl_frame hold the lock and
+    # call the shared _apply_place/_apply_controls helpers, which re-acquire it.
+    n._lock = threading.RLock()
+    n._last_ctrl_seq = None
     n._now = lambda: 0.0
     n.reach = reach
     n.enable_base = enable_base
