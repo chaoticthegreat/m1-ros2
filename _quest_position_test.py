@@ -117,6 +117,27 @@ def main():
     gates["precision toggles once on click (edge)"] = fine_on is True
     gates["precision scales motion down"] = abs(dz_fine - 0.10 * PRECISION_SCALE) < 0.01
 
+    # --- 2b. relative-mode precision toggle is continuous (no mid-grab snap) ---
+    # BUG7 regression guard: toggling precision while gripped in the DEFAULT
+    # relative scheme must re-anchor (clutch_hand0/clutch_target0) so the target
+    # does NOT jump -- previously the re-anchor was gated to absolute mode only,
+    # so toggling precision mid-grab in relative re-scaled the whole accumulated
+    # delta and snapped the target by (1-PRECISION_SCALE)*|delta|.
+    nr = make_node()                                    # control_mode defaults to "relative"
+    frame(nr, "left", ctrl([0, 0, 0], squeeze=True))    # grab at origin
+    frame(nr, "left", ctrl([0.0, 0.10, 0.0], squeeze=True))   # raise hand 10cm (1:1)
+    before = np.asarray(nr.target["left"], dtype=float).copy()
+    frame(nr, "left", ctrl([0.0, 0.10, 0.0], squeeze=True, lock=True))  # toggle precision, hand STILL
+    after = np.asarray(nr.target["left"], dtype=float)
+    snap_mm = float(np.linalg.norm(after - before)) * 1000.0
+    print(f"2b. relative precision toggle, hand held still -> target moved "
+          f"{snap_mm:.4f}mm (want ~0)")
+    gates["relative precision toggle is continuous (no snap)"] = snap_mm < 1e-2
+    # and a subsequent small hand move now scales by PRECISION_SCALE
+    frame(nr, "left", ctrl([0.0, 0.12, 0.0], squeeze=True))   # +2cm hand, fine mode
+    dz_after = nr.target["left"][2] - after[2]
+    gates["relative precision then scales motion"] = abs(dz_after - 0.02 * PRECISION_SCALE) < 0.005
+
     # toggle OFF again restores 1:1
     n2 = make_node()
     frame(n2, "left", ctrl([0, 0, 0], lock=True))   # click on (released)

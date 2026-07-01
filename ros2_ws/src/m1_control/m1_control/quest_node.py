@@ -201,14 +201,29 @@ def _ensure_cert(node: "M1QuestNode") -> tuple[str, str]:
     if os.path.isfile(cert) and os.path.isfile(key):
         return cert, key
 
-    node.get_logger().info(f"generating a self-signed TLS cert in {cache} (openssl)")
+    # Build the SAN from the host's REAL IPs so the cert is valid for whatever LAN
+    # IP the Quest connects to. A bare IP:0.0.0.0 is NOT a wildcard, so the old
+    # hardcoded SAN failed cert validation on the Quest (it hits the LAN IP, e.g.
+    # 192.168.31.236) -> the page was an insecure context -> WebXR refused to start.
+    san = ["DNS:localhost"]
+    hn = subprocess.run(["hostname"], capture_output=True, text=True,
+                        check=False).stdout.strip()
+    if hn:
+        san.append(f"DNS:{hn}")
+    seen = set()
+    for ip in ["127.0.0.1", *_lan_ips()]:
+        if ip and ip not in seen:
+            seen.add(ip)
+            san.append(f"IP:{ip}")
+    san_str = ",".join(san)
+    node.get_logger().info(
+        f"generating a self-signed TLS cert in {cache} (openssl); SAN={san_str}")
     subprocess.run(
         [
             "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
             "-keyout", key, "-out", cert, "-days", "3650",
             "-subj", "/CN=m1-quest",
-            # SANs so the cert is valid for any LAN IP/hostname the Quest uses.
-            "-addext", "subjectAltName=DNS:localhost,IP:0.0.0.0,IP:127.0.0.1",
+            "-addext", f"subjectAltName={san_str}",
         ],
         check=True,
         stdout=subprocess.DEVNULL,
@@ -451,12 +466,19 @@ class M1QuestNode(Node):
                 # the click scales hand motion down for sub-cm accuracy.
                 if precision and not self.last_precision[arm]:
                     self.fine[arm] = not self.fine[arm]
-                    # In absolute mode the scale multiplies displacement from the
-                    # engage anchor, so a live scale change would snap the target;
-                    # re-anchor on the engaged hand to keep the switch continuous.
-                    if mode == "absolute" and self.clutch[arm] and hand_base is not None:
-                        self.clutch_hand0[arm] = hand_base
+                    # In BOTH schemes the scale multiplies an accumulated delta from
+                    # the engage anchor (absolute: displacement from hand@engage;
+                    # relative: hand-delta since the squeeze), so changing the scale
+                    # without re-anchoring re-scales the WHOLE accumulated delta and
+                    # SNAPS the target. Re-anchor on the engaged hand so the switch is
+                    # continuous -- to hand_base in absolute, the raw WebXR hand in
+                    # relative.
+                    if self.clutch[arm]:
                         self.clutch_target0[arm] = np.array(self.target[arm], dtype=np.float64)
+                        if mode == "absolute" and hand_base is not None:
+                            self.clutch_hand0[arm] = hand_base
+                        elif mode != "absolute":
+                            self.clutch_hand0[arm] = hand
                 self.last_precision[arm] = precision
 
                 if mode == "absolute":
@@ -488,6 +510,14 @@ class M1QuestNode(Node):
                     # operator's heading frame captured at the squeeze, so
                     # "forward/left/up relative to where you're looking" map to
                     # robot x/y/z.
+                    # The raw WebXR hand is otherwise UNVALIDATED here (unlike the
+                    # absolute pos_base path) and TARGET_LIMITS['z'] is unbounded, so
+                    # a non-finite component would survive the clamp and publish an
+                    # inf/NaN target. Drop the clutch and skip this arm instead.
+                    if not np.all(np.isfinite(hand)):
+                        self.clutch[arm] = False
+                        self.grip[arm] = trigger
+                        continue
                     if squeeze and not self.clutch[arm]:
                         self.clutch[arm] = True
                         self.clutch_hand0[arm] = hand
@@ -790,6 +820,11 @@ class M1QuestNode(Node):
         return cls._deadzone(x), cls._deadzone(y)
 
     def _set_target(self, arm: str, xyz):
+        # Defense in depth: never let a non-finite component through (z is
+        # unbounded in TARGET_LIMITS, so inf/NaN would survive the clamp and be
+        # published). Keep the previous target instead.
+        if not np.all(np.isfinite(xyz)):
+            return
         self.target[arm] = [
             _clamp(float(xyz[0]), *TARGET_LIMITS["x"]),
             _clamp(float(xyz[1]), *TARGET_LIMITS["y"]),
@@ -951,8 +986,15 @@ def _make_handler(node: M1QuestNode):
             if self.path != "/api/xr":
                 self._send(404, json.dumps({"error": "not found"}))
                 return
+            # A negative/garbage Content-Length must not reach rfile.read(): read(-1)
+            # blocks until EOF and parks this handler thread until the socket
+            # timeout. Clamp to >= 0 and reject a non-integer header up front.
             try:
-                length = int(self.headers.get("Content-Length", 0))
+                length = max(0, int(self.headers.get("Content-Length", 0) or 0))
+            except (TypeError, ValueError):
+                self._send(400, json.dumps({"ok": False, "error": "bad Content-Length"}))
+                return
+            try:
                 payload = json.loads(self.rfile.read(length) or b"{}")
                 self._send(200, json.dumps(node.on_xr_frame(payload)))
             except Exception as exc:  # noqa: BLE001
@@ -1407,6 +1449,10 @@ function initThree(){
     log("WebGL context restored — re-uploading meshes");
     for(const k in linkNodes){ const nd=linkNodes[k];
       while(nd.children.length) nd.remove(nd.children[0]); }
+    // Also clear the absolute/embodiment overlay clones under bodyAnchor; without
+    // this loadRobot() appends a DUPLICATE clone per link on every context restore.
+    for(const k in bodyLinkNodes){ const bn=bodyLinkNodes[k];
+      while(bn.children.length) bn.remove(bn.children[0]); }
     loadRobot();                              // re-fetch (browser-cached) + re-instance
   }, false);
 
@@ -1829,8 +1875,18 @@ function setAnchor(vpose, head){
 function updateBodyAnchor(headPos, fwd){
   const n=Math.hypot(fwd[0],fwd[2]);
   const F=n>1e-4?[fwd[0]/n,0,fwd[2]/n]:[0,0,-1];     // horizontal forward
-  // base_link axes -> world: x=F (fwd), y=(Fz,0,-Fx) (left), z=up. Reused scratch.
-  _bX.set(F[0],0,F[2]); _bY.set(F[2],0,-F[0]);        // _bZ stays (0,1,0)
+  // EMBODIMENT yaw (the recurring "chest/arms face 90 deg to the left" bug): the
+  // two arms mount along base_link X -- the SHOULDER LINE (both fingertips at
+  // y=+0.19, split only along x: left x=+0.136, right x=-0.171) -- and REACH along
+  // base_link +Y. So for the on-body overlay the robot must be yawed 90 deg vs the
+  // front model: map base_link +Y (arm reach) -> F (operator forward), +X (shoulder
+  // line) -> operator right, +Z -> up. Mapping +X->F (as setAnchor does for the
+  // driveable front model) put the shoulder line along your forward, so the whole
+  // chest/arms overlay faced 90 deg to your left. This frame also feeds pos_base
+  // (line ~1959), so the SAME fix aligns the target mapping (hand-forward -> arm
+  // reaches forward), not just the visual. {_bX,_bY,_bZ} stays right-handed
+  // (_bX x _bY = _bZ), so it is a proper rotation (no reflection).
+  _bX.set(-F[2],0,F[0]); _bY.set(F[0],0,F[2]);        // _bZ stays (0,1,0)
   _bodyMat.makeBasis(_bX,_bY,_bZ);
   // Pin BODY_REF_BASELINK (arm-mount centre) to the chest: pos = chestWorld - R*ref.
   // _bodyMat has no translation yet, so applyMatrix4 rotates ref by R only.
